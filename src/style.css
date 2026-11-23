@@ -303,3 +303,65 @@ kbd { font: 700 10px/1 system-ui; background: rgba(255,255,255,0.15); border-rad
   .d-card .lines { font-size: 11px; gap: 0; }
   .go { min-height: 40px; }
 }
+
+/* Techniques (v4) */
+.d-vars { display: flex; flex-direction: column; gap: 4px; width: 100%; max-width: 520px; }
+.var { position: relative; font: inherit; color: #fff; cursor: pointer; background: #1b1029ee; border: 2px solid #ffffff33; border-radius: 12px; padding: 4px 34px 4px 8px; display: grid; grid-template-columns: 24px auto 1fr auto; grid-template-rows: auto auto; align-items: center; column-gap: 8px; text-align: left; min-height: 38px; }
+.var .vi { grid-row: 1 / span 2; color: #ffd166; display: grid; place-items: center; }
+.var .vn { font-size: 14px; white-space: nowrap; }
+.var .vl { font-size: 12px; color: #ffffffb0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.var .vp { font-size: 16px; font-variant-numeric: tabular-nums; }
+.var .obar { grid-column: 2 / span 3; width: 100%; height: 4px; }
+.var kbd { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); margin: 0; }
+.var.sel { border-color: #fff; background: #3a2560f0; box-shadow: 0 0 0 2px #ffd16699; }
+.var:disabled { opacity: 0.32; cursor: not-allowed; }
+.var.hint:not(.sel) { border-color: #ffd166; animation: hintglow 0.8s infinite alternate; }
+@media (hover: hover) { .var:hover:not(:disabled) { border-color: #ffffffaa; } }
+.vdots { display: flex; gap: 3px; height: 5px; }
+.vdots i { width: 5px; height: 5px; border-radius: 50%; background: #ffd166; }
+.opt .vdots + small { margin-top: 0; }
+.wlabel.tech { gap: 5px; }
+.wlabel.tech small { font-size: 11px; letter-spacing: 0.6px; opacity: 1; }
+.callout.tech { background: #e3a300; color: #1b1029; border-color: #fff; font-size: 20px; padding: 3px 8px; }
+.callout.tech small { color: #1b1029; }
+.callout.move.press { border-color: #f72585; color: #ff8fc0; }
+.callout.move.space { border-color: #4cc9f0; color: #8fe3ff; }
+.callout.move.deny { border-color: #ffd166; color: #ffd166; }
+@media (max-width: 420px) {
+  .var .vl { font-size: 11px; }
+  .var .vn { font-size: 13px; }
+  .var { padding-right: 8px; }
+}
+@media (max-height: 560px) {
+  .var .vl { display: none; }
+  .var { min-height: 30px; padding-top: 2px; padding-bottom: 2px; }
+}
+
+/* Team screen techniques */
+.kit { display: flex; flex-direction: column; gap: 6px; background: #00000030; border-radius: 12px; padding: 8px; }
+.kit-h { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 900; color: var(--dim); letter-spacing: 0.5px; text-transform: uppercase; }
+.slots { display: inline-flex; gap: 4px; align-items: center; }
+.slots i { width: 10px; height: 10px; border-radius: 3px; border: 2px solid var(--yellow); }
+.slots i.on { background: var(--yellow); }
+.slots b { color: var(--text); margin-left: 4px; }
+.tech[role="button"] { cursor: pointer; border: 2px solid transparent; }
+.tech.eq { border-color: #ffd16688; }
+.tech.empty { color: #ffffff66; border: 2px dashed #ffffff33; }
+.techs.off .tech { background: #ffffff14; color: var(--text); }
+.tech.new { position: relative; box-shadow: 0 0 0 2px var(--green); }
+.tech.new::after { content: 'NEW'; position: absolute; top: -8px; right: -6px; font-size: 9px; font-weight: 900; background: var(--green); color: #1b1029; border-radius: 6px; padding: 1px 4px; }
+.kit-next { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; }
+.kit-next > span { flex: 1; }
+.kit-next .btn { min-height: 34px; padding: 4px 8px; font-size: 13px; }
+.learned-list { display: flex; flex-direction: column; gap: 8px; text-align: left; }
+.learned { display: flex; gap: 12px; align-items: center; background: linear-gradient(90deg, #e3a30033, var(--panel)); border: 2px solid #ffd166; border-radius: 14px; padding: 10px; text-align: left; animation: labin 0.3s ease-out; }
+.learned .li { width: 52px; height: 52px; border-radius: 14px; background: #e3a300; color: #1b1029; display: grid; place-items: center; flex: none; }
+.learned > div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.learned small { font-size: 11px; font-weight: 900; color: var(--yellow); letter-spacing: 0.5px; }
+.learned b { font-size: 18px; }
+.learned span { font-size: 13px; color: var(--dim); }
+.learned em { font-style: normal; font-size: 13px; }
+.learned small.ok { color: var(--green); }
+.learned small.warn { color: var(--orange); }
+.unlock.new-tech { background: #e3a30033; border-color: #ffd166; }
+.learn-ov .panel { max-width: 420px; text-align: left; }

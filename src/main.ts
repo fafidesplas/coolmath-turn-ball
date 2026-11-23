@@ -1,14 +1,18 @@
 import './style.css';
 import { setSound, sfx, unlockAudio } from './audio';
 import {
-  ENABLE_SPECIALS, RIVALS, STATS, STAT_LABEL, STAT_NAME, TECHNIQUES, TECH_LEVELS, TEMPLATES, USER_TEAM, mirrorPlayers, playerPower, xpForLevel, MAX_LEVEL,
+  RIVALS, STATS, STAT_LABEL, STAT_NAME, TEMPLATES, USER_TEAM, mirrorPlayers, playerPower, xpForLevel, MAX_LEVEL,
   type Player, type RivalTeam,
 } from './data';
 import { DecisionUI } from './decisionui';
-import { applyResult, loadSave, persist, rollScout, ROSTER_MAX, SCOUT_REFRESH_COST, sign, type Rewards } from './game';
+import {
+  applyResult, equip, loadSave, nextInPath, nextLearnLevel, persist, rollScout, ROSTER_MAX, SCOUT_REFRESH_COST, sign, train, unequip,
+  type Learned, type Rewards,
+} from './game';
 import { icon } from './icons';
-import { Match, TUTORIAL, type MatchOptions, type MatchResult } from './match';
+import { Match, TUTORIAL, TUTORIAL_KITS, type MatchOptions, type MatchResult } from './match';
 import { MATCH_RULES, TUNE } from './rules';
+import { TECHS, slotsFor, trainCost, type TechId } from './techs';
 
 const app = document.getElementById('app')!;
 const save = loadSave();
@@ -48,14 +52,15 @@ function statBars(p: Player) {
     `<div class="sb" title="${STAT_NAME[k]}"><span>${STAT_LABEL[k]}</span><i><u style="width:${p.stats[k] * 10}%"></u></i><b>${p.stats[k]}</b></div>`).join('')}</div>`;
 }
 
-function techList(p: Player) {
-  if (!ENABLE_SPECIALS) return '';
-  return `<div class="techs">${p.techs.map((id, i) => {
-    const t = TECHNIQUES[id];
-    const known = p.known.includes(id);
-    return `<span class="tech ${known ? 'known' : 'locked'}" title="${t.desc} - ${t.cost} energy">${icon(known ? t.action : 'lock', 16)}${icon('star', 12)} +${t.bonus}${t.pierce ? ' P' : ''}${known ? ` <small>${t.cost}</small>` : ` <small>Lv${TECH_LEVELS[i]}</small>`}</span>`;
-  }).join('')}</div>`;
+const chip = (t: TechId, cls = '', extra = '') =>
+  `<span class="tech ${cls}" title="${esc(TECHS[t].name)}: ${esc(TECHS[t].line)}" ${extra}>${icon(TECHS[t].icon, 16)}${esc(TECHS[t].name)}</span>`;
+
+/** Compact technique row for scouting cards: what they bring, and what they learn next. */
+function techPreview(start: TechId[], path: TechId[]) {
+  return `<div class="techs">${start.map((t) => chip(t, 'known')).join('')}${path.slice(0, 2).map((t) => chip(t, 'locked')).join('')}</div>`;
 }
+
+const HOW: Record<Learned['how'], string> = { level: 'Level up', train: 'Trained', league: 'League win' };
 
 // ---------------- screens ----------------
 function titleScreen() {
@@ -105,20 +110,57 @@ function leagueScreen() {
 }
 
 function teamScreen(msg = '') {
+  const fresh = new Set(save.fresh ?? []);
   const el = mount(`${topBar('My Team')}
     ${msg ? `<p class="sub"><b class="msg">${esc(msg)}</b></p>` : ''}
-    <div class="roster">${save.roster.map((p, i) => `
+    <div class="roster">${save.roster.map((p, i) => {
+      const slots = slotsFor(p.level);
+      const bench = p.known.filter((t) => !p.gear.includes(t));
+      const nt = nextInPath(p);
+      const nl = nextLearnLevel(p);
+      const cost = trainCost(p.known.length);
+      const isNew = (t: TechId) => fresh.has(`${p.uid}:${t}`);
+      return `
       <div class="pcard ${i < 3 ? 'starter' : 'bench'}">
         <div class="pc-head">${avatarHTML(p, USER_TEAM.color, 52)}
-          <div class="pc-name"><b>${esc(p.name)}</b><small>${i < 3 ? 'STARTER' : 'BENCH'} - Lv ${p.level}${p.level >= MAX_LEVEL ? ' MAX' : ''}</small>
+          <div class="pc-name"><b>${esc(p.name)}</b><small>${i < 3 ? 'STARTER' : 'BENCH'} - ${esc(p.role)} - Lv ${p.level}${p.level >= MAX_LEVEL ? ' MAX' : ''}</small>
             <div class="xpbar"><i style="width:${p.level >= MAX_LEVEL ? 100 : (p.xp / xpForLevel(p.level)) * 100}%"></i></div></div></div>
         ${statBars(p)}
-        ${techList(p)}
+        <div class="kit">
+          <div class="kit-h"><span>Techniques</span><span class="slots">${Array.from({ length: slots }, (_, k) => `<i class="${k < p.gear.length ? 'on' : ''}"></i>`).join('')}<b>${p.gear.length}/${slots}</b></span></div>
+          <div class="techs">${p.gear.map((t) => chip(t, `known eq ${isNew(t) ? 'new' : ''}`, `data-unequip="${i}:${t}" role="button"`)).join('')}${
+            Array.from({ length: Math.max(0, slots - p.gear.length) }, () => `<span class="tech empty">${icon('slot', 16)}Empty</span>`).join('')}</div>
+          ${bench.length ? `<div class="techs off">${bench.map((t) => chip(t, `known ${isNew(t) ? 'new' : ''}`, `data-equip="${i}:${t}" role="button"`)).join('')}</div>` : ''}
+          ${nt ? `<div class="kit-next">${icon('lock', 16)}<span>${chip(nt, 'locked')}</span><small>${nl ? `Lv ${nl}` : ''}</small>
+            <button class="btn small" data-train="${i}" ${save.coins < cost ? 'disabled' : ''}>${icon('train', 18)} ${icon('coin', 16)} ${cost}</button></div>` : '<div class="kit-next"><small>Path complete</small></div>'}
+        </div>
         <div class="pc-actions">
           ${i > 0 ? `<button class="btn small icon-btn" data-up="${i}" aria-label="Move up">${icon('up', 20)}</button>` : ''}
           ${save.roster.length > 3 ? `<button class="btn small ghost" data-release="${i}">Release</button>` : ''}
         </div>
-      </div>`).join('')}</div>`, 'team-screen');
+      </div>`;
+    }).join('')}</div>
+    <p class="sub center">Tap a technique to equip or unequip it. Only equipped ones are used in matches.</p>`, 'team-screen');
+  if (save.fresh?.length) { save.fresh = []; persist(save); }
+  el.querySelectorAll<HTMLElement>('[data-equip]').forEach((b) => b.addEventListener('click', () => {
+    const [i, t] = b.dataset.equip!.split(':');
+    const p = save.roster[+i];
+    const err = equip(p, t as TechId);
+    if (err) { sfx.bad(); teamScreen(err); return; }
+    persist(save); sfx.tap(); teamScreen();
+  }));
+  el.querySelectorAll<HTMLElement>('[data-unequip]').forEach((b) => b.addEventListener('click', () => {
+    const [i, t] = b.dataset.unequip!.split(':');
+    unequip(save.roster[+i], t as TechId);
+    persist(save); sfx.tap(); teamScreen();
+  }));
+  el.querySelectorAll<HTMLButtonElement>('[data-train]').forEach((b) => b.addEventListener('click', () => {
+    const p = save.roster[+b.dataset.train!];
+    const r = train(save, p);
+    if (typeof r === 'string') { sfx.bad(); teamScreen(r); return; }
+    persist(save); sfx.levelUp();
+    learnedOverlay([r], () => teamScreen());
+  }));
   el.querySelectorAll<HTMLButtonElement>('[data-up]').forEach((b) => b.addEventListener('click', () => {
     const i = +b.dataset.up!;
     [save.roster[i - 1], save.roster[i]] = [save.roster[i], save.roster[i - 1]];
@@ -132,15 +174,31 @@ function teamScreen(msg = '') {
   }));
 }
 
+/** Full-screen notice for newly learned techniques. */
+function learnedHTML(list: Learned[]) {
+  return list.map((l) => `<div class="learned">
+      <span class="li">${icon(TECHS[l.tech].icon, 34)}</span>
+      <div><small>NEW TECHNIQUE - ${HOW[l.how]}</small><b>${esc(TECHS[l.tech].name)}</b><span>${esc(l.player.name)}</span><em>${esc(TECHS[l.tech].line)}</em>
+      <small class="${l.equipped ? 'ok' : 'warn'}">${l.equipped ? 'Equipped' : 'Slots full: equip it in Team'}</small></div></div>`).join('');
+}
+
+function learnedOverlay(list: Learned[], done: () => void) {
+  const ov = document.createElement('div');
+  ov.className = 'pause-overlay learn-ov';
+  ov.innerHTML = `<div class="panel">${learnedHTML(list)}<button class="btn primary" id="lok">${icon('check', 20)} OK</button></div>`;
+  app.firstElementChild!.appendChild(ov);
+  ov.querySelector('#lok')!.addEventListener('click', () => { sfx.tap(); done(); });
+}
+
 function scoutScreen(msg = '') {
   const el = mount(`${topBar('Scouting')}
     ${msg ? `<p class="sub"><b class="msg">${esc(msg)}</b></p>` : ''}
     <div class="roster">${save.scout.map((id) => {
       const t = TEMPLATES.find((x) => x.id === id)!;
-      const fake: Player = { uid: '', tid: t.id, name: t.name, num: t.num, tag: t.tag, hair: t.hair, skin: t.skin, stats: t.stats, growth: t.growth, techs: t.techs, level: 1, xp: 0, known: [t.techs[0]] };
+      const fake: Player = { uid: '', tid: t.id, name: t.name, num: t.num, tag: t.tag, hair: t.hair, skin: t.skin, stats: t.stats, growth: t.growth, role: t.role, path: t.path, level: 1, xp: 0, known: [...t.start], gear: [...t.start] };
       return `<div class="pcard">
-        <div class="pc-head">${avatarHTML(fake, '#8d99ae', 52)}<div class="pc-name"><b>${esc(t.name)}</b><small>Power ${playerPower(fake)}</small></div></div>
-        ${statBars(fake)}${techList(fake)}
+        <div class="pc-head">${avatarHTML(fake, '#8d99ae', 52)}<div class="pc-name"><b>${esc(t.name)}</b><small>${esc(t.role)} - Power ${playerPower(fake)}</small></div></div>
+        ${statBars(fake)}${techPreview(t.start, t.path)}
         <div class="pc-actions"><button class="btn small primary" data-sign="${id}" ${save.coins < t.price || save.roster.length >= ROSTER_MAX ? 'disabled' : ''}>Sign ${icon('coin', 18)} ${t.price}</button></div>
       </div>`;
     }).join('') || '<p class="sub">Nobody left to scout.</p>'}</div>
@@ -163,6 +221,7 @@ function howScreen() {
       ${card(`${icon('shoot', 26)}${icon('pass', 26)}`, 'Your turn', 'Shoot, pass, drive with the ball, or cut a teammate to a new spot.')}
       ${card(`${icon('press', 24)}${icon('space', 24)}${icon('deny', 24)}`, 'Their turn', 'The defense picks Press, Give space or Deny pass at the same time. Nobody sees the other choice.')}
       ${card(`<span class="mini-odds"><i class="good"></i><i class="mid"></i><i class="bad"></i></span>`, 'Exact odds', 'Select an option to see the play and its real odds. Green good, grey neutral, red bad.')}
+      ${card(`${icon('t_cross', 24)}${icon('t_fade', 24)}${icon('t_pnr', 24)}`, 'Techniques', 'Each move has techniques: crossover, fadeaway, pick and roll... Pick the move, then the technique. Players learn new ones by leveling up, training and league wins.')}
       ${card(`<span class="pips att"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>`, 'Moves', `${TUNE.actions} moves per possession. The last one is a shot.`)}
       ${card(icon('hoop', 32), 'Score', `1 inside the arc, 2 outside. First to ${MATCH_RULES.winScore}, or most after ${MATCH_RULES.maxPoss} possessions each.`)}
       <div class="center menu row"><button class="btn primary" id="tut">${icon('play', 22)} Tutorial</button><button class="btn" data-go="league">${icon('play', 22)} Play</button></div>
@@ -250,7 +309,7 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
 
 function tutorialScreen() {
   const el = mount(matchHud('TUT', RIVALS[0].color), 'match-screen');
-  bindMatch(el, null, { tier: 0, tutorial: TUTORIAL, hints: true });
+  bindMatch(el, null, { tier: 0, tutorial: TUTORIAL, kits: TUTORIAL_KITS, hints: true });
 }
 
 function matchScreen(rival: RivalTeam) {
@@ -268,6 +327,7 @@ function resultScreen(rival: RivalTeam, r: MatchResult) {
       <h1>${r.won ? 'VICTORY' : 'DEFEAT'}</h1>
       <div class="final"><span style="color:${USER_TEAM.color}">${USER_TEAM.short}</span><b>${r.score[0]} - ${r.score[1]}</b><span style="color:${rival.color}">${esc(rival.name.slice(0, 3).toUpperCase())}</span></div>
       <div class="reward">${icon('coin', 24)} +${rewards.coins}</div>
+      ${rewards.learned.length ? `<div class="learned-list">${learnedHTML(rewards.learned)}</div>` : ''}
       ${rewards.unlocked ? `<div class="unlock">${icon('lock', 20)} <b>${esc(rewards.unlocked.name)}</b> unlocked</div>` : ''}
       ${r.won && RIVALS.indexOf(rival) === RIVALS.length - 1 ? `<div class="unlock">${icon('trophy', 22)} Champions</div>` : ''}
       <div class="reports">${rewards.reports.map((rep) => {
@@ -275,7 +335,7 @@ function resultScreen(rival: RivalTeam, r: MatchResult) {
         return `<div class="rep ${rep.levels ? 'lvl' : ''}">${avatarHTML(rep.player, USER_TEAM.color, 40)}
           <div><b>${esc(rep.player.name)}</b> <small>Lv ${rep.player.level}</small>
           <small>${line ? `${line.pts} pts - ` : ''}+${rep.xp} XP</small>
-          ${rep.levels ? `<small class="up">${icon('up', 14)} LEVEL UP ${rep.stats.map((s) => `${STAT_LABEL[s]}+1`).join(' ')}${ENABLE_SPECIALS && rep.techs.length ? ` ${icon('star', 12)} ${rep.techs.map(esc).join(', ')}` : ''}</small>` : ''}</div></div>`;
+          ${rep.levels ? `<small class="up">${icon('up', 14)} LEVEL UP ${rep.stats.map((s) => `${STAT_LABEL[s]}+1`).join(' ')}</small>` : ''}</div></div>`;
       }).join('')}</div>
       <div class="menu row">
         <button class="btn primary" data-go="league">${icon('play', 20)} Next</button>
