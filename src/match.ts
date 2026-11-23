@@ -1,24 +1,19 @@
-// Real-time half-court 3x3 match in 3D. Free movement with an elevated camera; whenever the ball
-// handler meets a defender (or you call a play) the game stops, the camera drops to third person
-// and you pick a move while previews show what will happen and the exact odds.
+// Turn-based 3x3 match in 3D. Loop: decide -> watch the play -> decide again.
+// All rules and odds come from rules.ts (shared with the headless simulator); this file only decides
+// what to show: positions, previews, animations and the one-line causal explanation.
 import * as THREE from 'three';
 import { sfx } from './audio';
-import { type Action, type AttackAction, type DefendAction, type Player, type Technique } from './data';
-import {
-  aiAttackDist, aiDefendDist, attackOdds, bestTech, clamp, defenseOdds, HabitMemory, resolveDuel, sample, toPercents,
-  type Choice, type DuelContext, type DuelResult, type Weighted,
-} from './duel';
+import type { Player, Stats } from './data';
 import { icon } from './icons';
-import { ArcCurve, ARC_R, CORNER_DX, COURT_H, COURT_W, HOOP, RIM, World, w3, type PlayerLook } from './world';
+import {
+  actKey, actOdds, aiAttackDist, branches, clamp, explain, Habits, helperFor, legalActs, MATCH_RULES, OpponentModel,
+  pickBranch, Planner, readDefense, rng, sampleStance, sampleWeighted, setupPoss, SETUPS, shotChance, STANCES, stanceOdds,
+  cutChance, driveChance, pickChance, toPercents, TUNE, ZONES,
+  type Act, type ActKind, type Branch, type Ev, type Matchup, type Poss, type Stance, type StanceDist, type Weighted, type Zone,
+} from './rules';
+import { ArcCurve, COURT_H, COURT_W, HOOP, RIM, World, w3, type PlayerLook } from './world';
 
 export { COURT_W, COURT_H, HOOP };
-export const MATCH_SECONDS = 150;
-export const SHOT_CLOCK = 12;
-export const WIN_SCORE = 11;
-const DUEL_RANGE = 1.0;
-const ACT_RANGE = 3.2;
-const CLOSEOUT_RANGE = 1.8;
-const CORNER_Y = HOOP.y + Math.sqrt(ARC_R * ARC_R - CORNER_DX * CORNER_DX);
 
 export interface TeamSetup {
   name: string;
@@ -37,13 +32,9 @@ interface Ent {
   team: 0 | 1;
   slot: number;
   x: number; y: number;
-  tx: number; ty: number;
   px: number; py: number;
-  energy: number;
-  daze: number;
-  boost: number;
-  spotT: number;
   face: number;
+  daze: number;
   jumpT: number; jumpDur: number; jumpH: number;
   armsT: number; arms: number;
   anim: EntAnim | null;
@@ -51,136 +42,156 @@ interface Ent {
 
 interface Flight { curve: ArcCurve; t: number; dur: number; onLand: () => void }
 
-export interface HudInfo { score: [number, number]; clock: number; shotClock: number; golden: boolean; offense: 0 | 1 }
+export interface HudInfo {
+  score: [number, number];
+  poss: [number, number];
+  maxPoss: number;
+  offense: 0 | 1;
+  left: number;
+  maxLeft: number;
+  golden: boolean;
+}
 export interface PlayerLine { pts: number; duels: number; duelsWon: number; steals: number }
-export interface MatchResult { score: [number, number]; won: boolean; lines: Record<string, PlayerLine>; quit?: boolean }
+export interface MatchResult { score: [number, number]; won: boolean; lines: Record<string, PlayerLine>; quit?: boolean; tutorial?: boolean }
 
 export type Tone = 'good' | 'mid' | 'bad';
 export interface OddsItem { key: string; pct: number; tone: Tone; word: string; icon: string }
+export interface Card { gain: string; risk: string; change: string }
 export interface OptionInfo {
   id: string;
-  action: Action;
+  kind: ActKind | Stance;
+  act?: Act;
+  stance?: Stance;
   label: string;
-  tech?: Technique;
-  target?: number;
+  /** Short destination / target tag for sub-options. */
+  tag?: string;
   targetNum?: number;
   odds: OddsItem[];
   main: number;
+  card: Card;
+  disabled?: boolean;
+  hint?: boolean;
 }
 
 export interface DecisionInfo {
   side: 'att' | 'def';
-  me: { name: string; num: number; energy: number; color: string };
-  them: { name: string; num: number; color: string };
-  special: boolean;
-  specialAvailable: boolean;
-  pts: number;
+  left: number;
+  maxLeft: number;
+  /** Attack: what the defense tends to do here (exact mix the AI samples from). */
+  lean?: StanceDist;
+  /** Defense: what the AI attacker tends to do here, by action kind (exact mix it samples from). */
+  attLean?: Record<ActKind, number>;
+  /** Tutorial: the stance is shown in advance. */
+  shown?: Stance;
+  hint?: string;
 }
 
 export interface MatchHooks {
   hud(h: HudInfo): void;
-  mode(m: 'attack' | 'defend' | 'idle', canAct: boolean): void;
   decision(open: boolean): void;
   banner(text: string, color: string, sub?: string): void;
+  explain(text: string, tone: Tone): void;
   end(r: MatchResult): void;
 }
 
-type Phase = 'check' | 'play' | 'decide' | 'resolve' | 'pause' | 'over';
+/** One guided step of the tutorial (a decision inside a scripted possession). */
+export interface GuideStep {
+  allow: ActKind[];
+  /** Restrict drives to these destinations. */
+  zones?: Zone[];
+  /** Restrict passes to the teammate freed by help. */
+  toFreed?: boolean;
+  /** The lesson's outcome (the roll lands on it). */
+  outcome: Ev;
+  hint: string;
+}
+export interface TutorialPoss { setup: Zone[]; handler: number; stance?: Stance; title: string; steps: GuideStep[] }
 
-interface Decision {
-  side: 'att' | 'def';
-  att: Ent;
-  def: Ent;
-  ctx: DuelContext;
-  mates: Ent[];
-  attDist: Weighted<Choice<AttackAction>>[];
-  defDist: Weighted<Choice<DefendAction>>[];
-  special: boolean;
-  previewId: string | null;
+export interface MatchOptions {
+  tier: number;
+  tutorial?: TutorialPoss[];
+  seed?: number;
+  /** Show the short first-time hints. */
+  hints?: boolean;
 }
 
-const SPOTS = [
-  { x: 7.5, y: 8.6 }, { x: 2.6, y: 6.2 }, { x: 12.4, y: 6.2 }, { x: 1.2, y: 1.4 }, { x: 13.8, y: 1.4 },
-  { x: 4.6, y: 2.8 }, { x: 10.4, y: 2.8 }, { x: 7.5, y: 5.0 }, { x: 4.0, y: 5.0 }, { x: 11.0, y: 5.0 },
-];
+type Phase = 'intro' | 'decide' | 'resolve' | 'over';
 
 const dist = (ax: number, ay: number, bx: number, by: number) => Math.hypot(ax - bx, ay - by);
-export const isTwoPoint = (x: number, y: number) =>
-  y < CORNER_Y ? Math.abs(x - HOOP.x) > CORNER_DX : dist(x, y, HOOP.x, HOOP.y) > ARC_R;
-
-function segDist(px: number, py: number, ax: number, ay: number, bx: number, by: number) {
-  const dx = bx - ax, dy = by - ay;
-  const l2 = dx * dx + dy * dy || 1;
-  const t = clamp(((px - ax) * dx + (py - ay) * dy) / l2, 0, 1);
-  return { d: dist(px, py, ax + dx * t, ay + dy * t), t };
-}
-
 const ease = (k: number) => k * k * (3 - 2 * k);
 const shotApex = (d: number) => 0.7 + d * 0.09;
+const pct = (p: number) => Math.round(p * 100);
+const ONE = (st: Stance): StanceDist => ({ press: 0, space: 0, deny: 0, [st]: 1 });
 
-const OPT_LABEL: Record<Action, string> = {
-  shoot: 'Shoot', pass: 'Pass', dribble: 'Drive', protect: 'Shield',
-  steal: 'Steal', block: 'Block', press: 'Press', wait: 'Read',
-};
+export const STANCE_LABEL: Record<Stance, string> = { press: 'Press', space: 'Give space', deny: 'Deny pass' };
+export const KIND_LABEL: Record<ActKind, string> = { shoot: 'Shoot', pass: 'Pass', drive: 'Drive', cut: 'Cut' };
+const STANCE_WORD: Record<Stance, string> = { press: 'PRESS', space: 'SPACE', deny: 'DENY' };
 
 export class Match {
   ents: Ent[] = [];
+  phase: Phase = 'intro';
   offense: 0 | 1 = 0;
+  poss: Poss | null = null;
+  score: [number, number] = [0, 0];
+  possN: [number, number] = [0, 0];
+  golden = false;
   holder: Ent | null = null;
   flight: Flight | null = null;
-  phase: Phase = 'pause';
-  phaseT = 0;
-  after: (() => void) | null = null;
-  clock = MATCH_SECONDS;
-  shotClock = SHOT_CLOCK;
-  score: [number, number] = [0, 0];
-  golden = false;
-  duelCd = 0;
-  controlled: Ent | null = null;
-  moveTarget: { x: number; y: number } | null = null;
-  idleT = 9;
-  keys = new Set<string>();
-  time = 0;
-  aiT = 0;
-  memory = new HabitMemory();
-  lines: Record<string, PlayerLine> = {};
-  decision: Decision | null = null;
   paused = false;
+  /** Animation speed multiplier (1 in play; automated tests raise it). */
+  timeScale = 1;
   decisions = 0;
-  /** Event counters (debug / balance testing). */
-  stats: Record<string, number> = {};
-  private bump(k: string) { this.stats[k] = (this.stats[k] ?? 0) + 1; }
+  lines: Record<string, PlayerLine> = {};
   world: World;
+  /** Event counters (debug / smoke tests). */
+  stats: Record<string, number> = {};
+  /** Last resolved decision (smoke tests). */
+  lastRes: { act: Act; stance: Stance; ev: Ev; text: string } | null = null;
+
+  private rand: () => number;
+  private m: [Matchup, Matchup];
+  private planners: [Planner, Planner];
+  private model: OpponentModel;
+  private habits = new Habits();
+  private smart: number;
+  private temp: number;
   private timers: { t: number; fn: () => void }[] = [];
   private raf = 0;
   private last = 0;
-  private hudKey = '';
-  private modeKey = '';
-  private pointerDown = false;
   private destroyed = false;
   private ballPos = new THREE.Vector3();
-  private previewOpt: OptionInfo | null = null;
   private looseBall: THREE.Vector3 | null = null;
+  private dist: StanceDist | null = null;
+  private attDist: Weighted<Act>[] | null = null;
+  private opts: OptionInfo[] = [];
+  private previewId: string | null = null;
+  private freed: number | null = null;
+  private tutIdx = -1;
+  private stepIdx = 0;
+  private hudKey = '';
+  private shownStance: Stance | null = null;
 
-  constructor(
-    stage: HTMLElement,
-    public teams: [TeamSetup, TeamSetup],
-    private tier: number,
-    private hooks: MatchHooks,
-  ) {
+  constructor(stage: HTMLElement, public teams: [TeamSetup, TeamSetup], private o: MatchOptions, private hooks: MatchHooks) {
+    this.rand = rng(o.seed ?? (Date.now() & 0x7fffffff));
     const looks: PlayerLook[] = [];
     teams.forEach((t, ti) => t.players.slice(0, 3).forEach((pl, slot) => {
       this.ents.push({
-        i: this.ents.length, pl, team: ti as 0 | 1, slot, x: 7.5, y: 6, tx: 7.5, ty: 6, px: 7.5, py: 6, energy: 40, daze: 0, boost: 0,
-        spotT: 0, face: 0, jumpT: 0, jumpDur: 0, jumpH: 0, armsT: 0, arms: 0, anim: null,
+        i: this.ents.length, pl, team: ti as 0 | 1, slot, x: 7.5, y: 8, px: 7.5, py: 8, face: Math.PI,
+        daze: 0, jumpT: 0, jumpDur: 0, jumpH: 0, armsT: 0, arms: 0, anim: null,
       });
       looks.push({ jersey: t.color, shorts: t.shorts, accent: t.accent, skin: pl.skin, hair: pl.hair, num: pl.num, team: ti as 0 | 1 });
       this.lines[pl.uid] = { pts: 0, duels: 0, duelsWon: 0, steals: 0 };
     }));
+    const st = (ti: number): Stats[] => teams[ti].players.slice(0, 3).map((p) => p.stats);
+    this.m = [{ att: st(0), def: st(1) }, { att: st(1), def: st(0) }];
+    this.planners = [new Planner(this.m[0], (s) => readDefense(this.m[0], s)), new Planner(this.m[1], (s) => readDefense(this.m[1], s))];
+    this.model = new OpponentModel(this.planners[0]);
+    this.smart = o.tutorial ? 0 : clamp(0.2 + o.tier * 0.08, 0, 0.6);
+    this.temp = clamp(0.12 - o.tier * 0.015, 0.04, 0.12);
     this.world = new World(stage, looks);
-    this.bindInput();
-    this.setupCheck(0, 0, true);
-    this.updateCamera(true);
+    this.world.renderer.domElement.addEventListener('pointerdown', this.onCanvasDown);
+    this.offense = o.tutorial ? 0 : (this.rand() < 0.5 ? 0 : 1);
+    this.startPossession(true);
     this.last = performance.now();
     this.raf = requestAnimationFrame(this.loop);
   }
@@ -188,174 +199,21 @@ export class Match {
   destroy() {
     this.destroyed = true;
     cancelAnimationFrame(this.raf);
-    window.removeEventListener('keydown', this.onKeyDown);
-    window.removeEventListener('keyup', this.onKeyUp);
     this.world.destroy();
   }
 
+  quit(): MatchResult {
+    return { score: [...this.score] as [number, number], won: false, lines: this.lines, quit: true, tutorial: !!this.o.tutorial };
+  }
+
   private later(t: number, fn: () => void) { this.timers.push({ t, fn }); }
+  private bump(k: string) { this.stats[k] = (this.stats[k] ?? 0) + 1; }
 
-  // ---------------- input ----------------
-  private onKeyDown = (e: KeyboardEvent) => {
-    if (this.phase === 'over' || this.paused || this.phase === 'decide') return;
-    const k = e.key.toLowerCase();
-    if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'w', 'a', 's', 'd'].includes(k)) {
-      this.keys.add(k);
-      e.preventDefault();
-    } else if (k === ' ' || k === 'enter') {
-      e.preventDefault();
-      this.userAct();
-    }
-  };
-  private onKeyUp = (e: KeyboardEvent) => this.keys.delete(e.key.toLowerCase());
-
-  private bindInput() {
-    window.addEventListener('keydown', this.onKeyDown);
-    window.addEventListener('keyup', this.onKeyUp);
-    const el = this.world.renderer.domElement;
-    el.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      if (this.phase !== 'play' && this.phase !== 'check') return;
-      const p = this.world.pickCourt(e.clientX, e.clientY);
-      if (!p) return;
-      this.pointerDown = true;
-      try { el.setPointerCapture(e.pointerId); } catch { /* ignore */ }
-      this.setTarget(p.x, p.y);
-    });
-    el.addEventListener('pointermove', (e) => {
-      if (!this.pointerDown) return;
-      const p = this.world.pickCourt(e.clientX, e.clientY);
-      if (p) this.setTarget(p.x, p.y);
-    });
-    const up = () => { this.pointerDown = false; };
-    el.addEventListener('pointerup', up);
-    el.addEventListener('pointercancel', up);
-  }
-
-  private setTarget(x: number, y: number) {
-    this.moveTarget = { x: clamp(x, 0.4, COURT_W - 0.4), y: clamp(y, 0.4, COURT_H - 0.4) };
-    this.idleT = 0;
-  }
-
-  /** Main action button: call a play with the ball, or challenge the ball handler on defense. */
-  userAct() {
-    if (this.phase !== 'play' || !this.holder) return;
-    if (this.offense === 0 && this.holder.team === 0) {
-      const def = this.nearestFoe(this.holder);
-      this.openDecision('att', this.holder, def, this.spaceBonus(dist(def.x, def.y, this.holder.x, this.holder.y), 2.5, 4));
-    } else if (this.offense === 1) {
-      const h = this.holder;
-      const mine = this.ents.filter((e) => e.team === 0 && e.daze <= 0)
-        .sort((a, b) => dist(a.x, a.y, h.x, h.y) - dist(b.x, b.y, h.x, h.y))[0];
-      if (mine && dist(mine.x, mine.y, h.x, h.y) <= ACT_RANGE) this.openDecision('def', h, mine, 0);
-    }
-  }
-
-  canAct(): boolean {
-    if (this.phase !== 'play' || !this.holder) return false;
-    if (this.offense === 0) return this.holder.team === 0;
-    const h = this.holder;
-    return this.ents.some((e) => e.team === 0 && e.daze <= 0 && dist(e.x, e.y, h.x, h.y) <= ACT_RANGE);
-  }
-
-  // ---------------- flow ----------------
-  private setupCheck(offense: 0 | 1, handlerSlot: number, first = false) {
-    this.offense = offense;
-    this.flight = null;
-    this.looseBall = null;
-    this.shotClock = SHOT_CLOCK;
-    const off = this.ents.filter((e) => e.team === offense);
-    const def = this.ents.filter((e) => e.team !== offense);
-    const handler = off.find((e) => e.slot === handlerSlot) ?? off[0];
-    const wings = [{ x: 3.0, y: 5.6 }, { x: 12.0, y: 5.6 }];
-    let wi = 0;
-    for (const e of [...off, ...def]) { e.anim = null; e.daze = 0; e.boost = 0; e.arms = 0; e.armsT = 0; }
-    for (const e of off) {
-      const p = e === handler ? { x: 7.5, y: 9.3 } : wings[wi++];
-      e.tx = p.x; e.ty = p.y;
-      if (first) { e.x = p.x; e.y = p.y; }
-    }
-    for (const d of def) {
-      const man = off.find((o) => o.slot === d.slot) ?? off[0];
-      const p = this.markSpot(man.tx, man.ty, man === handler ? 2.6 : 1.7);
-      d.tx = p.x; d.ty = p.y;
-      if (first) { d.x = p.x; d.y = p.y; }
-    }
-    this.holder = handler;
-    this.decision = null;
-    this.world.clearPreview();
-    this.moveTarget = null;
-    this.controlled = offense === 0 ? handler : (def.find((d) => d.slot === handler.slot) ?? def[0]);
-    this.phase = 'check';
-    this.phaseT = first ? 1.8 : 1.3;
-    this.duelCd = 1.2;
-    if (this.golden) this.hooks.banner('GOLDEN BASKET', '#ffd60a', 'Next score wins');
-    else if (offense === 0) this.hooks.banner('YOUR BALL', this.teams[0].color);
-    else this.hooks.banner('DEFENSE', this.teams[1].color);
-    sfx.whistle();
-  }
-
-  private pauseThen(t: number, fn: () => void) {
-    this.phase = 'pause';
-    this.phaseT = t;
-    this.after = fn;
-  }
-
-  private turnover(newHolder: Ent) {
-    this.holder = newHolder;
-    this.flight = null;
-    this.looseBall = null;
-    this.lines[newHolder.pl.uid].steals++;
-    const team = newHolder.team;
-    this.pauseThen(0.9, () => this.setupCheck(team, newHolder.slot));
-  }
-
-  private markSpot(mx: number, my: number, sag: number) {
-    const dx = HOOP.x - mx, dy = HOOP.y - my;
-    const l = Math.hypot(dx, dy) || 1;
-    return { x: mx + (dx / l) * sag, y: my + (dy / l) * sag };
-  }
-
-  private nearestFoe(e: Ent, exclude?: Ent): Ent {
-    return this.ents.filter((o) => o.team !== e.team && o !== exclude)
-      .sort((a, b) => dist(a.x, a.y, e.x, e.y) - dist(b.x, b.y, e.x, e.y))[0];
-  }
-
-  private spaceBonus(d: number, one: number, two: number) { return d > two ? 2 : d > one ? 1 : 0; }
-
-  /** Make chance of a jump shot from the entity's spot. */
-  shotChance(e: Ent, ignoreDefense = false): number {
-    const d = dist(e.x, e.y, HOOP.x, HOOP.y);
-    const two = isTwoPoint(e.x, e.y);
-    let p = d < 2.2 ? 0.76 : d < 4.5 ? 0.62 : !two ? 0.52 : d < 8.5 ? 0.4 : 0.14;
-    p += (e.pl.stats.sho - 5) * 0.045;
-    if (!ignoreDefense) {
-      let nd = 99;
-      for (const o of this.ents) if (o.team !== e.team && o.daze <= 0) nd = Math.min(nd, dist(o.x, o.y, e.x, e.y));
-      if (nd < 2.6) p -= (2.6 - nd) * 0.12;
-    } else p += 0.06;
-    if (e.boost > 0) p += 0.08;
-    return clamp(p, 0.04, 0.93);
-  }
-
-  private laneRisk(from: Ent, to: Ent, exclude?: Ent): { risk: number; thief: Ent | null; d: number } {
-    let best: Ent | null = null, bestD = 99;
-    for (const o of this.ents) {
-      if (o.team === from.team || o.daze > 0 || o === exclude) continue;
-      const { d, t } = segDist(o.x, o.y, from.x, from.y, to.x, to.y);
-      if (t > 0.08 && t < 0.97 && d < bestD) { bestD = d; best = o; }
-    }
-    if (!best || bestD > 0.95) return { risk: 0, thief: null, d: bestD };
-    return { risk: clamp(0.4 + (best.pl.stats.def - from.pl.stats.pas) * 0.05 + (0.95 - bestD) * 0.4, 0.15, 0.85), thief: best, d: bestD };
-  }
-
-  private openness(e: Ent) {
-    let nd = 99;
-    for (const o of this.ents) if (o.team !== e.team && o.daze <= 0) nd = Math.min(nd, dist(o.x, o.y, e.x, e.y));
-    return Math.min(nd, 5) - dist(e.x, e.y, HOOP.x, HOOP.y) * 0.15;
-  }
-
-  // ---------------- 3D helpers ----------------
+  // ---------------------------------------------------------------- helpers
+  private att(i: number) { return this.ents[this.offense * 3 + i]; }
+  private def(i: number) { return this.ents[(1 - this.offense) * 3 + i]; }
+  private get mu(): Matchup { return this.m[this.offense]; }
+  private get userAttacks() { return this.offense === 0; }
   private pos3(e: Ent, h = 0) { return w3(e.x, e.y, h + this.jumpOf(e)); }
   private jumpOf(e: Ent) { return e.jumpT > 0 ? Math.sin(Math.PI * (1 - e.jumpT / e.jumpDur)) * e.jumpH : 0; }
   private hand(e: Ent, h = 1.15) {
@@ -366,929 +224,864 @@ export class Match {
   }
   private jump(e: Ent, h: number, dur: number) { e.jumpH = h; e.jumpDur = dur; e.jumpT = dur; }
   private faceTo(e: Ent, x: number, y: number) { e.face = Math.atan2(x - e.x, y - e.y); }
-
+  private glide(e: Ent, x: number, y: number, dur: number, curve?: { x: number; y: number }) {
+    const sx = e.x, sy = e.y;
+    if (dist(sx, sy, x, y) < 0.03) { e.anim = null; return; }
+    e.anim = {
+      t: 0, dur, path: (k) => {
+        const q = ease(k);
+        if (!curve) return { x: sx + (x - sx) * q, y: sy + (y - sy) * q };
+        const a = (1 - q) * (1 - q), b = 2 * (1 - q) * q, c = q * q;
+        return { x: a * sx + b * curve.x + c * x, y: a * sy + b * curve.y + c * y };
+      },
+    };
+  }
   private fly(from: THREE.Vector3, to: THREE.Vector3, apex: number, dur: number, onLand: () => void) {
     this.holder = null;
     this.looseBall = null;
     this.flight = { curve: new ArcCurve(from.clone(), to.clone(), apex), t: 0, dur, onLand };
   }
 
-  // ---------------- free-play shots & passes (AI) ----------------
-  private shoot(e: Ent, made: boolean, after?: () => void) {
-    const pts = isTwoPoint(e.x, e.y) ? 2 : 1;
-    const d = dist(e.x, e.y, HOOP.x, HOOP.y);
-    this.faceTo(e, HOOP.x, HOOP.y);
-    this.jump(e, 0.45, 0.6);
-    e.armsT = 0.5;
-    sfx.tap();
-    this.holder = null;
-    this.looseBall = this.hand(e, 2.0);
-    this.later(0.22, () => {
-      const from = this.hand(e, 2.1);
-      if (made) {
-        this.fly(from, RIM.clone().add(new THREE.Vector3(0, 0.12, 0)), shotApex(d), 0.75 + d * 0.035, () => {
-          this.world.kickNet();
-          sfx.swish();
-          this.fly(RIM.clone(), w3(HOOP.x, HOOP.y + 0.3, 0.2), 0, 0.35, () => this.scored(e, pts));
-        });
-      } else {
-        const toward = new THREE.Vector3(e.x - HOOP.x, 0, e.y - HOOP.y).normalize();
-        const front = RIM.clone().addScaledVector(toward, 0.24).add(new THREE.Vector3(0, 0.05, 0));
-        this.fly(from, front, shotApex(d), 0.75 + d * 0.035, () => {
-          this.world.kickRim();
-          sfx.rim();
-          this.world.callout(RIM.clone().add(new THREE.Vector3(0, 0.6, 0)), icon('cross', 26), 'bad');
-          this.rebound(after);
-        });
-      }
-    });
-  }
-
-  private scored(shooter: Ent, pts: number) {
-    this.bump(`score${shooter.team}`);
-    this.score[shooter.team] += pts;
-    this.lines[shooter.pl.uid].pts += pts;
-    if (shooter.team === 0) sfx.cheer();
-    this.world.shake = 0.25;
-    this.world.callout(RIM.clone().add(new THREE.Vector3(0, 0.9, 0)), `+${pts}`, shooter.team === 0 ? 'good big' : 'bad big');
-    this.looseBall = w3(HOOP.x, HOOP.y + 0.6, 0.2);
-    const over = this.golden || this.score[shooter.team] >= WIN_SCORE;
-    const other = (1 - shooter.team) as 0 | 1;
-    this.pauseThen(1.1, () => (over ? this.finish() : this.setupCheck(other, 0)));
-  }
-
-  private rebound(after?: () => void) {
-    const offR = this.nearestTo(this.offense, HOOP.x, HOOP.y);
-    const defR = this.nearestTo((1 - this.offense) as 0 | 1, HOOP.x, HOOP.y);
-    const pOff = clamp(0.36 + ((offR.pl.stats.str + offR.pl.stats.blk) - (defR.pl.stats.str + defR.pl.stats.blk)) * 0.03, 0.12, 0.5);
-    const win = Math.random() < pOff ? offR : defR;
-    const ang = Math.random() * Math.PI;
-    const spot = { x: clamp(HOOP.x + Math.cos(ang) * 2.4, 1, COURT_W - 1), y: HOOP.y + Math.sin(ang) * 2.2 + 0.6 };
-    for (const e of [offR, defR]) { e.tx = spot.x; e.ty = spot.y; }
-    this.phase = this.phase === 'resolve' ? 'resolve' : 'pause';
-    this.phaseT = 99;
-    this.fly(RIM.clone(), w3(spot.x, spot.y, 1.6), 0.9, 0.55, () => {
-      this.jump(win, 0.35, 0.4);
-      win.x = spot.x + (win.x - spot.x) * 0.3; win.y = spot.y + (win.y - spot.y) * 0.3;
-      this.holder = win;
-      if (win.team === this.offense) {
-        this.shotClock = SHOT_CLOCK;
-        this.world.callout(this.pos3(win, 2.6), icon('ball', 24), win.team === 0 ? 'good' : 'bad');
-        if (this.offense === 0) { this.controlled = win; this.moveTarget = null; } else this.retargetDefense();
-        this.duelCd = 1.0;
-        this.phase = 'play';
-        after?.();
-      } else {
-        this.world.callout(this.pos3(win, 2.6), icon('ball', 24), win.team === 0 ? 'good' : 'bad');
-        const team = win.team;
-        this.pauseThen(0.7, () => this.setupCheck(team, win.slot));
-        after?.();
-      }
-    });
-  }
-
-  private nearestTo(team: 0 | 1, x: number, y: number) {
-    return this.ents.filter((e) => e.team === team).sort((a, b) => dist(a.x, a.y, x, y) - dist(b.x, b.y, x, y))[0];
-  }
-
-  private passTo(from: Ent, to: Ent) {
-    let thief: Ent | null = null;
-    const lr = this.laneRisk(from, to);
-    if (lr.thief && Math.random() < lr.risk) thief = lr.thief;
-    this.faceTo(from, to.x, to.y);
-    const end = thief ?? to;
-    const d = dist(from.x, from.y, end.x, end.y);
-    sfx.pass();
-    this.fly(this.hand(from), this.pos3(end, 1.2), 0.3, 0.12 + d / 14, () => {
-      if (thief) {
-        sfx.steal();
-        thief.armsT = 0.4;
-        this.world.callout(this.pos3(thief, 2.6), icon('steal', 26), thief.team === 0 ? 'good' : 'bad');
-        this.turnover(thief);
-        return;
-      }
-      this.holder = to;
-      this.retargetDefense();
-    });
-  }
-
-  private retargetDefense() {
-    if (this.offense === 1 && this.holder) {
-      const marker = this.ents.find((e) => e.team === 0 && e.slot === this.holder!.slot);
-      if (marker && this.idleT > 1.5) { this.controlled = marker; this.moveTarget = null; }
+  /** Where defenders stand for a stance (null = neutral, used while the stance is still hidden). */
+  private defSpot(s: Poss, i: number, stance: Stance | null): { x: number; y: number } {
+    const z = ZONES[s.zones[i]];
+    const b = ZONES[s.zones[s.ball]];
+    const toward = (fx: number, fy: number, tx: number, ty: number, d: number) => {
+      const l = Math.hypot(tx - fx, ty - fy) || 1;
+      return { x: fx + ((tx - fx) / l) * d, y: fy + ((ty - fy) / l) * d };
+    };
+    const onBall = i === s.ball;
+    if (s.adv[i] > 0) {
+      // Beaten or helped away: trailing to the side.
+      const p = toward(z.x, z.y, HOOP.x, HOOP.y, 1.6);
+      const side = z.x < HOOP.x ? 1.4 : -1.4;
+      return { x: clamp(p.x + side, 0.5, COURT_W - 0.5), y: p.y + 0.6 };
     }
-    if (this.offense === 0 && this.holder?.team === 0) { this.controlled = this.holder; this.moveTarget = null; }
+    let p: { x: number; y: number };
+    if (onBall) {
+      const d = stance === 'press' ? 0.75 : stance === 'space' ? 2.3 : 1.25;
+      p = toward(z.x, z.y, HOOP.x, HOOP.y, d);
+    } else if (stance === 'deny') {
+      const lane = { x: z.x + (b.x - z.x) * 0.28, y: z.y + (b.y - z.y) * 0.28 };
+      p = toward(lane.x, lane.y, HOOP.x, HOOP.y, 0.5);
+    } else if (stance === 'space') {
+      p = { x: z.x + (HOOP.x - z.x) * 0.45, y: z.y + (HOOP.y + 1.2 - z.y) * 0.45 };
+    } else {
+      const d = stance === 'press' ? 1.3 : 1.7;
+      const q = toward(z.x, z.y, HOOP.x, HOOP.y, d);
+      p = { x: q.x + (b.x - q.x) * 0.08, y: q.y + (b.y - q.y) * 0.08 };
+    }
+    return { x: clamp(p.x, 0.5, COURT_W - 0.5), y: clamp(p.y, 0.5, COURT_H - 0.5) };
+  }
+
+  private layout(s: Poss, stance: Stance | null, dur: number, skip: Ent[] = []) {
+    for (let i = 0; i < 3; i++) {
+      const a = this.att(i), d = this.def(i);
+      const z = ZONES[s.zones[i]];
+      if (!skip.includes(a)) this.glide(a, z.x, z.y, dur);
+      const p = this.defSpot(s, i, stance);
+      if (!skip.includes(d)) this.glide(d, p.x, p.y, dur);
+    }
+  }
+
+  private snapLayout(s: Poss, stance: Stance | null) {
+    for (let i = 0; i < 3; i++) {
+      const a = this.att(i), d = this.def(i);
+      const z = ZONES[s.zones[i]];
+      a.x = z.x; a.y = z.y; a.anim = null;
+      const p = this.defSpot(s, i, stance);
+      d.x = p.x; d.y = p.y; d.anim = null;
+      this.faceTo(a, HOOP.x, HOOP.y);
+      this.faceTo(d, a.x, a.y);
+    }
+  }
+
+  // ---------------------------------------------------------------- flow
+  private startPossession(first = false) {
+    const tut = this.o.tutorial;
+    let s: Poss;
+    this.shownStance = null;
+    if (tut) {
+      this.tutIdx++;
+      this.stepIdx = 0;
+      const t = tut[this.tutIdx];
+      s = setupPoss(t.setup, t.handler);
+      this.shownStance = t.stance ?? null;
+      this.hooks.banner(t.title, '#ffd166', `${this.tutIdx + 1} / ${tut.length}`);
+    } else {
+      s = setupPoss(SETUPS[Math.floor(this.rand() * SETUPS.length)], Math.floor(this.rand() * 3));
+      if (this.golden) this.hooks.banner('NEXT SCORE WINS', '#ffd60a');
+      else this.hooks.banner(this.offense === 0 ? 'YOUR BALL' : 'DEFENSE', this.teams[this.offense].color);
+    }
+    this.poss = s;
+    this.freed = null;
+    this.holder = this.att(s.ball);
+    this.flight = null;
+    this.looseBall = null;
+    for (const e of this.ents) { e.daze = 0; e.armsT = 0; }
+    if (first) this.snapLayout(s, this.shownStance);
+    else this.layout(s, this.shownStance, 0.8);
+    this.phase = 'intro';
+    sfx.whistle();
+    this.updateCamera(first);
+    this.pushHud();
+    this.later(first ? 1.2 : 1.0, () => this.openDecision());
+  }
+
+  private openDecision() {
+    const s = this.poss!;
+    this.phase = 'decide';
+    this.previewId = null;
+    if (this.userAttacks) {
+      if (this.o.tutorial) this.dist = this.shownStance ? ONE(this.shownStance) : readDefense(this.mu, s);
+      else this.dist = this.model.defend(this.mu, s, this.smart);
+      this.attDist = null;
+    } else {
+      this.attDist = aiAttackDist(this.planners[1], s, this.habits, this.smart, this.temp);
+      this.dist = null;
+    }
+    this.opts = this.buildOptions();
+    for (let i = 0; i < 3; i++) { this.faceTo(this.att(i), HOOP.x, HOOP.y); this.faceTo(this.def(i), this.att(i).x, this.att(i).y); }
+    this.updateCamera();
+    this.hooks.decision(true);
+    this.pushHud();
+  }
+
+  private tutStep(): GuideStep | null {
+    const t = this.o.tutorial?.[this.tutIdx];
+    return t?.steps[this.stepIdx] ?? null;
+  }
+
+  decisionInfo(): DecisionInfo | null {
+    const s = this.poss;
+    if (!s || this.phase !== 'decide') return null;
+    const step = this.userAttacks ? this.tutStep() : null;
+    return {
+      side: this.userAttacks ? 'att' : 'def',
+      left: s.left,
+      maxLeft: s.rebs > 0 ? TUNE.orebActions : TUNE.actions,
+      lean: this.userAttacks ? this.dist ?? undefined : undefined,
+      attLean: this.attDist ? this.attDist.reduce((acc, x) => { acc[x.item.k] += x.w; return acc; }, { shoot: 0, pass: 0, drive: 0, cut: 0 } as Record<ActKind, number>) : undefined,
+      shown: this.shownStance ?? undefined,
+      hint: step?.hint ?? (this.o.hints ? this.firstHint() : undefined),
+    };
+  }
+
+  private firstHint(): string | undefined {
+    if (this.decisions === 0 && this.userAttacks) return 'Pick a move. Odds are exact.';
+    if (!this.userAttacks && this.stats.defHint === undefined) return 'Pick a stance. They move at the same time.';
+    return undefined;
+  }
+
+  options(): OptionInfo[] { return this.opts; }
+
+  // ---------------------------------------------------------------- options & odds
+  private buildOptions(): OptionInfo[] {
+    const s = this.poss!;
+    const m = this.mu;
+    if (!this.userAttacks) return this.stanceOptions();
+    const dist = this.dist!;
+    const step = this.tutStep();
+    const out: OptionInfo[] = [];
+    const nextShot = (n: Poss, who: number) => {
+      // Make chance for `who` in state n against what the defense would do there.
+      const d = this.o.tutorial ? (this.shownStance ? ONE(this.shownStance) : readDefense(m, n)) : readDefense(m, n);
+      let p = 0;
+      for (const st of STANCES) p += d[st] * shotChance(m, n, who, st).make;
+      return p;
+    };
+    for (const a of legalActs(s)) {
+      const o = actOdds(m, s, a, dist);
+      const pc = toPercents(o);
+      const g = (k: Ev) => pc[k] ?? 0;
+      let info: OptionInfo;
+      switch (a.k) {
+        case 'shoot': {
+          const pts = ZONES[s.zones[s.ball]].kind === 'three' ? 2 : 1;
+          const odds: OddsItem[] = [
+            { key: 'make', pct: g('make'), tone: 'good', word: 'IN', icon: 'check' },
+            { key: 'miss', pct: g('miss') + g('oreb'), tone: 'mid', word: 'MISS', icon: 'cross' },
+            { key: 'block', pct: g('block'), tone: 'bad', word: 'BLOCK', icon: 'block' },
+          ];
+          info = {
+            id: actKey(a), kind: 'shoot', act: a, label: 'Shoot', odds, main: g('make'),
+            card: {
+              gain: `+${pts} at ${g('make')}%`,
+              risk: g('block') >= 3 ? `Block ${g('block')}%` : `Miss ${g('miss') + g('oreb')}%`,
+              change: 'Ends the possession',
+            },
+          };
+          break;
+        }
+        case 'pass': {
+          const to = this.att(a.to);
+          const n: Poss = { ...s, ball: a.to, adv: s.adv.map((t) => Math.max(0, t - 1)), left: s.left - 1 };
+          const then = pct(nextShot(n, a.to));
+          const odds: OddsItem[] = [
+            { key: 'catch', pct: g('catch'), tone: 'good', word: 'CATCH', icon: 'check' },
+            { key: 'pick', pct: g('pick'), tone: 'bad', word: 'PICKED', icon: 'steal' },
+          ];
+          info = {
+            id: actKey(a), kind: 'pass', act: a, label: 'Pass', tag: `#${to.pl.num}`, targetNum: to.pl.num, odds, main: g('catch'),
+            card: { gain: `#${to.pl.num} then shoots ${then}%`, risk: `Picked off ${g('pick')}%`, change: s.adv[a.to] > 0 ? 'To the open man' : 'Uses 1 move' },
+          };
+          break;
+        }
+        case 'drive': {
+          const z = ZONES[a.z];
+          const n: Poss = { ...s, zones: s.zones.map((x, j) => (j === s.ball ? a.z : x)), adv: s.adv.map((t, j) => (j === s.ball ? 1 : Math.max(0, t - 1))), left: s.left - 1 };
+          const then = pct(shotChance(m, n, s.ball, null).make);
+          const helpPossible = z.kind !== 'three' && (dist.space ?? 0) > 0;
+          const freedNum = this.att(helperFor(s, a.z)).pl.num;
+          const odds: OddsItem[] = [
+            { key: 'beat', pct: g('beat'), tone: 'good', word: 'PAST', icon: 'dribble' },
+            ...(g('help') > 0 ? [{ key: 'help', pct: g('help'), tone: 'good' as Tone, word: 'MATE FREE', icon: 'pass' }] : []),
+            { key: 'held', pct: g('held') + g('stopped'), tone: 'mid', word: 'HELD', icon: 'even' },
+            { key: 'steal', pct: g('steal'), tone: 'bad', word: 'STOLEN', icon: 'steal' },
+          ];
+          info = {
+            id: actKey(a), kind: 'drive', act: a, label: 'Drive', tag: z.name, odds, main: g('beat'),
+            card: {
+              gain: `Past ${g('beat')}%: then ${then}%`,
+              risk: `Stolen ${g('steal')}%`,
+              change: helpPossible ? `Help may free #${freedNum}` : `To the ${z.name.toLowerCase()}`,
+            },
+          };
+          break;
+        }
+        case 'cut': {
+          const who = this.att(a.who);
+          const z = ZONES[a.z];
+          const odds: OddsItem[] = [
+            { key: 'open', pct: g('open'), tone: 'good', word: 'OPEN', icon: 'check' },
+            { key: 'covered', pct: g('covered'), tone: 'mid', word: 'COVERED', icon: 'even' },
+            ...(g('steal') > 0 ? [{ key: 'steal', pct: g('steal'), tone: 'bad' as Tone, word: 'STRIPPED', icon: 'steal' }] : []),
+          ];
+          info = {
+            id: actKey(a), kind: 'cut', act: a, label: 'Cut', tag: `#${who.pl.num} ${z.name}`, targetNum: who.pl.num, odds, main: g('open'),
+            card: {
+              gain: `#${who.pl.num} open ${g('open')}%`,
+              risk: g('steal') > 0 ? `Ball stripped ${g('steal')}%` : 'No turnover risk',
+              change: `#${who.pl.num} to the ${z.name.toLowerCase()}`,
+            },
+          };
+          break;
+        }
+      }
+      if (step) {
+        let ok = step.allow.includes(a.k);
+        if (ok && a.k === 'drive' && step.zones) ok = step.zones.includes(a.z);
+        if (ok && a.k === 'pass' && step.toFreed) ok = a.to === this.freed;
+        info.disabled = !ok;
+        info.hint = ok;
+      }
+      out.push(info);
+    }
+    return out;
+  }
+
+  private stanceOptions(): OptionInfo[] {
+    const s = this.poss!;
+    const m = this.mu;
+    const attDist = this.attDist!;
+    const handler = this.att(s.ball);
+    const passes = legalActs(s).filter((a): a is Extract<Act, { k: 'pass' }> => a.k === 'pass');
+    const cuts = legalActs(s).filter((a): a is Extract<Act, { k: 'cut' }> => a.k === 'cut');
+    const bestCut = (st: Stance) => Math.max(0, ...cuts.map((c) => cutChance(m, c.who, st)));
+    const bestPick = (st: Stance) => Math.max(0, ...passes.map((p) => pickChance(m, s, p.to, st)));
+    return STANCES.map((st) => {
+      const o = toPercents(stanceOdds(m, s, st, attDist));
+      const odds: OddsItem[] = [
+        { key: 'ball', pct: o.ball, tone: 'good', word: 'BALL', icon: 'ball' },
+        { key: 'cont', pct: o.cont, tone: 'mid', word: 'GOES ON', icon: 'even' },
+        { key: 'score', pct: o.score, tone: 'bad', word: 'SCORE', icon: 'hoop' },
+      ];
+      const shot = pct(shotChance(m, s, s.ball, st).make);
+      const drive = driveChance(m, s, st);
+      let card: Card;
+      if (st === 'press') card = { gain: `#${handler.pl.num} shoots ${shot}%`, risk: s.left > 1 ? `Drive beats you ${pct(drive.beat)}%` : 'They must shoot now', change: 'Tight on the ball' };
+      else if (st === 'space') card = { gain: s.left > 1 ? `Drive held ${pct(1 - drive.beat - drive.steal)}%` : 'Help in the paint', risk: `#${handler.pl.num} shoots ${shot}%`, change: 'Sag and help' };
+      else card = { gain: passes.length && s.left > 1 ? `Pass picked ${pct(bestPick(st))}%` : 'Lanes closed', risk: cuts.length && s.left > 1 ? `Backdoor cut ${pct(bestCut(st))}%` : `#${handler.pl.num} shoots ${shot}%`, change: 'Close the lanes' };
+      return { id: st, kind: st, stance: st, label: STANCE_LABEL[st], odds, main: o.ball, card };
+    });
+  }
+
+  // ---------------------------------------------------------------- previews
+  preview(id: string | null) {
+    if (this.phase !== 'decide' || this.previewId === id) return;
+    this.previewId = id;
+    const W = this.world;
+    W.clearPreview();
+    const s = this.poss!;
+    if (!id) { this.showCategory(null); this.updateCamera(); return; }
+    const opt = this.opts.find((o) => o.id === id);
+    if (!opt) return;
+    const lab = (k: string, pos: THREE.Vector3) => {
+      const o = opt.odds.find((x) => x.key === k);
+      if (!o || o.pct <= 0) return;
+      W.label({ pos, html: `${icon(o.icon, 16)}<b>${o.pct}%</b><small>${o.word}</small>`, cls: `odds ${o.tone}` });
+    };
+    const h = this.att(s.ball);
+    const A = this.pos3(h);
+    const toHoop = new THREE.Vector3(HOOP.x - h.x, 0, HOOP.y - h.y).normalize();
+    const side = new THREE.Vector3(-toHoop.z, 0, toHoop.x);
+    if (opt.stance) { this.previewStance(opt, lab); this.updateCamera(); return; }
+    const a = opt.act!;
+    switch (a.k) {
+      case 'shoot': {
+        const D = this.pos3(this.def(s.ball));
+        const from = this.hand(h, 2.1);
+        const dd = dist(h.x, h.y, HOOP.x, HOOP.y);
+        const curve = new ArcCurve(from, RIM.clone().add(new THREE.Vector3(0, 0.12, 0)), shotApex(dd));
+        W.dots(curve, '#ffffff', 0.075, 0.34);
+        W.ghostBall(RIM.clone().add(new THREE.Vector3(0, 0.12, 0)), '#3ddc97');
+        if (!(s.adv[s.ball] > 0)) W.wall(D.clone().addScaledVector(toHoop, -0.1), toHoop, '#ff4d6d', 1.0, 0.9, 2.0);
+        lab('make', RIM.clone().add(new THREE.Vector3(0, 0.75, 0)));
+        lab('miss', RIM.clone().addScaledVector(side, 1.3).add(new THREE.Vector3(0, -0.1, 0)));
+        lab('block', D.clone().add(new THREE.Vector3(0, 3.0, 0)));
+        W.label({ pos: curve.getPoint(0.5).add(new THREE.Vector3(0, 0.35, 0)), html: `<b>+${ZONES[s.zones[s.ball]].kind === 'three' ? 2 : 1}</b>`, cls: 'pts' });
+        break;
+      }
+      case 'pass': {
+        const to = this.att(a.to);
+        const B = this.pos3(to, 1.2);
+        const curve = new ArcCurve(this.hand(h), B, 0.35);
+        W.dots(curve, '#9be7ff', 0.07, 0.32, 1.3);
+        W.ghostBall(B, '#3ddc97');
+        W.floorRing(this.pos3(to), '#3ddc97', 0.8);
+        W.floorRing(this.pos3(this.def(a.to)), '#ff4d6d', 0.7, false);
+        lab('catch', this.pos3(to, 2.6));
+        lab('pick', this.pos3(this.def(a.to), 2.4));
+        break;
+      }
+      case 'drive': {
+        const z = ZONES[a.z];
+        const route = this.routeCurve(h.x, h.y, z.x, z.y, this.def(s.ball));
+        W.dots(route, '#ffd166', 0.09, 0.3, 1.4);
+        W.floorRing(w3(z.x, z.y), '#3ddc97', 0.65);
+        W.floorRing(this.pos3(this.def(s.ball)), '#ff4d6d', 0.7, false);
+        lab('beat', w3(z.x, z.y, 0.5));
+        lab('held', A.clone().add(new THREE.Vector3(0, 2.7, 0)).addScaledVector(side, -0.7));
+        lab('steal', this.pos3(this.def(s.ball), 2.5));
+        if (opt.odds.some((x) => x.key === 'help')) {
+          const fr = helperFor(s, a.z);
+          W.floorRing(this.pos3(this.def(fr)), '#ff9f40', 0.7, false);
+          W.floorRing(this.pos3(this.att(fr)), '#3ddc97', 0.75);
+          lab('help', this.pos3(this.att(fr), 2.6));
+        }
+        break;
+      }
+      case 'cut': {
+        const c = this.att(a.who);
+        const z = ZONES[a.z];
+        const route = this.routeCurve(c.x, c.y, z.x, z.y, this.def(a.who));
+        W.dots(route, '#7ef0c0', 0.08, 0.3, 1.4);
+        W.floorRing(w3(z.x, z.y), '#3ddc97', 0.65);
+        W.floorRing(this.pos3(this.def(a.who)), '#ff4d6d', 0.7, false);
+        lab('open', w3(z.x, z.y, 0.6));
+        lab('covered', this.pos3(this.def(a.who), 2.4));
+        lab('steal', A.clone().add(new THREE.Vector3(0, 2.8, 0)));
+        break;
+      }
+    }
+    this.updateCamera();
+  }
+
+  private previewStance(opt: OptionInfo, lab: (k: string, p: THREE.Vector3) => void) {
+    const s = this.poss!;
+    const W = this.world;
+    const st = opt.stance!;
+    const color = st === 'press' ? '#f72585' : st === 'space' ? '#4cc9f0' : '#ffd166';
+    for (let i = 0; i < 3; i++) {
+      const p = this.defSpot(s, i, st);
+      W.floorRing(w3(p.x, p.y), color, 0.55);
+      const d = this.def(i);
+      W.dots(new THREE.CatmullRomCurve3([this.pos3(d, 0.06), w3(p.x, p.y, 0.06)]), color, 0.06, 0.28, 1.2);
+    }
+    const h = this.att(s.ball);
+    const H = this.pos3(h);
+    if (st === 'press') W.floorRing(H, '#f72585', 1.25);
+    if (st === 'space') W.floorRing(w3(HOOP.x, HOOP.y + 1.4), '#4cc9f0', 1.6, false);
+    if (st === 'deny') {
+      for (let j = 0; j < 3; j++) {
+        if (j === s.ball) continue;
+        W.dots(new ArcCurve(this.hand(h), this.pos3(this.att(j), 1.2), 0.3), '#ff4d6d', 0.05, 0.4, 0.6);
+      }
+    }
+    lab('ball', H.clone().add(new THREE.Vector3(0, 2.9, 0)));
+    lab('score', RIM.clone().add(new THREE.Vector3(0, 0.75, 0)));
+    lab('cont', H.clone().add(new THREE.Vector3(1.3, 1.6, 0)));
+  }
+
+  /** Destination rings for a category (tap targets in the world). */
+  showCategory(kind: ActKind | null) {
+    if (this.phase !== 'decide' || this.previewId) return;
+    const W = this.world;
+    W.clearPreview();
+    if (!kind) return;
+    for (const o of this.opts) {
+      if (o.kind !== kind || o.disabled || !o.act) continue;
+      const a = o.act;
+      const p = a.k === 'pass' ? this.pos3(this.att(a.to)) : a.k === 'drive' || a.k === 'cut' ? w3(ZONES[a.z].x, ZONES[a.z].y) : null;
+      if (!p) continue;
+      W.floorRing(p, a.k === 'cut' ? '#7ef0c0' : '#ffffff', 0.6);
+      W.label({ pos: p.clone().add(new THREE.Vector3(0, 0.5, 0)), html: `<b>${o.main}%</b>`, cls: 'odds tag' });
+    }
+  }
+
+  /** Option under a tap on the court (destination rings / receivers). */
+  optionAt(x: number, y: number, kind: ActKind | null): string | null {
+    if (this.phase !== 'decide' || !this.userAttacks) return null;
+    let best: string | null = null, bd = 1.3;
+    for (const o of this.opts) {
+      if (!o.act || o.disabled || (kind && o.kind !== kind)) continue;
+      const a = o.act;
+      const p = a.k === 'pass' ? this.att(a.to) : a.k === 'drive' || a.k === 'cut' ? ZONES[a.z] : null;
+      if (!p) continue;
+      const d = dist(p.x, p.y, x, y);
+      if (d < bd) { bd = d; best = o.id; }
+    }
+    return best;
+  }
+
+  onPick: ((id: string) => void) | null = null;
+  private onCanvasDown = (e: PointerEvent) => {
+    if (this.phase !== 'decide' || !this.userAttacks) return;
+    const p = this.world.pickCourt(e.clientX, e.clientY);
+    if (!p) return;
+    const id = this.optionAt(p.x, p.y, null);
+    if (id) this.onPick?.(id);
+  };
+
+  private routeCurve(x0: number, y0: number, x1: number, y1: number, around: Ent) {
+    const mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+    const dx = x1 - x0, dy = y1 - y0;
+    const l = Math.hypot(dx, dy) || 1;
+    const nx = -dy / l, ny = dx / l;
+    const sideSign = (around.x - mx) * nx + (around.y - my) * ny > 0 ? -1 : 1;
+    const bend = Math.min(1.2, l * 0.18);
+    const mid = { x: mx + nx * sideSign * bend, y: my + ny * sideSign * bend };
+    const pts = [0, 0.25, 0.5, 0.75, 1].map((k) => {
+      const a = (1 - k) * (1 - k), b = 2 * (1 - k) * k, c = k * k;
+      return w3(a * x0 + b * mid.x + c * x1, a * y0 + b * mid.y + c * y1, 0.08);
+    });
+    return new THREE.CatmullRomCurve3(pts);
+  }
+
+  private routeMid(x0: number, y0: number, x1: number, y1: number, around: Ent) {
+    const mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+    const dx = x1 - x0, dy = y1 - y0;
+    const l = Math.hypot(dx, dy) || 1;
+    const nx = -dy / l, ny = dx / l;
+    const sideSign = (around.x - mx) * nx + (around.y - my) * ny > 0 ? -1 : 1;
+    const bend = Math.min(1.2, l * 0.18);
+    return { x: mx + nx * sideSign * bend, y: my + ny * sideSign * bend };
+  }
+
+  // ---------------------------------------------------------------- resolution
+  confirm(id: string) {
+    if (this.phase !== 'decide') return;
+    const opt = this.opts.find((o) => o.id === id);
+    if (!opt || opt.disabled) return;
+    const s = this.poss!;
+    const m = this.mu;
+    let act: Act, stance: Stance;
+    if (this.userAttacks) {
+      act = opt.act!;
+      stance = sampleStance(this.dist!, this.rand());
+      this.model.observe(m, s, this.dist!, act);
+    } else {
+      stance = opt.stance!;
+      act = sampleWeighted(this.attDist!, this.rand());
+      this.habits.addStance(stance);
+      this.stats.defHint = 1;
+    }
+    const list = branches(m, s, act, stance);
+    const step = this.userAttacks ? this.tutStep() : null;
+    let r = this.rand();
+    if (step) {
+      // Guided lesson: land the roll on the outcome being taught (the odds shown are unchanged).
+      let acc = 0;
+      for (const b of list) {
+        if (b.ev === step.outcome) { r = acc + b.p / 2; break; }
+        acc += b.p;
+      }
+    }
+    const b = pickBranch(list, r);
+    this.decisions++;
+    this.stepIdx++;
+    this.bump(`${this.userAttacks ? 'att' : 'def'}:${act.k}:${b.ev}`);
+    this.lastRes = { act, stance, ev: b.ev, text: explain(act, stance, b, this.userAttacks) };
+    const handler = this.att(s.ball);
+    this.lines[handler.pl.uid].duels++;
+    const good = b.ev === 'make' || b.ev === 'beat' || b.ev === 'help' || b.ev === 'open' || b.ev === 'catch';
+    if (good) this.lines[handler.pl.uid].duelsWon++;
+    this.world.clearPreview();
+    this.hooks.decision(false);
+    this.phase = 'resolve';
+    this.resolve(s, act, stance, b);
+  }
+
+  private resolve(s: Poss, act: Act, stance: Stance, b: Branch) {
+    const userAtt = this.userAttacks;
+    const tone = (ev: Ev): Tone => {
+      const attGood = ev === 'make' || ev === 'beat' || ev === 'help' || ev === 'open' || ev === 'catch' || ev === 'oreb';
+      const neutral = ev === 'held' || ev === 'covered' || ev === 'stopped';
+      if (neutral) return 'mid';
+      return attGood === userAtt ? 'good' : 'bad';
+    };
+    const t = tone(b.ev);
+    // 1. Reveal the stance: the defense slides into it.
+    const onBallDef = this.def(s.ball);
+    this.world.callout(this.pos3(onBallDef, 2.8), `${icon(stance === 'space' ? 'space' : stance === 'press' ? 'press' : 'deny', 24)}<small>${STANCE_WORD[stance]}</small>`, 'move');
+    this.layout({ ...s, adv: s.adv }, stance, 0.4, s.adv.map((x, i) => (x > 0 ? this.def(i) : null)).filter((x): x is Ent => !!x));
+    sfx.duel();
+    // 2. The action.
+    this.later(0.5, () => this.animateAction(s, act, stance, b, t));
+  }
+
+  private animateAction(s: Poss, act: Act, stance: Stance, b: Branch, tone: Tone) {
+    const h = this.att(s.ball);
+    const hd = this.def(s.ball);
+    const say = (delay: number) => this.later(delay, () => this.hooks.explain(this.lastRes!.text, tone));
+    const next = (delay: number) => this.later(delay, () => this.afterAction(b));
+    switch (act.k) {
+      case 'shoot': {
+        const pts = b.pts;
+        this.faceTo(h, HOOP.x, HOOP.y);
+        this.jump(h, 0.45, 0.6);
+        h.armsT = 0.5;
+        if (b.ev === 'block' || stance === 'press') this.later(0.1, () => { this.jump(hd, 0.55, 0.6); hd.armsT = 0.6; this.faceTo(hd, h.x, h.y); });
+        this.holder = null;
+        this.looseBall = this.hand(h, 2.0);
+        const d = dist(h.x, h.y, HOOP.x, HOOP.y);
+        this.later(0.22, () => {
+          const from = this.hand(h, 2.1);
+          if (b.ev === 'block') {
+            sfx.clash();
+            this.world.shake = 0.3;
+            this.world.callout(this.pos3(hd, 3.0), icon('block', 30), tone);
+            const away = { x: clamp(h.x + (h.x - HOOP.x) * 0.25, 1, COURT_W - 1), y: clamp(h.y + 1.8, 1, COURT_H - 1) };
+            this.fly(from, w3(away.x, away.y, 0.9), 0.8, 0.5, () => { this.holder = hd; });
+            say(0.6); next(1.9);
+          } else if (b.ev === 'make') {
+            this.fly(from, RIM.clone().add(new THREE.Vector3(0, 0.12, 0)), shotApex(d), 0.75 + d * 0.035, () => {
+              this.world.kickNet();
+              sfx.swish();
+              if (h.team === 0) sfx.cheer();
+              this.score[h.team] += pts;
+              this.lines[h.pl.uid].pts += pts;
+              this.world.shake = 0.2;
+              this.world.callout(RIM.clone().add(new THREE.Vector3(0, 0.9, 0)), `+${pts}`, h.team === 0 ? 'good big' : 'bad big');
+              this.pushHud();
+              this.fly(RIM.clone(), w3(HOOP.x, HOOP.y + 0.3, 0.2), 0, 0.35, () => { this.looseBall = w3(HOOP.x, HOOP.y + 0.5, 0.2); });
+            });
+            say(1.2); next(2.4);
+          } else {
+            const toward = new THREE.Vector3(h.x - HOOP.x, 0, h.y - HOOP.y).normalize();
+            const front = RIM.clone().addScaledVector(toward, 0.24).add(new THREE.Vector3(0, 0.05, 0));
+            const reb = b.ev === 'oreb' ? this.att(b.next!.ball) : this.def(this.nearestDefToHoop());
+            this.fly(from, front, shotApex(d), 0.75 + d * 0.035, () => {
+              this.world.kickRim();
+              sfx.rim();
+              const spot = { x: clamp(HOOP.x + (reb.x - HOOP.x) * 0.5, 1, COURT_W - 1), y: clamp(HOOP.y + 1.6, 1, COURT_H - 1) };
+              this.glide(reb, spot.x, spot.y, 0.45);
+              this.fly(RIM.clone(), w3(spot.x, spot.y, 1.8), 0.9, 0.5, () => {
+                this.jump(reb, 0.35, 0.4);
+                this.holder = reb;
+                this.world.callout(this.pos3(reb, 2.6), icon('ball', 24), reb.team === 0 ? 'good' : 'bad');
+              });
+            });
+            say(1.3); next(2.6);
+          }
+        });
+        break;
+      }
+      case 'pass': {
+        const to = this.att(act.to);
+        this.faceTo(h, to.x, to.y);
+        sfx.pass();
+        if (b.ev === 'catch') {
+          this.fly(this.hand(h), this.pos3(to, 1.2), 0.35, 0.18 + dist(h.x, h.y, to.x, to.y) / 14, () => {
+            this.holder = to;
+            this.world.callout(this.pos3(to, 2.6), icon('check', 24), tone);
+          });
+          say(0.7); next(1.7);
+        } else {
+          const thief = this.def(act.to);
+          const lp = { x: h.x + (to.x - h.x) * 0.6, y: h.y + (to.y - h.y) * 0.6 };
+          this.glide(thief, lp.x, lp.y, 0.3);
+          this.jump(thief, 0.35, 0.4);
+          thief.armsT = 0.4;
+          this.fly(this.hand(h), w3(lp.x, lp.y, 1.5), 0.25, 0.34, () => {
+            sfx.steal();
+            this.holder = thief;
+            this.lines[thief.pl.uid].steals++;
+            this.world.callout(this.pos3(thief, 2.7), icon('steal', 28), tone);
+          });
+          say(0.7); next(1.9);
+        }
+        break;
+      }
+      case 'drive': {
+        const z = ZONES[act.z];
+        const mid = this.routeMid(h.x, h.y, z.x, z.y, hd);
+        if (b.ev === 'beat' || b.ev === 'held' || b.ev === 'help') {
+          this.glide(h, z.x, z.y, 0.75, mid);
+          if (b.ev === 'beat') {
+            hd.daze = 1.6;
+            const lag = { x: hd.x + (z.x - hd.x) * 0.3, y: hd.y + (z.y - hd.y) * 0.3 };
+            this.glide(hd, lag.x, lag.y, 0.6);
+            this.later(0.3, () => this.world.callout(this.pos3(h, 2.7), icon('dribble', 28), tone));
+          } else {
+            const p = this.defSpot({ ...s, zones: s.zones.map((x, j) => (j === s.ball ? act.z : x)) }, s.ball, 'press');
+            this.glide(hd, p.x, p.y, 0.75);
+            if (b.ev === 'help' && b.freed !== undefined) {
+              const helper = this.def(b.freed);
+              const hp = { x: z.x + (HOOP.x - z.x) * 0.25 + (helper.x > z.x ? 0.6 : -0.6), y: z.y + 0.2 };
+              this.later(0.25, () => this.glide(helper, hp.x, hp.y, 0.5));
+              this.later(0.8, () => this.world.callout(this.pos3(this.att(b.freed!), 2.6), icon('check', 24), userTone(this.userAttacks)));
+            }
+          }
+          sfx.whistle();
+          say(0.9); next(2.0);
+        } else if (b.ev === 'stopped') {
+          const p = { x: h.x + (z.x - h.x) * 0.35, y: h.y + (z.y - h.y) * 0.35 };
+          this.glide(h, p.x, p.y, 0.3);
+          this.glide(hd, hd.x + (p.x - hd.x) * 0.4, hd.y + (p.y - hd.y) * 0.4, 0.3);
+          this.later(0.35, () => { sfx.clash(); this.glide(h, ZONES[s.zones[s.ball]].x, ZONES[s.zones[s.ball]].y, 0.35); this.world.callout(this.pos3(h, 2.5).lerp(this.pos3(hd, 2.5), 0.5), icon('even', 26), 'mid'); });
+          say(0.8); next(1.8);
+        } else {
+          const p = { x: h.x + (z.x - h.x) * 0.3, y: h.y + (z.y - h.y) * 0.3 };
+          this.glide(h, p.x, p.y, 0.3);
+          this.glide(hd, p.x + 0.4, p.y + 0.2, 0.25);
+          hd.armsT = 0.3;
+          this.later(0.25, () => {
+            sfx.steal();
+            this.world.shake = 0.2;
+            this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => {
+              this.holder = hd;
+              this.lines[hd.pl.uid].steals++;
+              this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone);
+            });
+          });
+          say(0.8); next(1.9);
+        }
+        break;
+      }
+      case 'cut': {
+        const c = this.att(act.who);
+        const cd = this.def(act.who);
+        const z = ZONES[act.z];
+        const mid = this.routeMid(c.x, c.y, z.x, z.y, cd);
+        this.glide(c, z.x, z.y, 0.7, mid);
+        if (b.ev === 'open') {
+          cd.daze = 1.4;
+          this.glide(cd, cd.x + (z.x - cd.x) * 0.25, cd.y + (z.y - cd.y) * 0.25, 0.6);
+          this.later(0.6, () => this.world.callout(this.pos3(c, 2.6), icon('check', 24), tone));
+        } else {
+          const p = this.defSpot({ ...s, zones: s.zones.map((x, j) => (j === act.who ? act.z : x)) }, act.who, 'press');
+          this.glide(cd, p.x, p.y, 0.7);
+        }
+        if (b.ev === 'steal') {
+          this.glide(hd, h.x + 0.3, h.y - 0.3, 0.25);
+          hd.armsT = 0.3;
+          this.later(0.3, () => {
+            sfx.steal();
+            this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; });
+            this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone);
+          });
+        }
+        say(0.8); next(1.9);
+        break;
+      }
+    }
+  }
+
+  private nearestDefToHoop() {
+    let best = 0, bd = 99;
+    for (let i = 0; i < 3; i++) { const d = this.def(i); const dd = dist(d.x, d.y, HOOP.x, HOOP.y); if (dd < bd) { bd = dd; best = i; } }
+    return best;
+  }
+
+  private afterAction(b: Branch) {
+    if (this.phase === 'over') return;
+    if (b.next) {
+      this.poss = b.next;
+      if (b.ev === 'help') this.freed = b.freed ?? null;
+      this.holder = this.att(b.next.ball);
+      this.flight = null;
+      this.looseBall = null;
+      this.layout(b.next, this.shownStance, 0.45);
+      this.pushHud();
+      this.later(0.5, () => this.openDecision());
+      return;
+    }
+    // Possession over.
+    this.possN[this.offense]++;
+    this.poss = null;
+    this.pushHud();
+    if (this.o.tutorial) {
+      if (this.tutIdx + 1 >= this.o.tutorial.length) { this.finish(); return; }
+      this.later(0.3, () => this.startPossession());
+      return;
+    }
+    const [a, c] = this.score;
+    const max = MATCH_RULES.maxPoss;
+    if (this.score[this.offense] >= MATCH_RULES.winScore || (this.golden && this.possN[0] === this.possN[1] && a !== c)) { this.finish(); return; }
+    if (this.possN[0] === this.possN[1] && this.possN[0] >= max) {
+      if (a !== c) { this.finish(); return; }
+      if (!this.golden) { this.golden = true; sfx.buzzer(); }
+    }
+    this.offense = (1 - this.offense) as 0 | 1;
+    this.later(0.3, () => this.startPossession());
   }
 
   private finish() {
     this.phase = 'over';
     sfx.buzzer();
     const won = this.score[0] > this.score[1];
+    if (this.o.tutorial) {
+      this.hooks.banner('READY', '#3ddc97', 'Tutorial complete');
+      this.later(1.6, () => this.hooks.end({ score: [...this.score] as [number, number], won: true, lines: this.lines, tutorial: true }));
+      return;
+    }
     this.hooks.banner(won ? 'VICTORY' : 'DEFEAT', won ? '#3ddc97' : '#ff4d6d', `${this.score[0]} - ${this.score[1]}`);
     this.later(1.8, () => this.hooks.end({ score: [...this.score] as [number, number], won, lines: this.lines }));
   }
 
-  quit(): MatchResult {
-    return { score: [...this.score] as [number, number], won: false, lines: this.lines, quit: true };
-  }
-
-  // ---------------- decisions ----------------
-  private openDecision(side: 'att' | 'def', att: Ent, def: Ent, space: number, shotIntent = false) {
-    this.phase = 'decide';
-    this.moveTarget = null;
-    this.keys.clear();
-    this.decisions++;
-    sfx.duel();
-    this.controlled = side === 'att' ? att : def;
-    this.faceTo(att, HOOP.x, HOOP.y);
-    this.faceTo(def, att.x, att.y);
-    const mates = this.ents.filter((e) => e.team === att.team && e !== att).sort((a, b) => a.slot - b.slot);
-    const laneMods = mates.map((m) => {
-      const lr = this.laneRisk(att, m, def);
-      const far = dist(att.x, att.y, m.x, m.y) > 8;
-      return (lr.thief ? -1 : 0) + (far ? -1 : 0);
-    });
-    const ctx: DuelContext = {
-      att: { player: att.pl, energy: att.energy },
-      def: { player: def.pl, energy: def.energy },
-      shotDist: dist(att.x, att.y, HOOP.x, HOOP.y),
-      isTwo: isTwoPoint(att.x, att.y),
-      shotClock: this.shotClock,
-      space,
-      pOpen: this.shotChance(att, true),
-      pCont: this.shotChance(att),
-      laneMods,
-      shotIntent,
-    };
-    const smart = 0.1 + this.tier * 0.09;
-    this.decision = {
-      side, att, def, ctx, mates,
-      attDist: aiAttackDist(ctx, this.memory, smart),
-      defDist: aiDefendDist(ctx, this.memory, smart),
-      special: false,
-      previewId: null,
-    };
-    this.world.callout(this.pos3(att, 2.9).lerp(this.pos3(def, 2.9), 0.5), icon('act', 34), 'flash');
-    this.hooks.decision(true);
-  }
-
-  decisionInfo(): DecisionInfo | null {
-    const d = this.decision;
-    if (!d) return null;
-    const me = d.side === 'att' ? d.att : d.def;
-    const them = d.side === 'att' ? d.def : d.att;
-    const unit = d.side === 'att' ? d.ctx.att : d.ctx.def;
-    const acts: Action[] = d.side === 'att' ? ['shoot', 'pass', 'dribble', 'protect'] : ['steal', 'block', 'press', 'wait'];
-    return {
-      side: d.side,
-      me: { name: me.pl.name, num: me.pl.num, energy: me.energy, color: this.teams[me.team].color },
-      them: { name: them.pl.name, num: them.pl.num, color: this.teams[them.team].color },
-      special: d.special,
-      specialAvailable: acts.some((a) => !!bestTech(unit, a)),
-      pts: d.ctx.isTwo ? 2 : 1,
-    };
-  }
-
-  toggleSpecial() {
-    const d = this.decision;
-    if (!d || this.phase !== 'decide') return;
-    d.special = !d.special;
-    sfx.tap();
-    const id = d.previewId;
-    d.previewId = null;
-    if (id) this.preview(id);
-  }
-
-  options(): OptionInfo[] {
-    const d = this.decision;
-    if (!d) return [];
-    const out: OptionInfo[] = [];
-    if (d.side === 'att') {
-      const unit = d.ctx.att;
-      const mk = (action: AttackAction, target?: number): OptionInfo => {
-        const tech = d.special ? bestTech(unit, action) : undefined;
-        const choice: Choice<AttackAction> = { action, tech, target };
-        const pc = toPercents(attackOdds(d.ctx, choice, d.defDist));
-        const odds = this.attackOddsItems(action, pc);
-        return {
-          id: target === undefined ? action : `${action}${target}`, action, label: OPT_LABEL[action], tech, target,
-          targetNum: target === undefined ? undefined : d.mates[target].pl.num,
-          odds, main: odds.filter((o) => o.tone === 'good').reduce((a, o) => a + o.pct, 0),
-        };
-      };
-      out.push(mk('shoot'), ...d.mates.map((_, i) => mk('pass', i)), mk('dribble'), mk('protect'));
-    } else {
-      const unit = d.ctx.def;
-      for (const action of ['steal', 'block', 'press', 'wait'] as DefendAction[]) {
-        const tech = d.special ? bestTech(unit, action) : undefined;
-        const o = toPercents(defenseOdds(d.ctx, { action, tech }, d.attDist));
-        const odds: OddsItem[] = [
-          { key: 'ball', pct: o.ball, tone: 'good', word: 'BALL', icon: 'ball' },
-          { key: 'even', pct: o.even, tone: 'mid', word: 'EVEN', icon: 'even' },
-          { key: 'beaten', pct: o.beaten, tone: 'bad', word: 'BEAT', icon: 'beaten' },
-          { key: 'score', pct: o.score, tone: 'bad', word: 'SCORE', icon: 'hoop' },
-        ];
-        out.push({ id: action, action, label: OPT_LABEL[action], tech, odds, main: o.ball });
-      }
-    }
-    return out;
-  }
-
-  private attackOddsItems(action: AttackAction, pc: Record<string, number>): OddsItem[] {
-    switch (action) {
-      case 'shoot': return [
-        { key: 'score', pct: pc.score ?? 0, tone: 'good', word: 'IN', icon: 'check' },
-        { key: 'miss', pct: pc.miss ?? 0, tone: 'mid', word: 'MISS', icon: 'cross' },
-        { key: 'blocked', pct: pc.blocked ?? 0, tone: 'bad', word: 'BLOCK', icon: 'block' },
-      ];
-      case 'pass': return [
-        { key: 'complete', pct: pc.complete ?? 0, tone: 'good', word: 'CATCH', icon: 'check' },
-        { key: 'deflect', pct: pc.deflect ?? 0, tone: 'mid', word: 'TIPPED', icon: 'even' },
-        { key: 'intercept', pct: pc.intercept ?? 0, tone: 'bad', word: 'PICKED', icon: 'steal' },
-      ];
-      case 'dribble': return [
-        { key: 'blowby', pct: pc.blowby ?? 0, tone: 'good', word: 'PAST', icon: 'dribble' },
-        { key: 'standoff', pct: pc.standoff ?? 0, tone: 'mid', word: 'HELD', icon: 'even' },
-        { key: 'stolen', pct: pc.stolen ?? 0, tone: 'bad', word: 'STOLEN', icon: 'steal' },
-      ];
-      case 'protect': return [
-        { key: 'shove', pct: pc.shove ?? 0, tone: 'good', word: 'SPACE', icon: 'protect' },
-        { key: 'standoff', pct: pc.standoff ?? 0, tone: 'mid', word: 'HELD', icon: 'even' },
-        { key: 'trapped', pct: pc.trapped ?? 0, tone: 'bad', word: 'TRAPPED', icon: 'press' },
-      ];
-    }
-  }
-
-  // ---------------- previews ----------------
-  preview(id: string | null) {
-    const d = this.decision;
-    if (!d || this.phase !== 'decide' || d.previewId === id) return;
-    d.previewId = id;
-    this.world.clearPreview();
-    if (!id) return;
-    const opt = this.options().find((o) => o.id === id);
-    if (!opt) return;
-    this.previewOpt = opt;
-    const W = this.world;
-    const att = d.att, def = d.def;
-    const A = this.pos3(att), D = this.pos3(def);
-    const pct = (k: string) => opt.odds.find((o) => o.key === k)!;
-    const lab = (k: string, pos: THREE.Vector3) => {
-      const o = pct(k);
-      W.label({ pos, html: `${icon(o.icon, 16)}<b>${o.pct}%</b><small>${o.word}</small>`, cls: `odds ${o.tone}` });
-    };
-    const towardHoop = new THREE.Vector3(HOOP.x - att.x, 0, HOOP.y - att.y).normalize();
-    const side = new THREE.Vector3(-towardHoop.z, 0, towardHoop.x);
-    if (opt.tech) W.label({ pos: this.pos3(d.side === 'att' ? att : def, 3.2), html: `${icon('star', 16)}<b>+${opt.tech.bonus}</b>`, cls: 'odds tech' });
-
-    switch (opt.action) {
-      case 'shoot': {
-        const from = this.hand(att, 2.1);
-        const dd = d.ctx.shotDist;
-        const curve = new ArcCurve(from, RIM.clone().add(new THREE.Vector3(0, 0.12, 0)), shotApex(dd));
-        W.dots(curve, '#ffffff', 0.075, 0.34);
-        W.ghostBall(RIM.clone().add(new THREE.Vector3(0, 0.12, 0)), '#3ddc97');
-        W.floorRing(w3(HOOP.x, HOOP.y), '#3ddc97', 0.5);
-        W.wall(D.clone().addScaledVector(towardHoop, -0.1), towardHoop, '#ff4d6d', 1.0, 0.9, 2.0);
-        lab('score', RIM.clone().add(new THREE.Vector3(0, 0.75, 0)));
-        lab('miss', RIM.clone().addScaledVector(side, 1.3).add(new THREE.Vector3(0, -0.1, 0)));
-        lab('blocked', D.clone().add(new THREE.Vector3(0, 3.1, 0)));
-        W.label({ pos: curve.getPoint(0.5).add(new THREE.Vector3(0, 0.35, 0)), html: `<b>+${d.ctx.isTwo ? 2 : 1}</b>`, cls: 'pts' });
-        break;
-      }
-      case 'pass': {
-        const to = d.mates[opt.target!];
-        const B = this.pos3(to, 1.2);
-        const curve = new ArcCurve(this.hand(att), B, 0.35);
-        W.dots(curve, '#9be7ff', 0.07, 0.32, 1.3);
-        W.ghostBall(B, '#3ddc97');
-        W.floorRing(this.pos3(to), '#3ddc97', 0.8);
-        W.floorRing(D, '#ff4d6d', 0.7, false);
-        const lane = this.laneRisk(att, to, def);
-        if (lane.thief) W.floorRing(this.pos3(lane.thief), '#ff4d6d', 0.7);
-        lab('complete', this.pos3(to, 2.6));
-        lab('deflect', curve.getPoint(0.5).add(new THREE.Vector3(0, 0.7, 0)));
-        lab('intercept', D.clone().add(new THREE.Vector3(0, 2.6, 0)));
-        break;
-      }
-      case 'dribble': {
-        const route = this.driveRoute(att, def);
-        const pts = [0, 0.25, 0.5, 0.75, 1].map((k) => { const p = route(k); return w3(p.x, p.y, 0.08); });
-        W.dots(new THREE.CatmullRomCurve3(pts), '#ffd166', 0.09, 0.3, 1.4);
-        const end = route(1);
-        W.floorRing(w3(end.x, end.y), '#3ddc97', 0.6);
-        W.floorRing(D, '#ff4d6d', 0.7, false);
-        lab('blowby', w3(end.x, end.y, 0.4));
-        lab('standoff', A.clone().add(new THREE.Vector3(0, 2.7, 0)).addScaledVector(side, -0.6));
-        lab('stolen', D.clone().add(new THREE.Vector3(0, 2.6, 0)));
-        break;
-      }
-      case 'protect': {
-        W.dome(A, '#4cc9f0', 1.05);
-        const push = this.pushSpot(def, att, 1.8);
-        const pts = [D.clone().setY(0.08), w3(push.x, push.y, 0.08)];
-        W.dots(new THREE.CatmullRomCurve3(pts), '#4cc9f0', 0.08, 0.3, 1.2);
-        lab('shove', w3(push.x, push.y, 1.4));
-        lab('standoff', A.clone().add(new THREE.Vector3(0, 2.9, 0)).addScaledVector(side, -0.7));
-        lab('trapped', D.clone().add(new THREE.Vector3(0, 2.6, 0)));
-        W.label({ pos: A.clone().add(new THREE.Vector3(0, 0.3, 0)).addScaledVector(side, -1.2), html: `${icon('energy', 16)}<b>+25</b>`, cls: 'odds energy' });
-        break;
-      }
-      default:
-        this.previewDefense(opt, A, D, side, lab);
-    }
-    this.updateCamera();
-  }
-
-  private previewDefense(opt: OptionInfo, A: THREE.Vector3, D: THREE.Vector3, side: THREE.Vector3, lab: (k: string, p: THREE.Vector3) => void) {
-    const d = this.decision!;
-    const W = this.world;
-    const att = d.att;
-    const ballP = this.hand(att);
-    const toAtt = new THREE.Vector3(att.x - d.def.x, 0, att.y - d.def.y).normalize();
-    switch (opt.action) {
-      case 'steal': {
-        const curve = new ArcCurve(this.pos3(d.def, 1.1), ballP, 0.25);
-        W.dots(curve, '#ffd166', 0.08, 0.22, 1.6);
-        W.ghostBall(ballP, '#3ddc97');
-        break;
-      }
-      case 'block': {
-        const toHoop = new THREE.Vector3(HOOP.x - att.x, 0, HOOP.y - att.y).normalize();
-        W.wall(A.clone().addScaledVector(toHoop, 0.75), toHoop, '#ff8c42', 1.3, 1.1, 2.0);
-        const curve = new ArcCurve(this.hand(att, 2.1), RIM.clone(), shotApex(d.ctx.shotDist));
-        W.dots(curve, '#ffffff', 0.05, 0.45, 0.6);
-        break;
-      }
-      case 'press': {
-        W.floorRing(A, '#f72585', 1.25);
-        W.floorRing(A, '#f72585', 0.85);
-        const pts = [D.clone().setY(0.08), A.clone().setY(0.08).addScaledVector(toAtt, -0.4)];
-        W.dots(new THREE.CatmullRomCurve3(pts), '#f72585', 0.08, 0.25, 1.4);
-        break;
-      }
-      case 'wait': {
-        W.sector(D, Math.atan2(toAtt.x, toAtt.z) - Math.PI / 2, 1.6, 3.2, '#4cc9f0');
-        for (const m of d.mates) {
-          W.dots(new ArcCurve(this.hand(att), this.pos3(m, 1.2), 0.3), '#4cc9f0', 0.05, 0.4, 0.6);
-        }
-        W.label({ pos: D.clone().add(new THREE.Vector3(0, 0.3, 0)).addScaledVector(side, 1.0), html: `${icon('energy', 16)}<b>+25</b>`, cls: 'odds energy' });
-        break;
-      }
-    }
-    lab('ball', ballP.clone().add(new THREE.Vector3(0, 0.9, 0)).addScaledVector(side, 0.9));
-    lab('even', A.clone().lerp(D, 0.5).add(new THREE.Vector3(0, 1.0, 0)).addScaledVector(side, -1.4));
-    lab('beaten', D.clone().addScaledVector(toAtt, -1.2).add(new THREE.Vector3(0, 0.5, 0)).addScaledVector(side, 1.2));
-    lab('score', A.clone().add(new THREE.Vector3(0, 3.0, 0)).addScaledVector(side, 0.4));
-  }
-
-  private driveRoute(att: Ent, def: Ent) {
-    const tx = HOOP.x - att.x, ty = HOOP.y - att.y;
-    const l = Math.hypot(tx, ty) || 1;
-    const fx = tx / l, fy = ty / l;
-    // Go around the defender on the side with more room.
-    const sx = -fy, sy = fx;
-    const sideSign = (def.x - att.x) * sx + (def.y - att.y) * sy > 0 ? -1 : 1;
-    const len = Math.min(3.6, Math.max(1.8, l - 1.4));
-    const end = { x: clamp(att.x + fx * len, 0.6, COURT_W - 0.6), y: clamp(att.y + fy * len, 0.6, COURT_H - 0.6) };
-    const mid = { x: att.x + fx * len * 0.5 + sx * sideSign * 1.3, y: att.y + fy * len * 0.5 + sy * sideSign * 1.3 };
-    const sx0 = att.x, sy0 = att.y;
-    return (k: number) => {
-      const a = (1 - k) * (1 - k), b = 2 * (1 - k) * k, c = k * k;
-      return { x: a * sx0 + b * mid.x + c * end.x, y: a * sy0 + b * mid.y + c * end.y };
-    };
-  }
-
-  private pushSpot(e: Ent, from: Ent, amount: number) {
-    const dx = e.x - from.x, dy = e.y - from.y;
-    const l = Math.hypot(dx, dy) || 1;
-    return { x: clamp(e.x + (dx / l) * amount, 0.4, COURT_W - 0.4), y: clamp(e.y + (dy / l) * amount, 0.4, COURT_H - 0.4) };
-  }
-
-  /** Confirm the user's choice. */
-  confirm(id: string) {
-    const d = this.decision;
-    if (!d || this.phase !== 'decide') return;
-    const opt = this.options().find((o) => o.id === id);
-    if (!opt) return;
-    this.world.clearPreview();
-    this.hooks.decision(false);
-    let res: DuelResult;
-    if (d.side === 'att') {
-      const mine: Choice<AttackAction> = { action: opt.action as AttackAction, tech: opt.tech, target: opt.target };
-      res = resolveDuel(d.ctx, mine, sample(d.defDist));
-    } else {
-      const ai = sample(d.attDist);
-      if (ai.action === 'pass') {
-        const best = [...d.mates].sort((a, b) => this.openness(b) - this.openness(a))[0];
-        ai.target = d.mates.indexOf(best);
-      }
-      res = resolveDuel(d.ctx, ai, { action: opt.action as DefendAction, tech: opt.tech });
-    }
-    this.memory.push(d.side, d.side === 'att' ? res.att.action : res.def.action);
-    this.bump(`${d.side}:${res.outcome}`);
-    this.applyDuel(d, res);
-  }
-
-  private applyDuel(d: Decision, res: DuelResult) {
-    const { att, def } = d;
-    att.energy -= res.att.tech?.cost ?? 0;
-    def.energy -= res.def.tech?.cost ?? 0;
-    att.energy += 10 + (res.att.action === 'protect' ? 15 : 0);
-    def.energy += 10 + (res.def.action === 'wait' ? 15 : 0);
-    att.energy = clamp(att.energy, 0, 100);
-    def.energy = clamp(def.energy, 0, 100);
-    this.lines[att.pl.uid].duels++;
-    this.lines[def.pl.uid].duels++;
-    if (res.winner === 'att') this.lines[att.pl.uid].duelsWon++;
-    if (res.winner === 'def') this.lines[def.pl.uid].duelsWon++;
-    if (!this.golden) this.clock = Math.max(0, this.clock - 2);
-    this.phase = 'resolve';
-    this.phaseT = 99;
-    this.duelCd = 2.0;
-    const userGood = (res.winner === 'att') === (d.side === 'att');
-    const tone = res.winner === 'tie' ? 'mid' : userGood ? 'good' : 'bad';
-    // Reveal both moves above the players' heads.
-    this.world.callout(this.pos3(att, 2.7), icon(res.att.action, 30) + (res.att.tech ? icon('star', 16) : ''), 'move');
-    this.world.callout(this.pos3(def, 2.7), icon(res.def.action, 30) + (res.def.tech ? icon('star', 16) : ''), 'move');
-    const back = (t = 0.5) => this.later(t, () => { if (this.phase === 'resolve') { this.phase = 'play'; this.decision = null; } });
-    const done = () => { this.decision = null; };
-
-    switch (res.outcome) {
-      case 'score':
-      case 'miss': {
-        if (res.def.action === 'block') this.later(0.15, () => { this.jump(def, 0.5, 0.6); def.armsT = 0.6; });
-        this.shoot(att, res.outcome === 'score', done);
-        break;
-      }
-      case 'blocked': {
-        this.jump(att, 0.4, 0.6);
-        att.armsT = 0.4;
-        this.later(0.1, () => { this.jump(def, 0.6, 0.6); def.armsT = 0.7; this.faceTo(def, att.x, att.y); });
-        this.looseBall = this.hand(att, 2.0);
-        this.holder = null;
-        this.later(0.3, () => {
-          sfx.clash();
-          this.world.shake = 0.3;
-          this.world.callout(this.pos3(def, 3.0), icon('block', 30), tone);
-          const away = this.pushSpot(att, def, 2.5);
-          this.fly(this.hand(att, 2.3), w3(away.x, away.y, 0.9), 0.8, 0.5, () => {
-            this.decision = null;
-            this.turnover(def);
-          });
-        });
-        break;
-      }
-      case 'complete':
-      case 'deflect':
-      case 'intercept': {
-        const to = res.att.target !== undefined ? d.mates[res.att.target] : d.mates[0];
-        this.faceTo(att, to.x, to.y);
-        sfx.pass();
-        if (res.outcome === 'complete') {
-          def.daze = 1.0;
-          to.boost = 1.5;
-          this.fly(this.hand(att), this.pos3(to, 1.2), 0.35, 0.15 + dist(att.x, att.y, to.x, to.y) / 14, () => {
-            this.holder = to;
-            this.world.callout(this.pos3(to, 2.6), icon('check', 26), tone);
-            this.retargetDefense();
-            this.decision = null;
-            this.phase = 'play';
-          });
-        } else if (res.outcome === 'deflect') {
-          const mid = this.pos3(att, 1.4).lerp(this.pos3(to, 1.4), 0.25);
-          def.armsT = 0.4;
-          this.fly(this.hand(att), mid, 0.2, 0.22, () => {
-            sfx.clash();
-            this.world.callout(mid.clone().add(new THREE.Vector3(0, 0.8, 0)), icon('even', 26), tone);
-            this.fly(mid, this.hand(att), 0.3, 0.3, () => {
-              this.holder = att;
-              this.shotClock = Math.max(1, this.shotClock - 3);
-              this.separate(att, def, 1.2);
-              this.decision = null;
-              this.phase = 'play';
-            });
-          });
-        } else {
-          const lp = { x: att.x + (to.x - att.x) * 0.35, y: att.y + (to.y - att.y) * 0.35 };
-          const sx = def.x, sy = def.y;
-          def.anim = { t: 0, dur: 0.3, path: (k) => ({ x: sx + (lp.x - sx) * ease(k), y: sy + (lp.y - sy) * ease(k) }) };
-          this.jump(def, 0.35, 0.4);
-          def.armsT = 0.4;
-          this.fly(this.hand(att), w3(lp.x, lp.y, 1.5), 0.2, 0.32, () => {
-            sfx.steal();
-            this.world.callout(w3(lp.x, lp.y, 2.7), icon('steal', 28), tone);
-            this.decision = null;
-            this.turnover(def);
-          });
-        }
-        break;
-      }
-      case 'blowby': {
-        const route = this.driveRoute(att, def);
-        att.anim = { t: 0, dur: 0.6, path: (k) => route(ease(k)) };
-        def.daze = 2.5;
-        att.boost = 2.0;
-        sfx.whistle();
-        this.later(0.2, () => this.world.callout(this.pos3(att, 2.7), icon('dribble', 28), tone));
-        if (d.side === 'att') {
-          // Chain straight into a follow-up decision with the defender beaten: the payoff of a good drive.
-          this.later(0.7, () => {
-            if (this.phase !== 'resolve' || this.holder !== att) return;
-            this.decision = null;
-            this.openDecision('att', att, def, 2);
-          });
-        } else back(0.7);
-        break;
-      }
-      case 'standoff': {
-        sfx.clash();
-        this.separate(att, def, 1.4);
-        this.shotClock = Math.max(1, this.shotClock - 2);
-        this.world.callout(this.pos3(att, 2.4).lerp(this.pos3(def, 2.4), 0.5), icon('even', 28), 'mid');
-        back(0.6);
-        break;
-      }
-      case 'shove': {
-        const p = this.pushSpot(def, att, 1.8);
-        const sx = def.x, sy = def.y;
-        def.anim = { t: 0, dur: 0.35, path: (k) => ({ x: sx + (p.x - sx) * ease(k), y: sy + (p.y - sy) * ease(k) }) };
-        def.daze = 1.2;
-        sfx.clash();
-        this.world.callout(this.pos3(att, 2.7), icon('protect', 28), tone);
-        back(0.6);
-        break;
-      }
-      case 'stolen':
-      case 'trapped': {
-        const sx = def.x, sy = def.y;
-        const p = { x: def.x + (att.x - def.x) * 0.35, y: def.y + (att.y - def.y) * 0.35 };
-        def.anim = { t: 0, dur: 0.2, path: (k) => ({ x: sx + (p.x - sx) * k, y: sy + (p.y - sy) * k }) };
-        def.armsT = 0.3;
-        this.later(0.18, () => {
-          sfx.steal();
-          this.world.shake = 0.2;
-          this.fly(this.hand(att), this.pos3(def, 1.2), 0.15, 0.22, () => {
-            this.world.callout(this.pos3(def, 2.7), icon(res.outcome === 'stolen' ? 'steal' : 'press', 28), tone);
-            this.decision = null;
-            this.turnover(def);
-          });
-        });
-        break;
-      }
-    }
-  }
-
-  private separate(a: Ent, b: Ent, amount: number) {
-    for (const [e, from] of [[a, b], [b, a]] as [Ent, Ent][]) {
-      const p = this.pushSpot(e, from, amount / 2);
-      const sx = e.x, sy = e.y;
-      e.anim = { t: 0, dur: 0.3, path: (k) => ({ x: sx + (p.x - sx) * ease(k), y: sy + (p.y - sy) * ease(k) }) };
-    }
-  }
-
-  // ---------------- simulation ----------------
-  private speed(e: Ent) {
-    let v = 2.5 + e.pl.stats.spd * 0.22;
-    if (e === this.holder) v *= 0.9;
-    if (e.boost > 0) v *= 1.4;
-    if (e.daze > 0) v *= 0.3;
-    return v;
-  }
-
+  // ---------------------------------------------------------------- loop
   private loop = (now: number) => {
     if (this.destroyed) return;
     const dt = Math.min(0.05, (now - this.last) / 1000);
     this.last = now;
-    if (!this.paused) this.update(dt);
+    if (!this.paused) this.update(dt * this.timeScale);
     this.sync(this.paused ? 0 : dt);
     this.raf = requestAnimationFrame(this.loop);
   };
 
-  /** Advance the simulation (exposed for tests). */
+  /** Advance animations and timers (exposed for tests). */
   update(dt: number) {
-    this.time += dt;
-    this.idleT += dt;
-    if (this.phase !== 'decide') {
-      const due = this.timers.filter((t) => (t.t -= dt) <= 0);
-      this.timers = this.timers.filter((t) => t.t > 0);
-      for (const t of due) t.fn();
-    }
+    const due = this.timers.filter((t) => (t.t -= dt) <= 0);
+    this.timers = this.timers.filter((t) => t.t > 0);
+    for (const t of due) t.fn();
     for (const e of this.ents) {
       if (e.jumpT > 0) e.jumpT = Math.max(0, e.jumpT - dt);
       if (e.armsT > 0) e.armsT = Math.max(0, e.armsT - dt);
+      if (e.daze > 0) e.daze = Math.max(0, e.daze - dt);
       e.arms += ((e.armsT > 0 ? 1 : 0) - e.arms) * Math.min(1, dt * 14);
       if (e.anim) {
         e.anim.t += dt;
         const k = Math.min(1, e.anim.t / e.anim.dur);
         const p = e.anim.path(k);
         if (Math.hypot(p.x - e.x, p.y - e.y) > 0.01) e.face = Math.atan2(p.x - e.x, p.y - e.y);
-        e.x = p.x; e.y = p.y; e.tx = p.x; e.ty = p.y;
+        e.x = p.x; e.y = p.y;
         if (k >= 1) e.anim = null;
       }
     }
-    if (this.flight && this.phase !== 'decide') {
+    if (this.flight) {
       const f = this.flight;
       f.t += dt;
       if (f.t >= f.dur) { this.flight = null; this.looseBall = f.curve.b.clone(); f.onLand(); }
     }
-
-    switch (this.phase) {
-      case 'check':
-        this.phaseT -= dt;
-        for (const e of this.ents) this.moveEnt(e, dt, 2.2);
-        if (this.phaseT <= 0) this.phase = 'play';
-        break;
-      case 'pause':
-        this.phaseT -= dt;
-        for (const e of this.ents) this.moveEnt(e, dt, 0.5);
-        if (this.phaseT <= 0 && this.after) { const fn = this.after; this.after = null; fn(); }
-        break;
-      case 'resolve':
-        for (const e of this.ents) if (!e.anim) this.moveEnt(e, dt, 0.35);
-        break;
-      case 'play':
-        this.tickPlay(dt);
-        break;
-      default:
-        break;
-    }
-    this.pushHud();
   }
 
-  private tickPlay(dt: number) {
-    for (const e of this.ents) {
-      e.daze = Math.max(0, e.daze - dt);
-      e.boost = Math.max(0, e.boost - dt);
-    }
-    this.duelCd = Math.max(0, this.duelCd - dt);
-    if (!this.golden) this.clock = Math.max(0, this.clock - dt);
-    if (this.holder) this.shotClock -= dt;
-
-    if (this.shotClock <= 0 && this.holder) {
-      const h = this.holder;
-      const thief = this.nearestFoe(h);
-      sfx.buzzer();
-      this.bump(`shotclock${h.team}`);
-      this.world.callout(this.pos3(h, 2.7), icon('cross', 28), 'bad');
-      this.turnover(thief);
-      return;
-    }
-    if (this.clock <= 0 && !this.golden && !this.flight) {
-      if (this.score[0] === this.score[1]) {
-        this.golden = true;
-        sfx.buzzer();
-        this.pauseThen(1.0, () => this.setupCheck(this.offense, this.holder?.slot ?? 0));
-      } else {
-        this.finish();
-      }
-      return;
-    }
-
-    this.thinkOffense(dt);
-    if (this.phase !== 'play') return;
-    this.thinkDefense();
-    this.userMove();
-    for (const e of this.ents) if (!e.anim) this.moveEnt(e, dt, 1);
-    this.separateAll();
-
-    // Contact = decision.
-    if (this.holder && this.duelCd <= 0 && !this.flight) {
-      const h = this.holder;
-      const d = this.ents.find((o) => o.team !== h.team && o.daze <= 0 && dist(o.x, o.y, h.x, h.y) < DUEL_RANGE);
-      if (d) this.openDecision(h.team === 0 ? 'att' : 'def', h, d, 0);
-    }
-  }
-
-  private userMove() {
-    const c = this.controlled;
-    if (!c || c.team !== 0 || c.anim) return;
-    let kx = 0, ky = 0;
-    if (this.keys.has('arrowleft') || this.keys.has('a')) kx -= 1;
-    if (this.keys.has('arrowright') || this.keys.has('d')) kx += 1;
-    if (this.keys.has('arrowup') || this.keys.has('w')) ky -= 1;
-    if (this.keys.has('arrowdown') || this.keys.has('s')) ky += 1;
-    if (kx || ky) {
-      const l = Math.hypot(kx, ky);
-      this.moveTarget = { x: clamp(c.x + (kx / l) * 1.2, 0.4, COURT_W - 0.4), y: clamp(c.y + (ky / l) * 1.2, 0.4, COURT_H - 0.4) };
-      this.idleT = 0;
-    }
-    if (this.moveTarget) {
-      c.tx = this.moveTarget.x; c.ty = this.moveTarget.y;
-      if (dist(c.x, c.y, c.tx, c.ty) < 0.1 && !this.pointerDown && !(kx || ky)) this.moveTarget = null;
-    } else if (c !== this.holder && this.idleT < 1.2) {
-      c.tx = c.x; c.ty = c.y;
-    } else if (c === this.holder) {
-      c.tx = c.x; c.ty = c.y;
-    }
-  }
-
-  private thinkOffense(dt: number) {
-    const off = this.ents.filter((e) => e.team === this.offense);
-    for (const e of off) {
-      if (e === this.holder || e.anim) continue;
-      e.spotT -= dt;
-      if (e.spotT <= 0) {
-        e.spotT = 1.2 + Math.random() * 0.8;
-        const ref = this.holder ?? e;
-        let best = SPOTS[0], bestS = -99;
-        for (const sp of SPOTS) {
-          let nd = 99;
-          for (const o of this.ents) if (o.team !== e.team) nd = Math.min(nd, dist(o.x, o.y, sp.x, sp.y));
-          const mateTaken = off.some((m) => m !== e && m !== this.holder && dist(m.tx, m.ty, sp.x, sp.y) < 2);
-          const sc = Math.min(nd, 4) + Math.min(dist(ref.x, ref.y, sp.x, sp.y), 5) * 0.5 - (mateTaken ? 5 : 0) + Math.random();
-          if (sc > bestS) { bestS = sc; best = sp; }
-        }
-        e.tx = best.x; e.ty = best.y;
-      }
-    }
-    if (this.offense === 1 && this.holder && this.holder.team === 1 && !this.flight) this.aiHandler(dt, this.holder);
-  }
-
-  private aiHandler(dt: number, h: Ent) {
-    if (h.anim) return;
-    this.aiT -= dt;
-    const nearest = this.nearestFoe(h);
-    const nd = dist(nearest.x, nearest.y, h.x, h.y);
-    if (this.aiT <= 0) {
-      this.aiT = 0.3 + Math.random() * 0.25;
-      const p = this.shotChance(h);
-      const threshold = 0.38 - this.tier * 0.015;
-      if ((p >= threshold && Math.random() < 0.7) || (this.shotClock < 2 && p > 0.15) || this.shotClock < 0.8) {
-        if (nd <= CLOSEOUT_RANGE && this.duelCd <= 0 && nearest.daze <= 0) {
-          // A defender can contest: the user decides how to close out.
-          this.openDecision('def', h, nearest, 1, true);
-        } else {
-          this.bump('aiOpenShot');
-          this.shoot(h, Math.random() < p);
-          this.phase = 'pause';
-          this.phaseT = 99;
-        }
-        return;
-      }
-      if (nd < 3 && Math.random() < 0.35 + this.tier * 0.03) {
-        const mates = this.ents.filter((e) => e.team === h.team && e !== h)
-          .map((m) => ({ m, s: this.openness(m) - this.laneRisk(h, m).risk * 4 }))
-          .sort((a, b) => b.s - a.s);
-        if (mates[0] && mates[0].s > 0.5) { this.bump('aiPass'); this.passTo(h, mates[0].m); return; }
-      }
-    }
-    // Drive toward a scoring spot while steering around the nearest defender.
-    const goal = { x: HOOP.x + (h.slot - 1) * 1.6, y: HOOP.y + 1.6 };
-    let gx = goal.x - h.x, gy = goal.y - h.y;
-    const gl = Math.hypot(gx, gy) || 1;
-    gx /= gl; gy /= gl;
-    if (nd < 3.2) {
-      const ax = h.x - nearest.x, ay = h.y - nearest.y;
-      const al = Math.hypot(ax, ay) || 1;
-      const w = (3.2 - nd) * 0.7;
-      gx += (ax / al) * w; gy += (ay / al) * w;
-    }
-    const l = Math.hypot(gx, gy) || 1;
-    h.tx = clamp(h.x + (gx / l) * 1.5, 0.5, COURT_W - 0.5);
-    h.ty = clamp(h.y + (gy / l) * 1.5, 0.5, COURT_H - 0.5);
-  }
-
-  private thinkDefense() {
-    const def = this.ents.filter((e) => e.team !== this.offense);
-    const off = this.ents.filter((e) => e.team === this.offense);
-    for (const d of def) {
-      if (d.anim) continue;
-      if (d === this.controlled && (this.moveTarget || this.idleT < 1.2)) continue;
-      const man = off.find((o) => o.slot === d.slot) ?? off[0];
-      if (d.team === 1 && man === this.holder) {
-        const p = this.markSpot(man.x, man.y, 0.35);
-        d.tx = p.x; d.ty = p.y;
-      } else {
-        const sag = man === this.holder ? 1.3 : 1.8;
-        const p = this.markSpot(man.x, man.y, sag);
-        d.tx = p.x; d.ty = p.y;
-      }
-    }
-  }
-
-  private moveEnt(e: Ent, dt: number, mult: number) {
-    const dx = e.tx - e.x, dy = e.ty - e.y;
-    const d = Math.hypot(dx, dy);
-    if (d < 0.02) return;
-    let v = this.speed(e) * mult;
-    if (e.team === 1 && this.offense === 0 && e.slot === this.holder?.slot) v *= 0.8 + this.tier * 0.035;
-    if (e.team === 0 && this.offense === 1 && e !== this.controlled) v *= 0.85;
-    const step = Math.min(d, v * dt);
-    e.x += (dx / d) * step;
-    e.y += (dy / d) * step;
-    if (d > 0.08) e.face = Math.atan2(dx, dy);
-  }
-
-  private separateAll() {
-    for (let i = 0; i < this.ents.length; i++) {
-      for (let j = i + 1; j < this.ents.length; j++) {
-        const a = this.ents[i], b = this.ents[j];
-        if (this.duelCd <= 0 && a.team !== b.team && (a === this.holder || b === this.holder)) continue;
-        const d = dist(a.x, a.y, b.x, b.y);
-        if (d < 0.95 && d > 0.001) {
-          const push = (0.95 - d) / 2;
-          const nx = (a.x - b.x) / d, ny = (a.y - b.y) / d;
-          a.x += nx * push; a.y += ny * push;
-          b.x -= nx * push; b.y -= ny * push;
-        }
-      }
-    }
-    for (const e of this.ents) {
-      e.x = clamp(e.x, 0.4, COURT_W - 0.4);
-      e.y = clamp(e.y, 0.4, COURT_H - 0.4);
-    }
-  }
-
-  // ---------------- rendering sync ----------------
+  // ---------------------------------------------------------------- camera & sync
   private updateCamera(snap = false) {
     const W = this.world;
-    const d = this.decision;
-    if (d && (this.phase === 'decide' || this.phase === 'resolve')) {
-      const me = d.side === 'att' ? d.att : d.def;
-      const A = this.pos3(d.att, 1.0), D = this.pos3(d.def, 1.0);
-      const pts = [A, D, RIM.clone()];
-      const opt = d.previewId ? this.previewOpt : undefined;
-      if (opt?.action === 'pass' && opt.target !== undefined) pts.push(this.pos3(d.mates[opt.target], 1.0));
-      let dir: THREE.Vector3;
-      if (d.side === 'att') {
-        dir = new THREE.Vector3(HOOP.x - me.x, 0, HOOP.y - me.y);
+    const s = this.poss;
+    const portrait = W.camera.aspect < 0.8;
+    if (s && this.phase === 'decide') {
+      const h = this.att(s.ball);
+      const pts = [this.pos3(h, 1), RIM.clone()];
+      for (let i = 0; i < 3; i++) pts.push(this.pos3(this.att(i), 0.6));
+      const opt = this.previewId ? this.opts.find((o) => o.id === this.previewId) : undefined;
+      if (opt?.act && (opt.act.k === 'drive' || opt.act.k === 'cut')) pts.push(w3(ZONES[opt.act.z].x, ZONES[opt.act.z].y, 0.5));
+      if (this.userAttacks) {
+        const dir = new THREE.Vector3(HOOP.x - h.x, 0, HOOP.y - h.y);
         if (dir.lengthSq() < 1) dir.set(0, 0, -1);
-        dir.normalize();
-        W.frame(pts, dir, 22, 2.4, { side: 0.9, speed: 2.6, zoom: 0.92, lookBias: new THREE.Vector3(0, -0.7, 0) });
+        dir.normalize().lerp(new THREE.Vector3(0, 0, -1), 0.45).normalize();
+        W.frame(pts, dir, portrait ? 52 : 40, 3.2, { side: 0.6, speed: 2.6, zoom: portrait ? 0.82 : 0.9, lookBias: new THREE.Vector3(0, -0.6, portrait ? 0.8 : 0.3) });
       } else {
-        // Over the defender's shoulder, looking at the ball handler.
-        dir = new THREE.Vector3(d.att.x - d.def.x, 0, d.att.y - d.def.y);
-        if (dir.lengthSq() < 0.01) dir.set(0, 0, 1);
-        dir.normalize();
-        const dpts = [A, D];
-        W.frame(dpts, dir, 27, 2.8, { side: W.camera.aspect < 0.8 ? 2.4 : 1.7, speed: 2.6, zoom: 1.2, lookBias: new THREE.Vector3(0, -0.5, 0) });
+        // Defense: the stance moves the whole team, so show everyone from above the arc, slightly
+        // off to the ball side.
+        for (let i = 0; i < 3; i++) pts.push(this.pos3(this.def(i), 0.6));
+        const dir = new THREE.Vector3((HOOP.x - h.x) * 0.08, 0, -1).normalize();
+        W.frame(pts, dir, portrait ? 54 : 46, 3.4, { speed: 2.6, zoom: portrait ? 0.8 : 0.88, lookBias: new THREE.Vector3(0, -0.6, portrait ? 0.8 : 0.3) });
       }
     } else {
-      const ball = this.ballPos.clone().setY(0);
-      const ctrl = this.controlled ? this.pos3(this.controlled) : ball;
-      const pts = [ball, ctrl, RIM.clone()];
-      const dir = new THREE.Vector3(ball.x * 0.06, 0, -1).normalize();
-      const portrait = W.camera.aspect < 0.8;
-      W.frame(pts, dir, portrait ? 50 : 46, portrait ? 4.0 : 5.4, { speed: 2.2, zoom: portrait ? 0.92 : 1, lookBias: new THREE.Vector3(0, -0.6, portrait ? -1.3 : 0.4) });
+      const pts = [RIM.clone(), ...this.ents.map((e) => this.pos3(e, 0.5)), this.ballPos.clone()];
+      W.frame(pts, new THREE.Vector3(0, 0, -1), portrait ? 58 : 48, 3.5, { speed: 2.0, zoom: portrait ? 0.78 : 0.86, lookBias: new THREE.Vector3(0, -0.6, portrait ? 0.6 : 0.4) });
     }
     if (snap) W.snapCamera();
   }
 
   private sync(dt: number) {
     const W = this.world;
-    // Ball position.
     if (this.flight) {
       const f = this.flight;
       f.curve.getPoint(Math.min(1, f.t / f.dur), this.ballPos);
     } else if (this.holder) {
       const h = this.holder;
-      const moving = Math.hypot(h.x - h.px, h.y - h.py) > 0.002;
+      const moving = !!h.anim;
       if (this.phase === 'decide' || h.jumpT > 0) this.ballPos.copy(this.hand(h, h.jumpT > 0 ? 2.0 : 1.2));
       else {
-        const bounce = Math.abs(Math.sin(this.time * (moving ? 8 : 5)));
-        const p = this.hand(h, 0.22 + bounce * 0.85);
-        if (bounce < 0.08 && dt > 0 && Math.random() < 0.15) sfx.bounce();
-        this.ballPos.copy(p);
+        const bounce = Math.abs(Math.sin(performance.now() / 1000 * (moving ? 8 : 5)));
+        this.ballPos.copy(this.hand(h, 0.22 + bounce * 0.85));
       }
-    } else if (this.looseBall) {
-      this.ballPos.copy(this.looseBall);
-    }
+    } else if (this.looseBall) this.ballPos.copy(this.looseBall);
     W.setBall(this.ballPos, this.flight ? 0.25 : 0.05);
-
+    const s = this.poss;
     for (const e of this.ents) {
       const moving = Math.hypot(e.x - e.px, e.y - e.py) > 0.004;
       e.px = e.x; e.py = e.y;
-      if (this.phase === 'decide' && this.decision) {
-        const d = this.decision;
-        if (e === d.att) this.faceTo(e, HOOP.x, HOOP.y);
-        if (e === d.def) this.faceTo(e, d.att.x, d.att.y);
+      if (this.phase === 'decide' && !e.anim) {
+        if (e.team === this.offense) this.faceTo(e, HOOP.x, HOOP.y);
+        else this.faceTo(e, this.att(e.slot).x, this.att(e.slot).y);
       }
       W.setPlayer(e.i, { x: e.x, y: e.y, face: e.face, jump: this.jumpOf(e), armsUp: e.arms, daze: e.daze > 0, moving }, dt);
-      const isCtrl = e === this.controlled;
-      W.players[e.i].setRing(this.teams[e.team].color, isCtrl ? 1 : 0.55);
+      const open = !!s && e.team === this.offense && s.adv[e.slot] > 0 && this.phase !== 'resolve';
+      W.players[e.i].setRing(open ? '#3ddc97' : this.teams[e.team].color, open ? 1 : 0.6);
     }
-    const h = this.holder;
-    W.setHandler(h ? this.pos3(h) : null);
-    const c = this.controlled;
-    W.setControlled(c && c !== h && this.phase !== 'decide' ? this.pos3(c) : null);
-    W.setMoveTarget(this.moveTarget && this.phase === 'play' ? w3(this.moveTarget.x, this.moveTarget.y) : null);
+    W.setHandler(this.holder && !this.flight ? this.pos3(this.holder) : null);
+    W.setControlled(null);
     this.updateCamera();
     W.render(dt);
-    this.pushMode();
   }
 
   private pushHud() {
-    const h: HudInfo = { score: this.score, clock: this.clock, shotClock: Math.max(0, this.shotClock), golden: this.golden, offense: this.offense };
-    const key = `${h.score.join('-')}|${Math.ceil(h.clock)}|${Math.ceil(h.shotClock)}|${h.golden}|${h.offense}`;
+    const s = this.poss;
+    const h: HudInfo = {
+      score: this.score, poss: this.possN, maxPoss: MATCH_RULES.maxPoss, offense: this.offense,
+      left: s ? s.left : 0, maxLeft: s && s.rebs > 0 ? TUNE.orebActions : TUNE.actions, golden: this.golden,
+    };
+    const key = JSON.stringify(h);
     if (key !== this.hudKey) { this.hudKey = key; this.hooks.hud(h); }
   }
-
-  private pushMode() {
-    let m: 'attack' | 'defend' | 'idle' = 'idle';
-    if (this.phase === 'play' || this.phase === 'check') m = this.offense === 0 ? 'attack' : 'defend';
-    const can = this.canAct();
-    const key = `${m}|${can}`;
-    if (key !== this.modeKey) { this.modeKey = key; this.hooks.mode(m, can); }
-  }
 }
+
+const userTone = (userAttacks: boolean): Tone => (userAttacks ? 'good' : 'bad');
+
+/** The guided tutorial: three lessons, then one possession without help. */
+export const TUTORIAL: TutorialPoss[] = [
+  {
+    title: 'SPACE: SHOOT', setup: ['wingL', 'top', 'cornerR'], handler: 2, stance: 'space',
+    steps: [{ allow: ['shoot'], outcome: 'make', hint: 'Your defender backs off. Space: shoot.' }],
+  },
+  {
+    title: 'PRESSURE: DRIVE', setup: ['top', 'wingL', 'wingR'], handler: 0, stance: 'press',
+    steps: [
+      { allow: ['drive'], zones: ['elbowL', 'elbowR'], outcome: 'beat', hint: 'Pressed tight. Drive past to an elbow.' },
+      { allow: ['shoot'], outcome: 'make', hint: 'Defender beaten. Shoot open.' },
+    ],
+  },
+  {
+    title: 'HELP: PASS', setup: ['top', 'cornerL', 'wingR'], handler: 0, stance: 'space',
+    steps: [
+      { allow: ['drive'], zones: ['elbowL', 'elbowR'], outcome: 'help', hint: 'They sag. Drive inside to pull help.' },
+      { allow: ['pass'], toFreed: true, outcome: 'catch', hint: 'Help left a mate free. Pass.' },
+      { allow: ['shoot'], outcome: 'make', hint: 'Open man. Shoot.' },
+    ],
+  },
+  { title: 'YOUR CALL', setup: ['top', 'wingL', 'cornerR'], handler: 0, steps: [] },
+];

@@ -28,6 +28,9 @@ const P: Record<string, string> = {
   hoop: '<rect x="5" y="2.5" width="14" height="8" rx="1"/><path d="M9 6h6v4.5"/><path d="M7.5 10.5h9l-1.5 9h-6z"/><path d="M8.3 14h7.4M9 17h6"/>',
   energy: '<path d="M13.5 2 5 13.5h6L10 22l9-12h-6.2z" fill="currentColor"/>',
   move: '<circle cx="12" cy="12" r="3"/><path d="M12 2v5M12 17v5M2 12h5M17 12h5"/><path d="M9.5 4.5 12 2l2.5 2.5M9.5 19.5 12 22l2.5-2.5M4.5 9.5 2 12l2.5 2.5M19.5 9.5 22 12l-2.5 2.5"/>',
+  space: '<circle cx="12" cy="12" r="2.6"/><path d="M8 12H2.5M16 12h5.5"/><path d="M5 9 2.5 12 5 15M19 9l2.5 3-2.5 3"/><path d="M12 3v3M12 18v3" stroke-dasharray="1.5 2"/>',
+  deny: '<circle cx="4.5" cy="12" r="2.4"/><circle cx="19.5" cy="12" r="2.4"/><path d="M7.5 12h9" stroke-dasharray="2 2.2"/><path d="M12 6.5v11" stroke-width="3"/>',
+  cut: '<circle cx="6" cy="6" r="2.4"/><path d="M6 9.5c0 6 4 9 11 9"/><path d="M14 15.5l3.5 3-3.5 3"/>',
   even: '<path d="M5 9.5h14M5 14.5h14"/>',
   beaten: '<path d="M4 18 18 6"/><path d="M11 5.5h7.5V13"/>',
 };

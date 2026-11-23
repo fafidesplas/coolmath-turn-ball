@@ -2,6 +2,7 @@
 // Court coordinates (meters): x 0..15 across, y 0..11 from the baseline. World: X = x - 7.5, Z = y - 5.5, Y up.
 import * as THREE from 'three';
 import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer.js';
+import { ZONES } from './rules';
 
 export const COURT_W = 15;
 export const COURT_H = 11;
@@ -259,7 +260,6 @@ export class World {
   private shared = new Shared();
   private handlerMarker: THREE.Group;
   private controlMarker: THREE.Mesh;
-  private targetMarker: THREE.Mesh;
   private preview = new THREE.Group();
   private dotPaths: DotPath[] = [];
   private pulses: THREE.Object3D[] = [];
@@ -320,11 +320,6 @@ export class World {
     this.controlMarker = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.26, 3), new THREE.MeshBasicMaterial({ color: '#ffffff' }));
     this.controlMarker.rotation.x = Math.PI;
     this.scene.add(this.controlMarker);
-
-    this.targetMarker = new THREE.Mesh(new THREE.RingGeometry(0.18, 0.28, 24), new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.8, depthWrite: false }));
-    this.targetMarker.rotation.x = -Math.PI / 2;
-    this.targetMarker.visible = false;
-    this.scene.add(this.targetMarker);
 
     this.scene.add(this.preview);
 
@@ -492,6 +487,20 @@ export class World {
     // Border + top line.
     g.lineWidth = 0.1 * S;
     g.strokeRect(0, 0, c.width, c.height);
+    // Marked zones: the spots every route starts and ends on.
+    for (const z of Object.values(ZONES)) {
+      g.strokeStyle = 'rgba(255,255,255,0.5)';
+      g.lineWidth = 0.05 * S;
+      g.setLineDash([0.12 * S, 0.1 * S]);
+      g.beginPath();
+      g.arc(X(z.x), Y(z.y), 0.55 * S, 0, Math.PI * 2);
+      g.stroke();
+      g.setLineDash([]);
+      g.fillStyle = 'rgba(255,255,255,0.35)';
+      g.beginPath();
+      g.arc(X(z.x), Y(z.y), 0.09 * S, 0, Math.PI * 2);
+      g.fill();
+    }
     // Center logo: a ring.
     g.strokeStyle = 'rgba(255,255,255,0.55)';
     g.lineWidth = 0.06 * S;
@@ -575,14 +584,6 @@ export class World {
   setControlled(pos: THREE.Vector3 | null) {
     this.controlMarker.visible = !!pos;
     if (pos) this.controlMarker.position.set(pos.x, 2.6 + pos.y + Math.sin(this.time * 5) * 0.06, pos.z);
-  }
-
-  setMoveTarget(p: THREE.Vector3 | null) {
-    this.targetMarker.visible = !!p;
-    if (p) {
-      this.targetMarker.position.set(p.x, 0.03, p.z);
-      this.targetMarker.scale.setScalar(1 + Math.sin(this.time * 8) * 0.12);
-    }
   }
 
   kickNet() { this.netKick = 1; }

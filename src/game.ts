@@ -18,6 +18,8 @@ export interface Save {
   scout: string[];
   sound: boolean;
   duelsSeen: number;
+  /** Guided tutorial finished (or skipped). */
+  tutorialDone?: boolean;
 }
 
 export function newSave(): Save {

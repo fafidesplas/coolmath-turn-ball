@@ -10,6 +10,12 @@ export const STAT_NAME: Record<Stat, string> = {
   spd: 'Speed', pas: 'Passing', sho: 'Shooting', str: 'Strength', def: 'Defense', blk: 'Blocking',
 };
 
+/**
+ * Special techniques and the energy bar are switched off in this version (equal teams, no specials).
+ * The data stays here so they can come back later.
+ */
+export const ENABLE_SPECIALS = false;
+
 export type AttackAction = 'dribble' | 'pass' | 'shoot' | 'protect';
 export type DefendAction = 'steal' | 'block' | 'press' | 'wait';
 export type Action = AttackAction | DefendAction;
@@ -35,7 +41,7 @@ export const ACTION_INFO: Record<Action, ActionInfo> = {
   wait: { label: 'Wait', stat: 'def', beats: 'pass', weak: 'shoot', color: '#4cc9f0' },
 };
 
-/** Matchup bonus from the ATTACKER's point of view. +3 = hard counter, ±1 = slight edge. */
+/** Matchup bonus from the ATTACKER's point of view. +3 = hard counter, +/-1 = slight edge. */
 export const MATRIX: Record<AttackAction, Record<DefendAction, number>> = {
   dribble: { steal: -3, block: 3, press: 1, wait: -1 },
   pass: { steal: 1, block: -1, press: 3, wait: -3 },
@@ -189,6 +195,17 @@ export function rivalPlayers(team: RivalTeam): Player[] {
       known: ROLE_TECHS[i].slice(0, techCount),
     };
   });
+}
+
+/**
+ * Equal teams: the rival plays with exact copies of your starters' stats (same slot = same role),
+ * wearing its own names and colors. Difficulty comes from how well the rival AI reads you.
+ */
+export function mirrorPlayers(team: RivalTeam, mine: Player[]): Player[] {
+  return mine.slice(0, 3).map((p, i) => ({
+    ...p, uid: `${team.id}-${i}`, tid: `${team.id}-${i}`, name: team.players[i], num: [3, 21, 55][i] + team.tier,
+    tag: team.motto, hair: ROLE_LOOK[i].hair, skin: ROLE_LOOK[i].skin, stats: { ...p.stats }, known: [],
+  }));
 }
 
 export const playerPower = (p: Player) =>

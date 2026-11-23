@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "sim": "node --disable-warning=ExperimentalWarning src/sim.ts"
   },
   "devDependencies": {
     "@types/three": "^0.187.0",

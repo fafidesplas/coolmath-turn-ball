@@ -1,13 +1,14 @@
 import './style.css';
 import { setSound, sfx, unlockAudio } from './audio';
 import {
-  RIVALS, STATS, STAT_LABEL, STAT_NAME, TECHNIQUES, TECH_LEVELS, TEMPLATES, USER_TEAM, playerPower, rivalPlayers, xpForLevel, MAX_LEVEL,
+  ENABLE_SPECIALS, RIVALS, STATS, STAT_LABEL, STAT_NAME, TECHNIQUES, TECH_LEVELS, TEMPLATES, USER_TEAM, mirrorPlayers, playerPower, xpForLevel, MAX_LEVEL,
   type Player, type RivalTeam,
 } from './data';
 import { DecisionUI } from './decisionui';
 import { applyResult, loadSave, persist, rollScout, ROSTER_MAX, SCOUT_REFRESH_COST, sign, type Rewards } from './game';
 import { icon } from './icons';
-import { Match, type MatchResult } from './match';
+import { Match, TUTORIAL, type MatchOptions, type MatchResult } from './match';
+import { MATCH_RULES, TUNE } from './rules';
 
 const app = document.getElementById('app')!;
 const save = loadSave();
@@ -48,6 +49,7 @@ function statBars(p: Player) {
 }
 
 function techList(p: Player) {
+  if (!ENABLE_SPECIALS) return '';
   return `<div class="techs">${p.techs.map((id, i) => {
     const t = TECHNIQUES[id];
     const known = p.known.includes(id);
@@ -61,7 +63,7 @@ function titleScreen() {
   const el = mount(`
     <div class="title-wrap">
       <div class="logo"><span class="l1">TURN</span><span class="ball">${icon('ball', 64)}</span><span class="l2">BALL</span></div>
-      <p class="tagline">3x3 street hoops. Every clash is a choice.</p>
+      <p class="tagline">3x3 street hoops, one move at a time.</p>
       <div class="menu">
         <button class="btn big primary" data-go="league">${icon('play', 26)} PLAY</button>
         <div class="menu-row">
@@ -88,7 +90,7 @@ function leagueScreen() {
       const locked = i > save.beaten;
       const rec = save.record[r.id];
       const beaten = i < save.beaten;
-      const pw = Math.round(rivalPlayers(r).reduce((a, p) => a + playerPower(p), 0) / 3 * 10) / 10;
+      const pw = myPow;
       return `<div class="rival ${locked ? 'locked' : ''} ${beaten ? 'beaten' : ''}" style="--c:${r.color};--a:${r.accent}">
         <div class="r-badge">${locked ? icon('lock', 22) : beaten ? icon('check', 24) : `<b>${i + 1}</b>`}</div>
         <div class="r-info"><b>${esc(r.name)}</b>
@@ -158,64 +160,53 @@ function howScreen() {
   const card = (ic: string, title: string, body: string) => `<section class="hcard"><div class="hi">${ic}</div><div><h3>${title}</h3><p>${body}</p></div></section>`;
   mount(`${topBar('How to Play')}
     <div class="how">
-      ${card(icon('move', 34), 'Move', 'Tap or drag on the court. Keys: WASD / arrows.')}
-      ${card(icon('act', 34), 'Clash', 'Touch the ball handler, or press the big button, to stop the play.')}
-      ${card(`${icon('shoot', 26)}${icon('pass', 26)}`, 'Preview', 'Hover or hold an option to see the ghost path and the real odds.')}
-      ${card(`<span class="mini-odds"><i class="good"></i><i class="mid"></i><i class="bad"></i></span>`, 'Read the colors', 'Green = good for you. Grey = nothing changes. Red = bad.')}
-      ${card(icon('star', 30), 'Special', 'Clashes charge energy. Turn on the star to power up a move.')}
-      ${card(icon('hoop', 32), 'Score', '1 point inside the arc, 2 outside. First to 11, or most points at the buzzer.')}
-      <div class="center"><button class="btn big primary" data-go="league">${icon('play', 24)} Play</button></div>
+      ${card(`${icon('shoot', 26)}${icon('pass', 26)}`, 'Your turn', 'Shoot, pass, drive with the ball, or cut a teammate to a new spot.')}
+      ${card(`${icon('press', 24)}${icon('space', 24)}${icon('deny', 24)}`, 'Their turn', 'The defense picks Press, Give space or Deny pass at the same time. Nobody sees the other choice.')}
+      ${card(`<span class="mini-odds"><i class="good"></i><i class="mid"></i><i class="bad"></i></span>`, 'Exact odds', 'Select an option to see the play and its real odds. Green good, grey neutral, red bad.')}
+      ${card(`<span class="pips att"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>`, 'Moves', `${TUNE.actions} moves per possession. The last one is a shot.`)}
+      ${card(icon('hoop', 32), 'Score', `1 inside the arc, 2 outside. First to ${MATCH_RULES.winScore}, or most after ${MATCH_RULES.maxPoss} possessions each.`)}
+      <div class="center menu row"><button class="btn primary" id="tut">${icon('play', 22)} Tutorial</button><button class="btn" data-go="league">${icon('play', 22)} Play</button></div>
     </div>`, 'how-screen');
+  app.querySelector('#tut')!.addEventListener('click', () => { sfx.tap(); tutorialScreen(); });
 }
 
-function fmtClock(s: number) {
-  const c = Math.ceil(s);
-  return `${Math.floor(c / 60)}:${String(c % 60).padStart(2, '0')}`;
-}
-
-function matchScreen(rival: RivalTeam) {
-  const el = mount(`
+function matchHud(rivalName: string, rivalColor: string) {
+  return `
     <div class="stage" id="stage"></div>
     <div class="hud">
       <div class="hteam home" style="--c:${USER_TEAM.color}"><span class="hn">${USER_TEAM.short}</span><span class="hs" id="s0">0</span></div>
-      <div class="hclock"><div id="clock">2:30</div><div class="shotc" id="shot"><svg viewBox="0 0 36 36"><circle cx="18" cy="18" r="15" class="bg"/><circle cx="18" cy="18" r="15" class="fg" id="shotring"/></svg><b id="shotn">12</b></div></div>
-      <div class="hteam away" style="--c:${rival.color}"><span class="hs" id="s1">0</span><span class="hn">${esc(rival.name.slice(0, 3).toUpperCase())}</span></div>
+      <div class="hclock"><span id="possn"></span></div>
+      <div class="hteam away" style="--c:${rivalColor}"><span class="hs" id="s1">0</span><span class="hn">${esc(rivalName)}</span></div>
       <button class="btn small ghost pausebtn icon-btn" id="pause" aria-label="Pause">${icon('pause', 20)}</button>
     </div>
     <div class="banner" id="banner"></div>
-    <div class="movehint" id="movehint" ${save.duelsSeen > 2 ? 'hidden' : ''}>${icon('move', 22)}<span>${matchMedia('(pointer: coarse)').matches ? 'Tap to move' : 'Click or WASD'}</span></div>
-    <button class="actbtn" id="act" aria-label="Clash">${icon('act', 40)}<small id="actlbl"></small></button>`, 'match-screen');
+    <div class="explain" id="explain"></div>`;
+}
+
+function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions) {
   const stage = el.querySelector<HTMLElement>('#stage')!;
   const banner = el.querySelector<HTMLElement>('#banner')!;
-  const act = el.querySelector<HTMLButtonElement>('#act')!;
-  const ring = el.querySelector<SVGCircleElement>('#shotring')!;
-  let bannerT = 0;
-
-  dui = new DecisionUI(el, () => match, () => save.duelsSeen < 3);
+  const expl = el.querySelector<HTMLElement>('#explain')!;
+  let bannerT = 0, explT = 0;
+  dui = new DecisionUI(el, () => match);
+  const team = save.roster.slice(0, 3);
+  const foe = rival ? rival : RIVALS[0];
   const m = new Match(stage, [
-    { name: USER_TEAM.name, short: USER_TEAM.short, color: USER_TEAM.color, accent: USER_TEAM.accent, shorts: '#ffffff', players: save.roster.slice(0, 3) },
-    { name: rival.name, short: rival.name.slice(0, 3).toUpperCase(), color: rival.color, accent: rival.accent, shorts: '#1d1a2b', players: rivalPlayers(rival) },
-  ], rival.tier, {
+    { name: USER_TEAM.name, short: USER_TEAM.short, color: USER_TEAM.color, accent: USER_TEAM.accent, shorts: '#ffffff', players: team },
+    { name: foe.name, short: foe.name.slice(0, 3).toUpperCase(), color: foe.color, accent: foe.accent, shorts: '#1d1a2b', players: mirrorPlayers(foe, team) },
+  ], opts, {
     decision: (open) => {
-      if (open) { save.duelsSeen++; el.querySelector('#movehint')?.setAttribute('hidden', ''); }
       el.classList.toggle('deciding', open);
+      if (open) { expl.classList.remove('show'); save.duelsSeen++; }
       dui?.show(open);
     },
     hud: (h) => {
       el.querySelector('#s0')!.textContent = String(h.score[0]);
       el.querySelector('#s1')!.textContent = String(h.score[1]);
-      el.querySelector('#clock')!.textContent = h.golden ? 'GOLD' : fmtClock(h.clock);
-      el.querySelector('#shotn')!.textContent = String(Math.ceil(h.shotClock));
-      ring.style.strokeDashoffset = String(94.2 * (1 - h.shotClock / 12));
-      el.querySelector('.shotc')!.classList.toggle('low', h.shotClock <= 4);
+      const n = Math.min(h.maxPoss, Math.max(h.poss[0], h.poss[1]) + (h.poss[0] === h.poss[1] ? 1 : 0));
+      el.querySelector('#possn')!.innerHTML = opts.tutorial ? `${icon('help', 16)}` : h.golden ? 'GOLDEN' : `${icon('ball', 16)} ${n}/${h.maxPoss}`;
       el.querySelector('.home')!.classList.toggle('poss', h.offense === 0);
       el.querySelector('.away')!.classList.toggle('poss', h.offense === 1);
-    },
-    mode: (mode, can) => {
-      act.hidden = mode === 'idle';
-      act.disabled = !can;
-      act.classList.toggle('def', mode === 'defend');
-      el.querySelector('#actlbl')!.textContent = mode === 'defend' ? 'CLASH' : 'PLAY';
     },
     banner: (text, color, sub) => {
       banner.innerHTML = `<div class="bn-main" style="--c:${color}">${esc(text)}</div>${sub ? `<div class="bn-sub">${esc(sub)}</div>` : ''}`;
@@ -225,11 +216,20 @@ function matchScreen(rival: RivalTeam) {
       clearTimeout(bannerT);
       bannerT = window.setTimeout(() => banner.classList.remove('show'), 1500);
     },
-    end: (r) => resultScreen(rival, r),
+    explain: (text, tone) => {
+      expl.className = `explain ${tone}`;
+      expl.textContent = text;
+      void expl.offsetWidth;
+      expl.classList.add('show');
+      clearTimeout(explT);
+      explT = window.setTimeout(() => expl.classList.remove('show'), 2200);
+    },
+    end: (r) => {
+      if (r.tutorial) { save.tutorialDone = true; persist(save); leagueScreen(); return; }
+      resultScreen(rival!, r);
+    },
   });
   match = m;
-  act.addEventListener('click', () => m.userAct());
-
   el.querySelector('#pause')!.addEventListener('click', () => {
     if (m.phase === 'over' || m.paused) return;
     m.paused = true;
@@ -240,8 +240,23 @@ function matchScreen(rival: RivalTeam) {
       <button class="btn ghost" id="quit">${icon('cross', 20)} Quit</button></div>`;
     el.appendChild(ov);
     ov.querySelector('#resume')!.addEventListener('click', () => { m.paused = false; ov.remove(); });
-    ov.querySelector('#quit')!.addEventListener('click', () => { persist(save); leagueScreen(); });
+    ov.querySelector('#quit')!.addEventListener('click', () => {
+      if (opts.tutorial) { save.tutorialDone = true; }
+      persist(save);
+      leagueScreen();
+    });
   });
+}
+
+function tutorialScreen() {
+  const el = mount(matchHud('TUT', RIVALS[0].color), 'match-screen');
+  bindMatch(el, null, { tier: 0, tutorial: TUTORIAL, hints: true });
+}
+
+function matchScreen(rival: RivalTeam) {
+  if (!save.tutorialDone) { tutorialScreen(); return; }
+  const el = mount(matchHud(rival.name.slice(0, 3).toUpperCase(), rival.color), 'match-screen');
+  bindMatch(el, rival, { tier: rival.tier, hints: save.duelsSeen < 6 });
 }
 
 function resultScreen(rival: RivalTeam, r: MatchResult) {
@@ -259,8 +274,8 @@ function resultScreen(rival: RivalTeam, r: MatchResult) {
         const line = r.lines[rep.player.uid];
         return `<div class="rep ${rep.levels ? 'lvl' : ''}">${avatarHTML(rep.player, USER_TEAM.color, 40)}
           <div><b>${esc(rep.player.name)}</b> <small>Lv ${rep.player.level}</small>
-          <small>${line ? `${line.pts} pts - ${line.duelsWon}/${line.duels} clashes - ` : ''}+${rep.xp} XP</small>
-          ${rep.levels ? `<small class="up">${icon('up', 14)} LEVEL UP ${rep.stats.map((s) => `${STAT_LABEL[s]}+1`).join(' ')}${rep.techs.length ? ` ${icon('star', 12)} ${rep.techs.map(esc).join(', ')}` : ''}</small>` : ''}</div></div>`;
+          <small>${line ? `${line.pts} pts - ` : ''}+${rep.xp} XP</small>
+          ${rep.levels ? `<small class="up">${icon('up', 14)} LEVEL UP ${rep.stats.map((s) => `${STAT_LABEL[s]}+1`).join(' ')}${ENABLE_SPECIALS && rep.techs.length ? ` ${icon('star', 12)} ${rep.techs.map(esc).join(', ')}` : ''}</small>` : ''}</div></div>`;
       }).join('')}</div>
       <div class="menu row">
         <button class="btn primary" data-go="league">${icon('play', 20)} Next</button>
@@ -297,6 +312,7 @@ const routes: Record<string, () => void> = {
   get match() { return match; },
   save,
   play: (i: number) => matchScreen(RIVALS[i]),
+  tutorial: () => tutorialScreen(),
 };
 
 titleScreen();
