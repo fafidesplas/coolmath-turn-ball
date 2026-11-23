@@ -1,116 +1,154 @@
-# Turn Ball — Planning
+# Turn Ball - Planning (v2, 3D)
 
-> A Coolmath-style team-sport game: real-time movement on an open court, with turn-based RPG duels whenever players collide. Inspired by the *structure* of classic underwater-sport minigames in RPGs, but built on a real sport. All names, characters, art and audio are original.
+> A Coolmath-style team-sport game: real-time movement on a 3D half court, with turn-based clashes whenever the ball handler meets a defender. All names, characters, art and audio are original and generated in code.
+
+## 0. Why v2
+
+Player feedback on the 2D prototype: it was hard to understand. Too much text, a 3-second timer, and a duel panel full of numbers that covered the court. The requests were:
+
+- Make it 3D.
+- When there is a decision, drop the camera to a third-person view.
+- Hovering an option should show what will happen: a ghost line from the ball to the hoop, a line to the teammate, floating odds for each result (make, miss, blocked...).
+- Do the same for every option, attack and defense.
+- Remove the decision timer.
+- Less text, no emoji, everything readable at a glance.
+
+v2 keeps the good parts of the system (stat-tilted rock-paper-scissors, energy, special techniques, league progression with signings and levels) and rebuilds the presentation around **show, don't tell**.
 
 ## 1. Pitch
 
-**"3-on-3 street hoops where every collision is a turn-based showdown."**
-You run a scrappy neighborhood crew, the Sunnyside Hoopers, through the Sunset League. On the court you move freely. When a defender touches your ball handler, time freezes: you have **3 seconds** to choose a move, and your stats, techniques and a little luck decide what happens. A match lasts **3–5 minutes**. Between matches you level up players, unlock techniques and scout new signings.
+**"3x3 street hoops in 3D. Every clash is a choice, and you see the odds before you make it."**
+You run the Sunnyside Hoopers through the Sunset League. You move freely on the court. When the ball handler meets a defender, play stops, the camera swoops behind your player and you pick a move. Every option previews its outcome in the world, with the exact odds. A match lasts 3-5 minutes.
 
-## 2. Sport choice: 3x3 basketball (not futsal)
+## 2. Sport: 3x3 basketball
 
-| Criterion | 3x3 basketball | Futsal |
-|---|---|---|
-| Court | **One hoop, half court.** All action happens in one area that fits a phone screen. | Two goals, full pitch. Needs scrolling or tiny sprites. |
-| Players | 3 v 3 = 6 tokens, readable on mobile. | 5 v 5 + keepers = 10, crowded. |
-| Possession | **12-second shot clock** creates constant decisions, close to the 2–3 s duel rhythm. | Long possessions, less frequent clashes. |
-| Duel fit | Dribble/pass/shoot/protect vs steal/block/press/wait map 1:1 onto real basketball moves. | Shoot and block map less cleanly (keeper adds a third party). |
-| Scoring | Many small scores (1 and 2 points) keep the scoreboard moving in short matches. | Low scoring; a 3-minute match often ends 0–0. |
-| Real sport | FIBA 3x3 is an official Olympic sport with simple rules. | Also real, but adds rules overhead. |
-
-**Decision:** 3x3 basketball. Rules are simplified from FIBA 3x3: 1 point inside the arc, 2 outside, a 12 s shot clock, first to 11 or the leader at the end of the clock, and a golden basket if tied. Possession restarts with a "check" at the top after every score or turnover.
+One hoop, half court, 3 v 3: six readable players, constant possession changes, and moves that map 1:1 to real basketball (shoot, pass, drive, shield vs steal, block, press, read). Rules simplified from FIBA 3x3: 1 point inside the arc, 2 outside, 12 s shot clock, first to 11 or the leader at the buzzer (2:30 game clock), golden basket if tied. After every score or turnover, possession restarts with a check at the top.
 
 ## 3. Core loop
 
-1. **Field phase (real time).** Tap or drag to move the controlled player; tap a teammate to pass. Pass lanes show green (safe) or red (an interception is possible). The Shoot button shows the live % and the point value.
-2. **Contact → duel (turn-based).** Contact between the ball handler and a defender pauses the game.
-3. **Duel phase.** A 3-second timer. The attacker picks Dribble / Pass / Shoot / Protect; the defender picks Steal / Block / Press / Wait. ★ technique buttons appear when the player has enough energy. If time runs out, the game picks Protect or Wait for you with a −1 penalty.
-4. **Reveal (~2 s).** Both moves are shown, then a line-by-line breakdown: stat edge, matchup, technique, modifiers, dice, and the total. A headline (BLOWN BY!, REJECTED!, STOLEN!…) explains the outcome.
-5. **Consequence.** Play resumes with the result applied, so the next field decision builds on the duel.
+1. **Free play (real time).** Elevated 3/4 camera that follows the ball. Tap/click the court (or WASD) to move your player. A white ring marks the move target.
+2. **Clash.** Play stops when:
+   - a defender touches your ball handler, or you press the big **PLAY** button (open look: more space = bonus);
+   - on defense, your defender touches the rival handler, you press **CLASH** within 3.2 m, or the rival tries to shoot with your defender close enough to contest.
+3. **Decide (no timer).** The camera drops to third person behind your player. One big button per option. Hover (desktop) or press and hold (touch) to preview; click, release on it, or tap it again to confirm.
+4. **Resolve.** Both chosen moves pop above the players, then a short 3D animation shows the result: the shot drops or rattles out, the block, the steal, the drive past a dazed defender, the pass caught or picked off.
+5. **Back to free play.** The camera rises back to the overview.
 
-## 4. Duel system
+## 4. Camera
 
-**Total = stat edge (clamped ±4) + matchup + technique bonus + context modifiers + luck (two dice of −1/0/+1).**
-Above 0 the attacker wins, 0 is a stand-off, and below 0 the defender wins.
+| Moment | Camera |
+|---|---|
+| Free play | Perspective camera, 46-50 deg pitch, behind the baseline-facing view. Frames the ball, your player and the rim; portrait phones aim slightly ahead so the court fills the screen. |
+| Attack decision | Behind and slightly to the side of your ball handler, facing the hoop (22 deg pitch). Frames handler, defender and rim; when previewing a pass, it widens to include the receiver. |
+| Defense decision | Over your defender's shoulder, facing the ball handler (27 deg pitch), offset sideways so the attacker is never hidden. Widens to show passing lanes for Read. |
+| Transitions | Exponential smoothing (no cuts). Small screen shake on blocks, steals and scores. |
 
-Matchup matrix (attacker's view). Each move hard-counters exactly one move and is hard-countered by exactly one:
+The camera rig is a generic "frame these points from this direction" function, so every situation (corners, pass targets, portrait vs landscape) is framed automatically.
 
-| Attack \ Defense | Steal | Block | Press | Wait |
+## 5. Previews (the heart of v2)
+
+Every option draws its consequence in the world and pins its odds as labels anchored to 3D points (players, rim, trajectory).
+
+| Option | Preview | Odds labels (green / grey / red) |
+|---|---|---|
+| Shoot | Flowing dotted arc from the ball to the rim, ghost ball in the rim, red block wall over the defender, point value (+1/+2) on the arc | IN at the rim, MISS beside the rim, BLOCK over the defender |
+| Pass (one per teammate) | Dotted pass line to that teammate, green ring under the receiver, red rings under the defender and any second defender lurking in the lane | CATCH at the receiver, TIPPED mid-lane, PICKED over the defender |
+| Drive | Dotted route around the defender toward the hoop, green ring at the end | PAST at the end of the route, HELD over you, STOLEN over the defender |
+| Shield | Translucent dome around you, push path for the defender, +25 energy badge | SPACE where the defender lands, HELD, TRAPPED |
+| Steal | Reach arc from your hand to the ball, ghost ball | BALL, EVEN, BEAT, SCORE (all four for every defensive option) |
+| Block | Contest wall between the shooter and the hoop, faint shot arc | |
+| Press | Two pulsing pink rings closing on the handler | |
+| Read | Vision cone plus the passing lanes you are covering, +25 energy badge | |
+
+Each option button also shows its main success % and a stacked green/grey/red bar, so the options can be compared without reading anything.
+
+**The odds are real.** The resolution samples the rival's move from an explicit probability distribution (stat-based weights, the habit counter of smarter rivals, and technique use). The preview computes the exact probability of each outcome by summing over that distribution, the two luck dice, and the shot-make roll. The numbers are rounded with a largest-remainder method so they always add up to 100.
+
+## 6. Clash system
+
+**Total = stat edge (clamped +-4) + matchup + technique bonus + context + luck (two dice of -1/0/+1).**
+Above 0 the attacker wins, 0 is a stand-off, below 0 the defender wins.
+
+Matchup matrix (attacker's view):
+
+| Attack \ Defense | Steal | Block | Press | Read |
 |---|---|---|---|---|
-| Dribble (SPD) | **−3** | **+3** | +1 | −1 |
-| Pass (PAS) | +1 | −1 | **+3** | **−3** |
-| Shoot (SHO) | +1 | **−3** | −1 | **+3** |
-| Protect (STR) | **+3** | +1 | **−3** | −1 |
+| Drive (SPD) | -3 | +3 | +1 | -1 |
+| Pass (PAS) | +1 | -1 | +3 | -3 |
+| Shoot (SHO) | +1 | -3 | -1 | +3 |
+| Shield (STR) | +3 | +1 | -3 | -1 |
 
-Defender stats: Steal → DEF, Block → BLK, Press → STR, Wait → DEF.
+Context: shooting right under the rim +1, deep two -1; open space (called plays) +1/+2; a second defender in the pass lane -1; very long pass -1.
 
 Outcomes:
-- **Dribble win:** the defender is dazed for 2.5 s and the attacker gets a speed boost and a better shot chance.
-- **Pass win:** a guaranteed pass to the most open teammate.
-- **Shoot win:** the basket is good.
-- **Protect win:** keep the ball, +25 energy, and the defender is pushed back.
-- **Stand-off:** the players separate and the shot clock loses 2 s.
-- **Defender win:** turnover (steal, block or interception).
 
-Shooting modifiers: right under the rim +1, deep two −1. Every duel costs 2 s of game clock.
+| Attack | Attacker wins | Stand-off | Defender wins |
+|---|---|---|---|
+| Shoot | Clean shot (open make %) | Contested shot (contested make %) | Blocked, turnover |
+| Pass | Caught, receiver gets a boost | Tipped, ball stays, shot clock -3 | Intercepted |
+| Drive | Past the defender (dazed 2.5 s), speed boost | Held, shot clock -2 | Stolen |
+| Shield | Defender shoved back, +energy | Held | Trapped, turnover |
 
-**Readability rules:** each button shows "Beats X · Weak to Y" plus the relevant stat. The rival's stats are visible. Values in the reveal are always shown from *your* perspective, with green for good and red for bad. The first duels show a one-line legend.
+Missed shots go to a rebound battle (strength + blocking).
 
-**AI:** rival choices are weighted by their stats and the context (shot clock, distance), plus a habit memory. With probability `0.1 + 0.09 × tier` the AI counters your most frequent recent move, so predictable players get punished on harder teams.
+**AI:** the rival's move distribution is weighted by its stats and context (distance, shot clock, energy, shot intent). Smarter rivals (`0.1 + 0.09 x tier`) blend in the counter to your most frequent recent move, so the odds you see shift if you get predictable.
 
-## 5. Energy & techniques
+## 7. Energy and specials
 
-- Players start a match with 40 energy and gain +10 per duel. Protect (attack) and Wait (defense) give +15 more, so playing it safe charges your specials.
-- The yellow ring around each token shows energy.
-- There are 12 original techniques, such as Blink Crossover (Dribble +4), Skyscraper (Block +4), Rainbow Bomb (Shoot +3, pierces counters) and Mind Reader (Wait +3, pierces counters). Costs range from 30 to 60 energy.
-- **Pierce** turns a negative matchup into 0, which counters the counter.
+- Each player starts with 40 energy, +10 per clash, +15 more for Shield (attack) or Read (defense).
+- The **star toggle** in the decision bar turns on the special version of every option that has an affordable technique. Buttons and odds update instantly; a star label shows the bonus.
+- 12 original techniques (for example Blink Crossover: Drive +4; Skyscraper: Block +4; Rainbow Bomb: Shoot +3 and ignores counters). Costs 30-60 energy.
 
-## 6. Progression
+## 8. Progression (unchanged)
 
-- **XP:** 25 + 8/point + 5/duel won + 30 for a win; bench players get 15. Each level costs `60 + 40 × level` XP, up to a maximum of level 10.
-- **Level up:** +1 to the player's two growth stats. New techniques unlock at levels 1, 3 and 5.
-- **Coins:** a win pays 100 + 25 × tier + 5 × margin; a loss pays 30 + 5 × tier.
-- **Scouting:** 3 free agents at a time (200–560 coins), a 25-coin refresh, and a roster of up to 5. The first 3 players in the roster start; you reorder them in My Team.
-- **League:** 6 rivals with rising tiers. Beating one unlocks the next: Puddle Jumpers → Rooftop Ravens → Crunchtime Crabs → Neon Narwhals → Thunder Toasters → Midnight Meteors.
-- The game saves to `localStorage`.
+- XP per match (points, clashes won, win bonus); levels up to 10 raise the two growth stats; techniques unlock at levels 1, 3 and 5.
+- Coins from matches; scouting with 3 free agents, roster of 5, first 3 start.
+- League of 6 rivals with rising tiers. Progress saved in `localStorage` (same save as v1).
 
-## 7. Pacing targets
+## 9. Simplifications vs v1
 
-| Target | Value | Status |
-|---|---|---|
-| Duel decision | 3 s timer | ✅ |
-| Duel total (decide + reveal) | ~4–5 s | ✅ |
-| Match length | 2:30 game clock → ~3.5–4.5 min real time | ✅ measured 3:22–4:25 in automated playtests |
-| Duels per match | ~30–45 | measured 34–42 |
+| v1 | v2 |
+|---|---|
+| 3-second decision timer with auto-pick penalty | No timer. Think as long as you want. |
+| Duel panel with stat lines, matrix hints ("Beats X / Weak to Y") and a line-by-line breakdown | Options show their outcome in the world with exact odds; the matrix is never needed. |
+| Separate shoot and pass buttons in free play, plus pass lanes colored on the court | One PLAY button that opens the same decision view (all shots and passes go through previews). |
+| Switch-defender button | Your defender is chosen automatically (the one guarding the ball). |
+| Emoji icons | Hand-drawn SVG icon set; no emoji anywhere. |
+| Text banners and long callouts | Icon callouts above the players, short banners only for possession changes. |
 
-## 8. Art & audio direction
+## 10. Art, audio, performance
 
-- Bright, chunky, readable look: wooden court, top-down "chibi" tokens (jersey color, skin, hair, eyes, number), an energy ring and a controlled-player arrow.
-- Juice: floating callouts, screen shake on blocks and buckets, daze stars, speed lines, confetti on wins, and a bobbing crowd.
-- On tall phone screens the court is drawn transposed, with the hoop on the left, so it fills the screen. On wide screens it is drawn with the hoop at the top.
-- Sound effects are synthesized with Web Audio (whistle, swish, rim, clash, ticks, buzzer, level-up). There are no audio files.
+- Low-poly procedural look: chunky players (big heads, flat-shaded), team jersey colors with white shorts for the Hoopers and dark shorts for rivals, colored rings under every player, numbers on back and chest. The ball handler gets a pulsing gold ring and a floating gem; your controlled defender gets a white chevron.
+- Sunset street court: wood floor and lines drawn into a canvas texture, glass backboard, wireframe net that reacts to swishes, low-poly city blocks, trees and fence.
+- Lighting: hemisphere + warm key + cool rim light, fog. No shadow maps; soft blob shadows instead (cheap on phones).
+- Pixel ratio capped at 1.5 on touch devices, 2 on desktop. Instanced meshes for preview dots. One draw call per mesh, no post-processing.
+- Sound: synthesized with Web Audio. No audio files.
 
-## 9. Tech
+## 11. Tech
 
-- TypeScript + Vite. Canvas 2D for the court and DOM for menus and duel UI. No engine.
-- Modules: `data.ts` (content), `duel.ts` (pure resolution + AI), `match.ts` (simulation, input, rendering), `duelui.ts`, `game.ts` (save/progression), `main.ts` (screens), `audio.ts`.
-- Deployed to GitHub Pages via Actions, with `base: /coolmath-turn-ball/`.
+- TypeScript + Vite + Three.js. DOM for menus, HUD and decision bar; CSS2D labels for world-anchored odds and callouts.
+- Modules: `data.ts` (content), `duel.ts` (resolution, exact odds, AI distributions), `world.ts` (3D scene, camera rig, previews, labels), `match.ts` (simulation, decisions, resolution animations), `decisionui.ts` (option bar and input), `icons.ts` (SVG icons), `game.ts` (save/progression), `main.ts` (screens), `audio.ts`.
+- Deployed to GitHub Pages via Actions with `base: /coolmath-turn-ball/`.
 
-## 10. Roadmap
+## 12. Pacing targets
 
-**Prototype (done):** field + duels, AI, 6 rivals, leveling, techniques, scouting, mobile and desktop input, Pages deploy.
+| Target | Value |
+|---|---|
+| Match length | 2:30 game clock, paused during decisions; ~3-5 min real time |
+| Clashes per match | ~15-30 |
+| Decision | No timer; camera transition ~0.6 s, resolution animation ~1-1.5 s |
 
-**Next:**
-1. Onboarding: a guided first possession with arrows ("tap here", "pass to Luz").
-2. Balance pass with real players: AI shot selection, duel frequency, how often players reach 11 points.
-3. Positional off-ball plays (screens / give-and-go) as a field-side counterpart to duels.
-4. Player portraits and a richer token art pass; an announcer text ticker.
-5. Settings: duel timer length (accessibility), reduced motion, left-handed layout.
-6. More content: tournament mode, rival rematches with traits, cosmetic jerseys.
-7. Analytics hooks for Coolmath (match length, duel choices, drop-off).
+## 13. Roadmap
 
-## 11. Known risks
+1. Guided first possession (ghost hand showing "move here", "press PLAY").
+2. Balance pass with real players (closeout frequency, AI shot selection, rebound odds).
+3. Off-ball plays (screens, give-and-go) as free-play options.
+4. Settings: reduced motion, camera height, left-handed layout.
+5. Cosmetic jerseys and court themes per rival.
+6. Analytics hooks for Coolmath (match length, option choices, drop-off).
 
-- Duel frequency can feel high for some players. Tunables: `DUEL_RANGE`, the AI chase speed, and the post-duel cooldown.
-- Steal is the riskiest defensive pick (+2 net for the attacker across the matrix) and Wait is the safest. This is intentional, but needs validating with players.
-- The emoji icons used on buttons render slightly differently across platforms.
+## 14. Known risks
+
+- Showing exact odds makes the best option obvious in isolation; depth comes from energy/specials, positioning (space bonus, lanes) and the AI adapting to your habits. Needs validation with players.
+- Older phones: the scene is light, but CSS2D labels and WebGL on low-end Android need real-device testing.
+- The free-play camera hides part of the court edges on very narrow screens.

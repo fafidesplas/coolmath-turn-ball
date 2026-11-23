@@ -18,7 +18,6 @@ export const DEFEND_ACTIONS: DefendAction[] = ['steal', 'block', 'press', 'wait'
 
 export interface ActionInfo {
   label: string;
-  icon: string;
   stat: Stat;
   beats: Action;
   weak: Action;
@@ -26,14 +25,14 @@ export interface ActionInfo {
 }
 
 export const ACTION_INFO: Record<Action, ActionInfo> = {
-  dribble: { label: 'Dribble', icon: '⚡', stat: 'spd', beats: 'block', weak: 'steal', color: '#ffb703' },
-  pass: { label: 'Pass', icon: '🎯', stat: 'pas', beats: 'press', weak: 'wait', color: '#3ddc97' },
-  shoot: { label: 'Shoot', icon: '🏀', stat: 'sho', beats: 'wait', weak: 'block', color: '#ff6b35' },
-  protect: { label: 'Protect', icon: '🛡️', stat: 'str', beats: 'steal', weak: 'press', color: '#4cc9f0' },
-  steal: { label: 'Steal', icon: '🖐️', stat: 'def', beats: 'dribble', weak: 'protect', color: '#ffb703' },
-  block: { label: 'Block', icon: '🧱', stat: 'blk', beats: 'shoot', weak: 'dribble', color: '#ff6b35' },
-  press: { label: 'Press', icon: '🔥', stat: 'str', beats: 'protect', weak: 'pass', color: '#f72585' },
-  wait: { label: 'Wait', icon: '👀', stat: 'def', beats: 'pass', weak: 'shoot', color: '#4cc9f0' },
+  dribble: { label: 'Dribble', stat: 'spd', beats: 'block', weak: 'steal', color: '#ffb703' },
+  pass: { label: 'Pass', stat: 'pas', beats: 'press', weak: 'wait', color: '#3ddc97' },
+  shoot: { label: 'Shoot', stat: 'sho', beats: 'wait', weak: 'block', color: '#ff6b35' },
+  protect: { label: 'Protect', stat: 'str', beats: 'steal', weak: 'press', color: '#4cc9f0' },
+  steal: { label: 'Steal', stat: 'def', beats: 'dribble', weak: 'protect', color: '#ffb703' },
+  block: { label: 'Block', stat: 'blk', beats: 'shoot', weak: 'dribble', color: '#ff6b35' },
+  press: { label: 'Press', stat: 'str', beats: 'protect', weak: 'pass', color: '#f72585' },
+  wait: { label: 'Wait', stat: 'def', beats: 'pass', weak: 'shoot', color: '#4cc9f0' },
 };
 
 /** Matchup bonus from the ATTACKER's point of view. +3 = hard counter, ±1 = slight edge. */
@@ -42,17 +41,6 @@ export const MATRIX: Record<AttackAction, Record<DefendAction, number>> = {
   pass: { steal: 1, block: -1, press: 3, wait: -3 },
   shoot: { steal: 1, block: -3, press: -1, wait: 3 },
   protect: { steal: 3, block: 1, press: -3, wait: -1 },
-};
-
-export const MATCHUP_TEXT: Record<string, string> = {
-  'dribble-block': 'Ankle breaker!',
-  'dribble-steal': 'Picked clean!',
-  'pass-press': 'Pass over the pressure!',
-  'pass-wait': 'Read like a book!',
-  'shoot-wait': 'Too much space!',
-  'shoot-block': 'Swatted!',
-  'protect-steal': 'Shielded!',
-  'protect-press': 'Trapped!',
 };
 
 export interface Technique {
@@ -136,9 +124,9 @@ export const USER_TEAM = { name: 'Sunnyside Hoopers', short: 'SUN', color: '#ff7
 export const RIVALS: RivalTeam[] = [
   { id: 'puddle', name: 'Puddle Jumpers', color: '#2ec4b6', accent: '#cbf3f0', tier: 0, motto: 'They jump. Mostly into puddles.', players: ['Drip Malone', 'Galosh Gary', 'Splatty Jo'] },
   { id: 'ravens', name: 'Rooftop Ravens', color: '#7b2cbf', accent: '#e0aaff', tier: 1, motto: 'Caw. Caw. Buckets.', players: ['Beaky Ray', 'Talon Sue', 'Perch Petrov'] },
-  { id: 'crabs', name: 'Crunchtime Crabs', color: '#e63946', accent: '#ffccd5', tier: 2, motto: 'Sideways defense, straight-up rude.', players: ['Pinch Ortiz', 'Shelly Snap', 'Claw Danvers'] },
+  { id: 'crabs', name: 'Crunchtime Crabs', color: '#c1121f', accent: '#ffccd5', tier: 2, motto: 'Sideways defense, straight-up rude.', players: ['Pinch Ortiz', 'Shelly Snap', 'Claw Danvers'] },
   { id: 'narwhals', name: 'Neon Narwhals', color: '#f72585', accent: '#4cc9f0', tier: 3, motto: 'Glow in the dark. Score in the light.', players: ['Glimmer Ko', 'Tusk Bright', 'Neona Vale'] },
-  { id: 'toasters', name: 'Thunder Toasters', color: '#f4a261', accent: '#264653', tier: 4, motto: 'Pop-up shots, crispy defense.', players: ['Crumbs McKay', 'Sizzle Ade', 'Bagel Brick'] },
+  { id: 'toasters', name: 'Thunder Toasters', color: '#3d5a80', accent: '#f4a261', tier: 4, motto: 'Pop-up shots, crispy defense.', players: ['Crumbs McKay', 'Sizzle Ade', 'Bagel Brick'] },
   { id: 'meteors', name: 'Midnight Meteors', color: '#3a0ca3', accent: '#ffd60a', tier: 5, motto: 'Undefeated since sundown.', players: ['Comet Kade', 'Orbit Ines', 'Big Crater'] },
 ];
 
@@ -186,7 +174,7 @@ export function playerFromTemplate(t: PlayerTemplate): Player {
 }
 
 export function rivalPlayers(team: RivalTeam): Player[] {
-  const base = 4 + team.tier * 0.8;
+  const base = 4.5 + team.tier * 0.75;
   return team.players.map((name, i) => {
     const off = ROLE_OFFSETS[i];
     const stats = {} as Stats;

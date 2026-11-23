@@ -1,26 +1,35 @@
 import './style.css';
 import { setSound, sfx, unlockAudio } from './audio';
 import {
-  ACTION_INFO, ATTACK_ACTIONS, DEFEND_ACTIONS, MATRIX, RIVALS, STATS, STAT_LABEL, STAT_NAME, TECHNIQUES, TECH_LEVELS,
-  TEMPLATES, USER_TEAM, playerPower, rivalPlayers, xpForLevel, MAX_LEVEL,
+  RIVALS, STATS, STAT_LABEL, STAT_NAME, TECHNIQUES, TECH_LEVELS, TEMPLATES, USER_TEAM, playerPower, rivalPlayers, xpForLevel, MAX_LEVEL,
   type Player, type RivalTeam,
 } from './data';
-import { avatarHTML, showDuel } from './duelui';
+import { DecisionUI } from './decisionui';
 import { applyResult, loadSave, persist, rollScout, ROSTER_MAX, SCOUT_REFRESH_COST, sign, type Rewards } from './game';
-import { Match, MATCH_SECONDS, WIN_SCORE, type MatchResult } from './match';
+import { icon } from './icons';
+import { Match, type MatchResult } from './match';
 
 const app = document.getElementById('app')!;
 const save = loadSave();
 setSound(save.sound);
 let match: Match | null = null;
+let dui: DecisionUI | null = null;
 
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
-const coinsHTML = () => `<div class="coins">🪙 <b>${save.coins}</b></div>`;
+const coinsHTML = () => `<div class="coins">${icon('coin', 20)}<b>${save.coins}</b></div>`;
 
 document.addEventListener('pointerdown', unlockAudio, { capture: true });
 document.addEventListener('keydown', unlockAudio, { capture: true });
 
+function avatarHTML(p: Player, color: string, size = 56) {
+  return `<div class="avatar" style="--c:${color};--skin:${p.skin};--hair:${p.hair};width:${size}px;height:${size}px">
+    <div class="av-head"><div class="av-hair"></div><div class="av-eyes"></div></div>
+    <div class="av-num">${p.num}</div></div>`;
+}
+
 function mount(html: string, cls: string) {
+  dui?.destroy();
+  dui = null;
   match?.destroy();
   match = null;
   app.innerHTML = `<div class="screen ${cls}">${html}</div>`;
@@ -30,7 +39,7 @@ function mount(html: string, cls: string) {
 }
 
 function topBar(title: string) {
-  return `<div class="topbar"><button class="btn small ghost" data-go="title">◀ Back</button><h2>${title}</h2>${coinsHTML()}</div>`;
+  return `<div class="topbar"><button class="btn small ghost icon-btn" data-go="title" aria-label="Back">${icon('back', 22)}</button><h2>${title}</h2>${coinsHTML()}</div>`;
 }
 
 function statBars(p: Player) {
@@ -42,7 +51,7 @@ function techList(p: Player) {
   return `<div class="techs">${p.techs.map((id, i) => {
     const t = TECHNIQUES[id];
     const known = p.known.includes(id);
-    return `<span class="tech ${known ? 'known' : 'locked'}" title="${t.desc} · ${t.cost} energy">${known ? '★' : '🔒'} ${t.name}${known ? '' : ` <small>Lv${TECH_LEVELS[i]}</small>`}</span>`;
+    return `<span class="tech ${known ? 'known' : 'locked'}" title="${t.desc} - ${t.cost} energy">${icon(known ? t.action : 'lock', 16)}${icon('star', 12)} +${t.bonus}${t.pierce ? ' P' : ''}${known ? ` <small>${t.cost}</small>` : ` <small>Lv${TECH_LEVELS[i]}</small>`}</span>`;
   }).join('')}</div>`;
 }
 
@@ -51,18 +60,20 @@ function titleScreen() {
   const next = RIVALS[Math.min(save.beaten, RIVALS.length - 1)];
   const el = mount(`
     <div class="title-wrap">
-      <div class="logo"><span class="l1">TURN</span><span class="ball">🏀</span><span class="l2">BALL</span></div>
-      <p class="tagline">3-on-3 street hoops where every collision is a <b>turn-based showdown</b>.</p>
+      <div class="logo"><span class="l1">TURN</span><span class="ball">${icon('ball', 64)}</span><span class="l2">BALL</span></div>
+      <p class="tagline">3x3 street hoops. Every clash is a choice.</p>
       <div class="menu">
-        <button class="btn big primary" data-go="league">▶ PLAY</button>
-        <button class="btn" data-go="team">👕 My Team</button>
-        <button class="btn" data-go="scout">🔎 Scout Players</button>
-        <button class="btn" data-go="how">❓ How to Play</button>
+        <button class="btn big primary" data-go="league">${icon('play', 26)} PLAY</button>
+        <div class="menu-row">
+          <button class="btn sq" data-go="team" aria-label="My team">${icon('team', 28)}<small>Team</small></button>
+          <button class="btn sq" data-go="scout" aria-label="Scout">${icon('scout', 28)}<small>Scout</small></button>
+          <button class="btn sq" data-go="how" aria-label="How to play">${icon('help', 28)}<small>Help</small></button>
+          <button class="btn sq" id="snd" aria-label="Sound">${icon(save.sound ? 'soundOn' : 'soundOff', 28)}<small>Sound</small></button>
+        </div>
       </div>
       <div class="title-foot">
         ${coinsHTML()}
-        <div class="progress">${save.beaten >= RIVALS.length ? '🏆 Champions of the Sunset League!' : `Next rival: <b>${esc(next.name)}</b>`}</div>
-        <button class="btn small ghost" id="snd">${save.sound ? '🔊 Sound on' : '🔇 Sound off'}</button>
+        <div class="progress">${save.beaten >= RIVALS.length ? `${icon('trophy', 18)} Champions` : `Next: <b style="color:${next.color}">${esc(next.name)}</b>`}</div>
       </div>
     </div>`, 'title');
   el.querySelector('#snd')!.addEventListener('click', () => {
@@ -71,38 +82,38 @@ function titleScreen() {
 }
 
 function leagueScreen() {
+  const myPow = Math.round(save.roster.slice(0, 3).reduce((a, p) => a + playerPower(p), 0) / 3 * 10) / 10;
   const el = mount(`${topBar('Sunset League')}
-    <p class="sub">Beat each crew to unlock the next. Wins pay more coins and XP.</p>
     <div class="league">${RIVALS.map((r, i) => {
       const locked = i > save.beaten;
       const rec = save.record[r.id];
       const beaten = i < save.beaten;
       const pw = Math.round(rivalPlayers(r).reduce((a, p) => a + playerPower(p), 0) / 3 * 10) / 10;
       return `<div class="rival ${locked ? 'locked' : ''} ${beaten ? 'beaten' : ''}" style="--c:${r.color};--a:${r.accent}">
-        <div class="r-badge">${locked ? '🔒' : beaten ? '✔' : '★'.repeat(1 + Math.floor(r.tier / 2))}</div>
-        <div class="r-info"><b>${esc(r.name)}</b><small>${esc(r.motto)}</small>
-          <small>Power ${pw}${rec ? ` · W${rec.w} L${rec.l}` : ''}</small></div>
-        <button class="btn small ${locked ? 'ghost' : 'primary'}" data-rival="${i}" ${locked ? 'disabled' : ''}>${locked ? 'Locked' : 'Play'}</button>
+        <div class="r-badge">${locked ? icon('lock', 22) : beaten ? icon('check', 24) : `<b>${i + 1}</b>`}</div>
+        <div class="r-info"><b>${esc(r.name)}</b>
+          <span class="pow"><i style="width:${pw * 10}%"></i><em>${pw}</em></span>
+          ${rec ? `<small>W${rec.w} L${rec.l}</small>` : ''}</div>
+        <button class="btn small ${locked ? 'ghost' : 'primary'} icon-btn" data-rival="${i}" ${locked ? 'disabled' : ''} aria-label="Play">${icon(locked ? 'lock' : 'play', 22)}</button>
       </div>`;
     }).join('')}</div>
-    <p class="sub">Your power: <b>${Math.round(save.roster.slice(0, 3).reduce((a, p) => a + playerPower(p), 0) / 3 * 10) / 10}</b> · Starters: ${save.roster.slice(0, 3).map((p) => esc(p.name.split(' ')[0])).join(', ')}</p>`, 'league-screen');
+    <div class="mypow">${save.roster.slice(0, 3).map((p) => avatarHTML(p, USER_TEAM.color, 40)).join('')}<span class="pow"><i style="width:${myPow * 10}%"></i><em>${myPow}</em></span></div>`, 'league-screen');
   el.querySelectorAll<HTMLButtonElement>('[data-rival]').forEach((b) =>
     b.addEventListener('click', () => { sfx.tap(); matchScreen(RIVALS[+b.dataset.rival!]); }));
 }
 
 function teamScreen(msg = '') {
   const el = mount(`${topBar('My Team')}
-    <p class="sub">The first three are your starters. Bench players earn a little XP too. ${msg ? `<b class="msg">${esc(msg)}</b>` : ''}</p>
+    ${msg ? `<p class="sub"><b class="msg">${esc(msg)}</b></p>` : ''}
     <div class="roster">${save.roster.map((p, i) => `
       <div class="pcard ${i < 3 ? 'starter' : 'bench'}">
         <div class="pc-head">${avatarHTML(p, USER_TEAM.color, 52)}
-          <div class="pc-name"><b>${esc(p.name)}</b><small>${i < 3 ? 'STARTER' : 'BENCH'} · Lv ${p.level}${p.level >= MAX_LEVEL ? ' MAX' : ''}</small>
-            <div class="xpbar"><i style="width:${p.level >= MAX_LEVEL ? 100 : (p.xp / xpForLevel(p.level)) * 100}%"></i></div>
-            <small class="quote">“${esc(p.tag)}”</small></div></div>
+          <div class="pc-name"><b>${esc(p.name)}</b><small>${i < 3 ? 'STARTER' : 'BENCH'} - Lv ${p.level}${p.level >= MAX_LEVEL ? ' MAX' : ''}</small>
+            <div class="xpbar"><i style="width:${p.level >= MAX_LEVEL ? 100 : (p.xp / xpForLevel(p.level)) * 100}%"></i></div></div></div>
         ${statBars(p)}
         ${techList(p)}
         <div class="pc-actions">
-          ${i > 0 ? `<button class="btn small" data-up="${i}">▲ Move up</button>` : ''}
+          ${i > 0 ? `<button class="btn small icon-btn" data-up="${i}" aria-label="Move up">${icon('up', 20)}</button>` : ''}
           ${save.roster.length > 3 ? `<button class="btn small ghost" data-release="${i}">Release</button>` : ''}
         </div>
       </div>`).join('')}</div>`, 'team-screen');
@@ -113,29 +124,29 @@ function teamScreen(msg = '') {
   }));
   el.querySelectorAll<HTMLButtonElement>('[data-release]').forEach((b) => b.addEventListener('click', () => {
     const p = save.roster[+b.dataset.release!];
-    if (!confirm(`Release ${p.name}? They will leave the team.`)) return;
+    if (!confirm(`Release ${p.name}?`)) return;
     save.roster.splice(+b.dataset.release!, 1);
-    persist(save); teamScreen(`${p.name} waved goodbye.`);
+    persist(save); teamScreen(`${p.name} left the team.`);
   }));
 }
 
 function scoutScreen(msg = '') {
   const el = mount(`${topBar('Scouting')}
-    <p class="sub">Sign free agents with coins (roster max ${ROSTER_MAX}). New signings start at Lv 1. ${msg ? `<b class="msg">${esc(msg)}</b>` : ''}</p>
+    ${msg ? `<p class="sub"><b class="msg">${esc(msg)}</b></p>` : ''}
     <div class="roster">${save.scout.map((id) => {
       const t = TEMPLATES.find((x) => x.id === id)!;
       const fake: Player = { uid: '', tid: t.id, name: t.name, num: t.num, tag: t.tag, hair: t.hair, skin: t.skin, stats: t.stats, growth: t.growth, techs: t.techs, level: 1, xp: 0, known: [t.techs[0]] };
       return `<div class="pcard">
-        <div class="pc-head">${avatarHTML(fake, '#8d99ae', 52)}<div class="pc-name"><b>${esc(t.name)}</b><small>Power ${playerPower(fake)}</small><small class="quote">“${esc(t.tag)}”</small></div></div>
+        <div class="pc-head">${avatarHTML(fake, '#8d99ae', 52)}<div class="pc-name"><b>${esc(t.name)}</b><small>Power ${playerPower(fake)}</small></div></div>
         ${statBars(fake)}${techList(fake)}
-        <div class="pc-actions"><button class="btn small primary" data-sign="${id}" ${save.coins < t.price || save.roster.length >= ROSTER_MAX ? 'disabled' : ''}>Sign · 🪙 ${t.price}</button></div>
+        <div class="pc-actions"><button class="btn small primary" data-sign="${id}" ${save.coins < t.price || save.roster.length >= ROSTER_MAX ? 'disabled' : ''}>Sign ${icon('coin', 18)} ${t.price}</button></div>
       </div>`;
-    }).join('') || '<p class="sub">Nobody left to scout. You signed them all!</p>'}</div>
-    <div class="center"><button class="btn" id="reroll" ${save.coins < SCOUT_REFRESH_COST ? 'disabled' : ''}>🔄 New prospects · 🪙 ${SCOUT_REFRESH_COST}</button></div>`, 'scout-screen');
+    }).join('') || '<p class="sub">Nobody left to scout.</p>'}</div>
+    <div class="center"><button class="btn" id="reroll" ${save.coins < SCOUT_REFRESH_COST ? 'disabled' : ''}>${icon('scout', 20)} New ${icon('coin', 18)} ${SCOUT_REFRESH_COST}</button></div>`, 'scout-screen');
   el.querySelectorAll<HTMLButtonElement>('[data-sign]').forEach((b) => b.addEventListener('click', () => {
     const err = sign(save, b.dataset.sign!);
     if (err) { sfx.bad(); scoutScreen(err); return; }
-    persist(save); sfx.coin(); scoutScreen('Welcome to the Hoopers! Check My Team to make them a starter.');
+    persist(save); sfx.coin(); scoutScreen('Signed. Set starters in My Team.');
   }));
   el.querySelector('#reroll')!.addEventListener('click', () => {
     if (save.coins < SCOUT_REFRESH_COST) return;
@@ -144,24 +155,16 @@ function scoutScreen(msg = '') {
 }
 
 function howScreen() {
-  const cell = (v: number) => `<td class="${v >= 3 ? 'w3' : v > 0 ? 'w1' : v <= -3 ? 'l3' : 'l1'}">${v > 0 ? '+' : ''}${v}</td>`;
+  const card = (ic: string, title: string, body: string) => `<section class="hcard"><div class="hi">${ic}</div><div><h3>${title}</h3><p>${body}</p></div></section>`;
   mount(`${topBar('How to Play')}
     <div class="how">
-      <section><h3>🏀 The game</h3>
-        <p>3-on-3 half-court hoops. Inside the arc = <b>1 point</b>, outside = <b>2 points</b>. First to <b>${WIN_SCORE}</b> or most points after <b>${Math.floor(MATCH_SECONDS / 60)}:${String(MATCH_SECONDS % 60).padStart(2, '0')}</b> wins. Tie? <b>Golden basket</b>! You have <b>12 seconds</b> per possession.</p></section>
-      <section><h3>🕹️ Controls</h3>
-        <p><b>Tap / drag</b> the court to move. <b>Tap a teammate</b> to pass (green lane = safe, red = risky). Buttons below the court to shoot or pass.<br>
-        Keyboard: <kbd>WASD</kbd>/<kbd>Arrows</kbd> move · <kbd>Space</kbd> shoot · <kbd>Q</kbd>/<kbd>E</kbd> pass · <kbd>Shift</kbd> switch defender · <kbd>1-4</kbd> duel moves · <kbd>5-6</kbd> techniques.</p></section>
-      <section><h3>⚔️ Duels</h3>
-        <p>When a defender touches the ball handler, time freezes. You get <b>3 seconds</b> to pick a move. Total = <b>stat edge</b> + <b>matchup</b> + <b>★ technique</b> + <b>luck (-2…+2)</b>. Above 0, the attacker wins; below 0, the defender steals the ball.</p>
-        <table class="matrix"><tr><th>Attack ↓ / Defense →</th>${DEFEND_ACTIONS.map((d) => `<th>${ACTION_INFO[d].icon} ${ACTION_INFO[d].label}</th>`).join('')}</tr>
-        ${ATTACK_ACTIONS.map((a) => `<tr><th>${ACTION_INFO[a].icon} ${ACTION_INFO[a].label}</th>${DEFEND_ACTIONS.map((d) => cell(MATRIX[a][d])).join('')}</tr>`).join('')}</table>
-        <p class="small">Winning a duel: <b>Dribble</b> blows past (defender dazed), <b>Pass</b> finds the open teammate, <b>Shoot</b> scores, <b>Protect</b> keeps the ball and charges energy. <b>Wait</b> also charges energy on defense.</p></section>
-      <section><h3>⚡ Energy & ★ Techniques</h3>
-        <p>Every duel charges energy (the yellow ring). Spend it on special techniques that add a big bonus — some even <b>pierce</b> counters.</p></section>
-      <section><h3>📈 Progress</h3>
-        <p>Win matches for coins and XP. Players level up, gain stats and learn new techniques at Lv ${TECH_LEVELS.join(', ')}. Spend coins to <b>scout</b> new players.</p></section>
-      <div class="center"><button class="btn big primary" data-go="league">Let's play!</button></div>
+      ${card(icon('move', 34), 'Move', 'Tap or drag on the court. Keys: WASD / arrows.')}
+      ${card(icon('act', 34), 'Clash', 'Touch the ball handler, or press the big button, to stop the play.')}
+      ${card(`${icon('shoot', 26)}${icon('pass', 26)}`, 'Preview', 'Hover or hold an option to see the ghost path and the real odds.')}
+      ${card(`<span class="mini-odds"><i class="good"></i><i class="mid"></i><i class="bad"></i></span>`, 'Read the colors', 'Green = good for you. Grey = nothing changes. Red = bad.')}
+      ${card(icon('star', 30), 'Special', 'Clashes charge energy. Turn on the star to power up a move.')}
+      ${card(icon('hoop', 32), 'Score', '1 point inside the arc, 2 outside. First to 11, or most points at the buzzer.')}
+      <div class="center"><button class="btn big primary" data-go="league">${icon('play', 24)} Play</button></div>
     </div>`, 'how-screen');
 }
 
@@ -172,94 +175,70 @@ function fmtClock(s: number) {
 
 function matchScreen(rival: RivalTeam) {
   const el = mount(`
+    <div class="stage" id="stage"></div>
     <div class="hud">
       <div class="hteam home" style="--c:${USER_TEAM.color}"><span class="hn">${USER_TEAM.short}</span><span class="hs" id="s0">0</span></div>
-      <div class="hclock"><div id="clock">${fmtClock(MATCH_SECONDS)}</div><div class="shotc" id="shot">12</div></div>
-      <div class="hteam away" style="--c:${rival.color}"><span class="hs" id="s1">0</span><span class="hn">${esc(rival.name.split(' ')[1] ?? rival.name).slice(0, 8).toUpperCase()}</span></div>
-      <button class="btn small ghost pausebtn" id="pause" aria-label="Pause">⏸</button>
+      <div class="hclock"><div id="clock">2:30</div><div class="shotc" id="shot"><svg viewBox="0 0 36 36"><circle cx="18" cy="18" r="15" class="bg"/><circle cx="18" cy="18" r="15" class="fg" id="shotring"/></svg><b id="shotn">12</b></div></div>
+      <div class="hteam away" style="--c:${rival.color}"><span class="hs" id="s1">0</span><span class="hn">${esc(rival.name.slice(0, 3).toUpperCase())}</span></div>
+      <button class="btn small ghost pausebtn icon-btn" id="pause" aria-label="Pause">${icon('pause', 20)}</button>
     </div>
-    <div class="court-wrap"><canvas id="court"></canvas><div class="banner" id="banner"></div></div>
-    <div class="controls" id="controls"></div>`, 'match-screen');
-  const canvas = el.querySelector<HTMLCanvasElement>('#court')!;
+    <div class="banner" id="banner"></div>
+    <div class="movehint" id="movehint" ${save.duelsSeen > 2 ? 'hidden' : ''}>${icon('move', 22)}<span>${matchMedia('(pointer: coarse)').matches ? 'Tap to move' : 'Click or WASD'}</span></div>
+    <button class="actbtn" id="act" aria-label="Clash">${icon('act', 40)}<small id="actlbl"></small></button>`, 'match-screen');
+  const stage = el.querySelector<HTMLElement>('#stage')!;
   const banner = el.querySelector<HTMLElement>('#banner')!;
-  const controls = el.querySelector<HTMLElement>('#controls')!;
-  const wrap = el.querySelector<HTMLElement>('.court-wrap')!;
+  const act = el.querySelector<HTMLButtonElement>('#act')!;
+  const ring = el.querySelector<SVGCircleElement>('#shotring')!;
   let bannerT = 0;
-  let ctrlSig = '';
 
-  const m = new Match(canvas, [
-    { name: USER_TEAM.name, short: USER_TEAM.short, color: USER_TEAM.color, accent: USER_TEAM.accent, players: save.roster.slice(0, 3) },
-    { name: rival.name, short: rival.name.slice(0, 3).toUpperCase(), color: rival.color, accent: rival.accent, players: rivalPlayers(rival) },
+  dui = new DecisionUI(el, () => match, () => save.duelsSeen < 3);
+  const m = new Match(stage, [
+    { name: USER_TEAM.name, short: USER_TEAM.short, color: USER_TEAM.color, accent: USER_TEAM.accent, shorts: '#ffffff', players: save.roster.slice(0, 3) },
+    { name: rival.name, short: rival.name.slice(0, 3).toUpperCase(), color: rival.color, accent: rival.accent, shorts: '#1d1a2b', players: rivalPlayers(rival) },
   ], rival.tier, {
-    duel: (setup) => {
-      const legend = save.duelsSeen < 4;
-      save.duelsSeen++;
-      return showDuel(wrap, setup, legend);
+    decision: (open) => {
+      if (open) { save.duelsSeen++; el.querySelector('#movehint')?.setAttribute('hidden', ''); }
+      el.classList.toggle('deciding', open);
+      dui?.show(open);
     },
     hud: (h) => {
       el.querySelector('#s0')!.textContent = String(h.score[0]);
       el.querySelector('#s1')!.textContent = String(h.score[1]);
-      el.querySelector('#clock')!.textContent = h.golden ? 'GOLDEN' : fmtClock(h.clock);
-      const sc = el.querySelector<HTMLElement>('#shot')!;
-      sc.textContent = String(Math.ceil(h.shotClock));
-      sc.classList.toggle('low', h.shotClock <= 4);
+      el.querySelector('#clock')!.textContent = h.golden ? 'GOLD' : fmtClock(h.clock);
+      el.querySelector('#shotn')!.textContent = String(Math.ceil(h.shotClock));
+      ring.style.strokeDashoffset = String(94.2 * (1 - h.shotClock / 12));
+      el.querySelector('.shotc')!.classList.toggle('low', h.shotClock <= 4);
       el.querySelector('.home')!.classList.toggle('poss', h.offense === 0);
       el.querySelector('.away')!.classList.toggle('poss', h.offense === 1);
     },
-    controls: (c) => {
-      const sig = `${c.mode}|${c.passes.length}`;
-      if (sig !== ctrlSig) {
-        ctrlSig = sig;
-        if (c.mode === 'attack') {
-          controls.innerHTML = `
-            <button class="btn ctrl shoot" id="cshoot"><span>🏀 SHOOT <kbd>Space</kbd></span><b></b><small></small></button>
-            ${c.passes.map((_, i) => `<button class="btn ctrl pass" data-pass="${i}"><span>🎯 PASS <kbd>${i ? 'E' : 'Q'}</kbd></span><b></b><small></small></button>`).join('')}`;
-          controls.querySelector('#cshoot')!.addEventListener('click', () => m.userShoot());
-          controls.querySelectorAll<HTMLElement>('[data-pass]').forEach((b) => b.addEventListener('click', () => m.userPass(+b.dataset.pass!)));
-        } else if (c.mode === 'defend') {
-          controls.innerHTML = `<div class="ctrl-hint">🛡️ Defending with <b></b><br><small>Run into the ball handler to start a DUEL</small></div>
-            <button class="btn ctrl switch" id="cswitch"><span>🔄 SWITCH <kbd>Shift</kbd></span><small>closest to ball</small></button>`;
-          controls.querySelector('#cswitch')!.addEventListener('click', () => m.userSwitch());
-        } else {
-          controls.innerHTML = `<div class="ctrl-hint dim">…</div>`;
-        }
-      }
-      if (c.mode === 'attack') {
-        const sh = controls.querySelector('#cshoot')!;
-        sh.querySelector('b')!.textContent = `${c.shootPct}%`;
-        sh.querySelector('small')!.textContent = c.isTwo ? '2 PTS' : '1 PT';
-        sh.classList.toggle('hot', c.shootPct >= 50);
-        controls.querySelectorAll<HTMLElement>('[data-pass]').forEach((b, i) => {
-          const p = c.passes[i];
-          b.querySelector('b')!.textContent = p.name;
-          b.querySelector('small')!.textContent = p.risky ? 'RISKY' : 'OPEN';
-          b.classList.toggle('risky', p.risky);
-        });
-      } else if (c.mode === 'defend') {
-        controls.querySelector('.ctrl-hint b')!.textContent = c.controlledName;
-      }
+    mode: (mode, can) => {
+      act.hidden = mode === 'idle';
+      act.disabled = !can;
+      act.classList.toggle('def', mode === 'defend');
+      el.querySelector('#actlbl')!.textContent = mode === 'defend' ? 'CLASH' : 'PLAY';
     },
-    banner: (text, sub, color) => {
-      banner.innerHTML = `<div class="bn-main" style="--c:${color ?? '#fff'}">${esc(text)}</div>${sub ? `<div class="bn-sub">${esc(sub)}</div>` : ''}`;
+    banner: (text, color, sub) => {
+      banner.innerHTML = `<div class="bn-main" style="--c:${color}">${esc(text)}</div>${sub ? `<div class="bn-sub">${esc(sub)}</div>` : ''}`;
       banner.classList.remove('show');
       void banner.offsetWidth;
       banner.classList.add('show');
       clearTimeout(bannerT);
-      bannerT = window.setTimeout(() => banner.classList.remove('show'), 1600);
+      bannerT = window.setTimeout(() => banner.classList.remove('show'), 1500);
     },
     end: (r) => resultScreen(rival, r),
   });
   match = m;
+  act.addEventListener('click', () => m.userAct());
 
   el.querySelector('#pause')!.addEventListener('click', () => {
-    if (m.phase === 'duel' || m.phase === 'over') return;
+    if (m.phase === 'over' || m.paused) return;
     m.paused = true;
     const ov = document.createElement('div');
     ov.className = 'pause-overlay';
     ov.innerHTML = `<div class="panel"><h2>Paused</h2>
-      <button class="btn primary" id="resume">▶ Resume</button>
-      <button class="btn ghost" id="quit">Quit match (no rewards)</button></div>`;
-    wrap.appendChild(ov);
+      <button class="btn primary" id="resume">${icon('play', 22)} Resume</button>
+      <button class="btn ghost" id="quit">${icon('cross', 20)} Quit</button></div>`;
+    el.appendChild(ov);
     ov.querySelector('#resume')!.addEventListener('click', () => { m.paused = false; ov.remove(); });
     ov.querySelector('#quit')!.addEventListener('click', () => { persist(save); leagueScreen(); });
   });
@@ -271,22 +250,22 @@ function resultScreen(rival: RivalTeam, r: MatchResult) {
   if (r.won) sfx.levelUp(); else sfx.bad();
   const el = mount(`
     <div class="result ${r.won ? 'won' : 'lost'}">
-      <h1>${r.won ? 'VICTORY!' : 'NICE TRY!'}</h1>
-      <div class="final"><span>${USER_TEAM.name}</span><b>${r.score[0]} – ${r.score[1]}</b><span>${esc(rival.name)}</span></div>
-      <div class="reward">🪙 +${rewards.coins} coins</div>
-      ${rewards.unlocked ? `<div class="unlock">🔓 New rival unlocked: <b>${esc(rewards.unlocked.name)}</b></div>` : ''}
-      ${r.won && RIVALS.indexOf(rival) === RIVALS.length - 1 ? '<div class="unlock">🏆 You beat the Midnight Meteors! Champions!</div>' : ''}
+      <h1>${r.won ? 'VICTORY' : 'DEFEAT'}</h1>
+      <div class="final"><span style="color:${USER_TEAM.color}">${USER_TEAM.short}</span><b>${r.score[0]} - ${r.score[1]}</b><span style="color:${rival.color}">${esc(rival.name.slice(0, 3).toUpperCase())}</span></div>
+      <div class="reward">${icon('coin', 24)} +${rewards.coins}</div>
+      ${rewards.unlocked ? `<div class="unlock">${icon('lock', 20)} <b>${esc(rewards.unlocked.name)}</b> unlocked</div>` : ''}
+      ${r.won && RIVALS.indexOf(rival) === RIVALS.length - 1 ? `<div class="unlock">${icon('trophy', 22)} Champions</div>` : ''}
       <div class="reports">${rewards.reports.map((rep) => {
         const line = r.lines[rep.player.uid];
         return `<div class="rep ${rep.levels ? 'lvl' : ''}">${avatarHTML(rep.player, USER_TEAM.color, 40)}
           <div><b>${esc(rep.player.name)}</b> <small>Lv ${rep.player.level}</small>
-          <small>${line ? `${line.pts} pts · ${line.duelsWon}/${line.duels} duels won · ` : 'Bench · '}+${rep.xp} XP</small>
-          ${rep.levels ? `<small class="up">⬆ LEVEL UP! ${rep.stats.map((s) => `${STAT_LABEL[s]}+1`).join(' ')}${rep.techs.length ? ` · New technique: ★ ${rep.techs.map(esc).join(', ')}` : ''}</small>` : ''}</div></div>`;
+          <small>${line ? `${line.pts} pts - ${line.duelsWon}/${line.duels} clashes - ` : ''}+${rep.xp} XP</small>
+          ${rep.levels ? `<small class="up">${icon('up', 14)} LEVEL UP ${rep.stats.map((s) => `${STAT_LABEL[s]}+1`).join(' ')}${rep.techs.length ? ` ${icon('star', 12)} ${rep.techs.map(esc).join(', ')}` : ''}</small>` : ''}</div></div>`;
       }).join('')}</div>
       <div class="menu row">
-        <button class="btn primary" data-go="league">Continue</button>
-        <button class="btn" data-go="team">My Team</button>
-        <button class="btn" data-go="scout">Scout</button>
+        <button class="btn primary" data-go="league">${icon('play', 20)} Next</button>
+        <button class="btn sq" data-go="team" aria-label="Team">${icon('team', 24)}</button>
+        <button class="btn sq" data-go="scout" aria-label="Scout">${icon('scout', 24)}</button>
       </div>
     </div>`, 'result-screen');
   if (r.won) confetti(el);
@@ -313,7 +292,11 @@ const routes: Record<string, () => void> = {
   how: howScreen,
 };
 
-// Expose a tiny hook for automated smoke tests.
-(window as unknown as { __turnball: unknown }).__turnball = { get match() { return match; }, save };
+// Tiny hook for automated smoke tests.
+(window as unknown as { __turnball: unknown }).__turnball = {
+  get match() { return match; },
+  save,
+  play: (i: number) => matchScreen(RIVALS[i]),
+};
 
 titleScreen();
