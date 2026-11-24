@@ -3,3 +3,6 @@ dist
 .DS_Store
 *.log
 test-shots
+# Pixel edition: licensed art, generated locally from the purchased pack (see tools/pixel-art/README.md)
+src/pixel/art/
+.pixel-art-key

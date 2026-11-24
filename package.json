@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "sim": "node --disable-warning=ExperimentalWarning src/sim.ts"
+    "sim": "node --disable-warning=ExperimentalWarning src/sim.ts",
+    "art:export": "python3 tools/pixel-art/export_atlas.py \"${HOOPS_PACK:-../assets/n3cloud-basketball-hoops-in-pixel/Hoops_in_pixels_V2}\" src/pixel/art",
+    "art:seal": "node tools/pixel-art/seal.mjs seal",
+    "art:unseal": "node tools/pixel-art/seal.mjs unseal"
   },
   "devDependencies": {
     "@types/three": "^0.187.0",
@@ -15,6 +18,7 @@
     "vite": "^8.3.8"
   },
   "dependencies": {
+    "@fontsource/pixelify-sans": "^5.3.0",
     "three": "^0.187.0"
   }
 }

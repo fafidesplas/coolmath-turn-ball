@@ -24,6 +24,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # The pixel edition's art comes from a licensed pack that may not be redistributed: the repo only
+      # holds it encrypted; the key is a repository secret, so only the deployed build contains it.
+      - name: Unseal pixel art
+        run: npm run art:unseal
+        env:
+          PIXEL_ART_KEY: ${{ secrets.PIXEL_ART_KEY }}
       - run: npm run build
       - uses: actions/upload-pages-artifact@v3
         with:
