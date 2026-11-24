@@ -19,7 +19,9 @@ import { TECHS, isDefTech, type TechId } from '../techs';
 import { FIRE, SPECIALS, fireDelta, specialFor, type SpecialDef, type SpecialId } from '../specials';
 import { ArcCurve, COURT_H, COURT_W, HOOP, RIM, RIM_H, w3 } from './court';
 import { hairStyleFor, releaseIndex, tagLen, type Kit } from './sprites';
-import { PixelWorld, type PixelLook, type ScenePt } from './world';
+import { PixelWorld, type CamMode, type PixelLook, type ScenePt } from './world';
+import { COMBOS, REACT_WORD, comboOdds, comboScoreVs, combosFor, reaction, type ComboPlan } from './combos';
+import { pxsfx } from './pxsfx';
 
 export { COURT_W, COURT_H, HOOP };
 
@@ -79,9 +81,13 @@ export interface MatchResult { score: [number, number]; won: boolean; lines: Rec
 export type Tone = 'good' | 'mid' | 'bad';
 export interface OddsItem { key: string; pct: number; tone: Tone; word: string; icon: string }
 export interface Card { gain: string; risk: string; change: string }
+/** Menu kinds on attack: the four actions plus combined plays. */
+export type UiKind = ActKind | 'combo';
 export interface OptionInfo {
   id: string;
-  kind: ActKind | Stance;
+  kind: UiKind | Stance;
+  /** A combined play (several players, several steps in one decision). */
+  combo?: ComboPlan;
   /** Technique used (attack technique or defensive technique). */
   tech: TechId;
   act?: Act;
@@ -193,6 +199,8 @@ export interface MatchOptions {
   hints?: boolean;
   /** Reduced motion: no slow motion, zoom, shake or flashes. */
   reduceFx?: boolean;
+  /** Camera mode (full, soft, off). */
+  cam?: CamMode;
   /** Step-by-step coach on the first attack and the first defense possession. */
   coach?: { att: boolean; def: boolean };
 }
@@ -206,8 +214,12 @@ const pct = (p: number) => Math.round(p * 100);
 const ONE = (st: Stance) => ({ press: 0, space: 0, deny: 0, [st]: 1 });
 
 export const STANCE_LABEL: Record<Stance, string> = { press: 'Press', space: 'Give space', deny: 'Deny pass' };
-export const KIND_LABEL: Record<ActKind, string> = { shoot: 'Shoot', pass: 'Pass', drive: 'Dribble', cut: 'Play' };
-export const KIND_ICON: Record<ActKind, string> = { shoot: 'shoot', pass: 'pass', drive: 'dribble', cut: 'cut' };
+export const KIND_LABEL: Record<UiKind, string> = { shoot: 'Shoot', pass: 'Pass', drive: 'Dribble', cut: 'Play', combo: 'Combo' };
+export const KIND_ICON: Record<UiKind, string> = { shoot: 'shoot', pass: 'pass', drive: 'dribble', cut: 'cut', combo: 'team' };
+/** Outcomes that let a combo go on to its next step. */
+const COMBO_GO = new Set<Ev>(['open', 'catch', 'feed', 'beat', 'help', 'room']);
+/** Extra options of one animated action (combo steps). */
+interface AnimOpts { lead0?: boolean; blocker?: Ent; alley?: boolean }
 /** The big word shown when a duel resolves, and its icon. */
 const RESULT_WORD: Record<Ev, { w: string; i: string }> = {
   make: { w: 'SCORE!', i: 'hoop' }, and1: { w: 'AND ONE!', i: 'hoop' }, miss: { w: 'MISS', i: 'cross' }, oreb: { w: 'REBOUND!', i: 'ball' },
@@ -301,6 +313,16 @@ export class Match {
   private cine: SpecialDef | null = null;
   /** A dunk cinematic (zoom, letterbox) is running. */
   private fxOn = false;
+  /** Combined play in progress: the plan, the defense's first move and the name shown at the end. */
+  private comboRun: { c: ComboPlan; dm0: TechId; dmPrev: TechId } | null = null;
+  /** How the next animated action ends: go on with the combo, or close the decision. */
+  private chain: { final: boolean; done: () => void } | null = null;
+  /** Off-ball movement: per attacker, time to the next step and the offset of the current one. */
+  private wander: { t: number; back: boolean }[] = [{ t: 1.2, back: false }, { t: 2.0, back: false }, { t: 2.8, back: false }];
+  /** Phase of the dribble bounce (sound on each floor contact). */
+  private bouncePh = 0;
+  /** Who won the ball at the end of the last possession (keeps it to clear it out). */
+  private nextHandler: Ent | null = null;
 
   constructor(stage: HTMLElement, public teams: [TeamSetup, TeamSetup], private o: MatchOptions, private hooks: MatchHooks) {
     this.rand = rng(o.seed ?? (Date.now() & 0x7fffffff));
@@ -330,6 +352,8 @@ export class Match {
     this.temp = clamp(0.12 - o.tier * 0.015, 0.04, 0.12);
     this.world = new PixelWorld(stage, looks);
     this.world.reduce = !!o.reduceFx;
+    this.world.camMode = o.cam ?? 'soft';
+    this.world.setFans(fanLooks(teams));
     this.world.canvas.addEventListener('pointerdown', this.onCanvasDown);
     this.offense = o.tutorial ? 0 : (this.rand() < 0.5 ? 0 : 1);
     this.startPossession(true);
@@ -344,7 +368,17 @@ export class Match {
   }
 
   /** Switch reduced motion during a match (pause menu). */
-  setReduceFx(on: boolean) { this.o.reduceFx = on; this.world.reduce = on; if (on) { this.slow = 0; this.world.endCinematic(); } }
+  setReduceFx(on: boolean) { this.o.reduceFx = on; this.world.reduce = on; if (on) { this.slow = 0; this.world.endCinematic(); this.world.overview(); } }
+  /** Switch the camera mode during a match (pause menu). */
+  setCamMode(m: CamMode) {
+    this.o.cam = m;
+    this.world.setCamMode(m);
+    if (this.phase !== 'decide' || m === 'off') return;
+    // Frame again what is on screen: the previewed move, or the duel.
+    this.camDuel();
+    const id = this.previewId;
+    if (id) { this.previewId = null; this.preview(id); }
+  }
 
   quit(): MatchResult {
     return { score: [...this.score] as [number, number], won: false, lines: this.lines, quit: true, tutorial: !!this.o.tutorial };
@@ -461,7 +495,9 @@ export class Match {
       this.shownStance = t.stance ?? null;
       this.hooks.banner(t.title, '#ffd166', `${this.tutIdx + 1} / ${tut.length}`);
     } else {
-      s = setupPoss(SETUPS[Math.floor(this.rand() * SETUPS.length)], Math.floor(this.rand() * 3));
+      // Transition: the player who won the ball (rebound, steal, block) keeps it and clears it out to the arc.
+      const won = this.nextHandler && this.nextHandler.team === this.offense ? this.nextHandler.slot : -1;
+      s = setupPoss(SETUPS[Math.floor(this.rand() * SETUPS.length)], won >= 0 ? won : Math.floor(this.rand() * 3));
       if (this.golden) this.hooks.banner('NEXT SCORE WINS', '#ffd60a');
       else this.hooks.banner(this.offense === 0 ? 'YOUR BALL' : 'DEFENSE', this.teams[this.offense].color);
     }
@@ -478,7 +514,15 @@ export class Match {
     this.looseBall = null;
     for (const e of this.ents) { e.daze = 0; e.armsT = 0; }
     if (first) this.snapLayout(s, this.shownStance);
-    else this.layout(s, this.shownStance, 0.8);
+    else {
+      this.layout(s, this.shownStance, 0.8);
+      // The ball carrier dribbles out at speed; the others jog to their spots.
+      const hh = this.att(s.ball);
+      if (this.nextHandler === hh && dist(hh.x, hh.y, ZONES[s.zones[s.ball]].x, ZONES[s.zones[s.ball]].y) > 2) { hh.fast = true; this.glide(hh, ZONES[s.zones[s.ball]].x, ZONES[s.zones[s.ball]].y, 0.9); }
+    }
+    this.nextHandler = null;
+    this.comboRun = null;
+    this.chain = null;
     this.phase = 'intro';
     sfx.whistle();
     this.pushHud();
@@ -501,6 +545,7 @@ export class Match {
     }
     this.opts = this.buildOptions();
     for (let i = 0; i < 3; i++) { this.faceTo(this.att(i), HOOP.x, HOOP.y); this.faceTo(this.def(i), this.att(i).x, this.att(i).y); }
+    this.wander = this.wander.map((_, i) => ({ t: 0.9 + i * 0.7 + Math.random() * 0.6, back: false }));
     // Battle camera: close on the two players facing off; the opponent's tell floats over their player.
     this.camDuel();
     this.world.clearMarks();
@@ -524,7 +569,9 @@ export class Match {
   camDuel() {
     const s = this.poss;
     if (!s) return;
-    this.world.frame([...this.pts(this.att(s.ball)), ...this.pts(this.def(s.ball))], 3, 12);
+    const P = [...this.pts(this.att(s.ball)), ...this.pts(this.def(s.ball))];
+    this.world.frame(P, 2, 16);
+    if (this.phase === 'decide') this.world.setDuelBox(P);
   }
   /** Frame everything an action involves (the shooter and the rim, the passer and the receiver...). */
   private focusAct(a: Act) {
@@ -538,7 +585,7 @@ export class Match {
       if (a.t === 'iso' || a.t === 'giveandgo') for (let j = 0; j < 3; j++) P.push(...this.pts(this.att(j)));
       P.push(...this.pts(this.att(a.who)), ...this.pts(this.def(a.who)), ...this.pts(ZONES[a.z]));
     }
-    this.world.frame(P, 3, 14);
+    this.world.frame(P, 2, 14, true);
   }
   /** Frame a defensive move: the duel, plus the rim or the whole team when the move involves them. */
   private focusStance(dm: TechId) {
@@ -548,7 +595,7 @@ export class Match {
     P.push(...this.pts(p));
     if (dm === 'rim' || dm === 'charge') P.push(...this.rimPts());
     if (famOf(dm) === 'deny' || dm === 'hawk') for (let j = 0; j < 3; j++) { P.push(...this.pts(this.att(j)), ...this.pts(this.defSpot(s, j, dm))); }
-    this.world.frame(P, 3, 14);
+    this.world.frame(P, 2, 14, true);
   }
 
   /** The opponent's most likely choice, shown as an icon over their player. */
@@ -906,6 +953,8 @@ export class Match {
       }
       out.push(info);
     }
+    // Combined plays (not during the guided lessons).
+    if (!step) for (const c of combosFor(m, s)) out.push(this.comboOption(c, plan));
     // The dunk is always on the Shoot menu: when it is out of reach it says why.
     if (!out.some((o) => o.tech === 'dunk')) {
       const h = this.att(s.ball);
@@ -1004,6 +1053,139 @@ export class Match {
     return out;
   }
 
+  // ---------------------------------------------------------------- combined plays (options)
+  /** Short label of a combo target ("#7", "#7 glass", "#4 > #7", "Post"). */
+  private comboTag(c: ComboPlan) {
+    const n = (j: number) => `#${this.att(j).pl.num}`;
+    if (c.id === 'gng') return ZONES[c.zone!].name;
+    if (c.id === 'swing') return `${n(c.who[1])} > ${n(c.who[2])}`;
+    if (c.look === 'glass') return `${n(c.mate)} glass`;
+    if (c.id === 'backdoor') return `${n(c.mate)} ${c.look}`;
+    return n(c.mate);
+  }
+
+  /** Menu option of a combo: exact odds of the whole chain against the defense's mix. */
+  private comboOption(c: ComboPlan, plan: DefPlan): OptionInfo {
+    const s = this.poss!, m = this.mu;
+    const o = comboOdds(m, s, c, plan);
+    const pc = toPercents({ score: o.score, stop: o.stop, miss: o.miss + o.block, lost: o.lost });
+    const d = COMBOS[c.id];
+    const tag = this.comboTag(c);
+    return {
+      id: `combo:${c.key}`, kind: 'combo', tech: d.tech, label: d.name, tag, short: tag, targetNum: this.att(c.mate).pl.num,
+      odds: [
+        { key: 'score', pct: pc.score, tone: 'good', word: 'SCORE', icon: 'hoop' },
+        { key: 'stop', pct: pc.stop, tone: 'mid', word: 'STOPPED', icon: 'even' },
+        { key: 'miss', pct: pc.miss, tone: 'mid', word: 'MISS', icon: 'cross' },
+        { key: 'lost', pct: pc.lost, tone: 'bad', word: 'LOST', icon: 'steal' },
+      ],
+      main: pc.score,
+      card: { gain: `Scores ${pc.score}%, ${o.pts.toFixed(2)} points on average`, risk: `Ball lost ${pc.lost}%`, change: d.line },
+      group: `combo_${c.id}`, what: d.line, reward: lvl(o.pts * 100, 30, 55), risk: lvl(pc.lost, 8, 16),
+      edge: this.edgeCombo(c, plan), combo: c,
+    };
+  }
+
+  /** Like edgeAtt, for a combo: does it do best, or worst, against the defense's tell? */
+  private edgeCombo(c: ComboPlan, plan: DefPlan): -1 | 0 | 1 {
+    const t = this.tell();
+    if (!t?.st) return 0;
+    const s = this.poss!;
+    const succ = {} as Record<Stance, number>;
+    for (const st of STANCES) succ[st] = comboScoreVs(this.mu, s, c, plan.v[st]);
+    const me = succ[t.st];
+    const others = STANCES.filter((x) => x !== t.st).map((x) => succ[x]);
+    const hi = Math.max(...others), lo = Math.min(...others);
+    if (me >= hi - 0.02 && me - lo >= 0.06) return 1;
+    if (me <= lo + 0.02 && hi - me >= 0.06) return -1;
+    return 0;
+  }
+
+  /**
+   * Preview of a combo: every step's route on the court with a numbered badge (1, 2, 3), following the path
+   * where each step works. The camera frames all of it.
+   */
+  private previewCombo(c: ComboPlan) {
+    const W = this.world;
+    const m = this.mu;
+    let st = this.poss!;
+    let prev: Branch | null = null;
+    const P: ScenePt[] = [];
+    const at = (j: number, i: number) => (i === 0 ? { x: this.att(j).x, y: this.att(j).y } : ZONES[st.zones[j]]);
+    const g = (q: { x: number; y: number }, h = 0) => w3(q.x, q.y, h);
+    for (let i = 0; i < 4; i++) {
+      const a = c.next(i, st, prev);
+      if (!a) break;
+      const holder = at(st.ball, i);
+      let mid: Vector3;
+      if (a.k === 'cut') {
+        const from = at(a.who, i), z = ZONES[a.z];
+        if (a.t === 'pnr') {
+          const hd = this.def(st.ball);
+          const scr = { x: hd.x + (holder.x - hd.x) * 0.35, y: hd.y + (holder.y - hd.y) * 0.35 };
+          W.dots(new CatmullRomCurve3([g(from, 0.08), g(scr, 0.08)]), '#ffd166', 0.07, 0.26, 1.2);
+          W.wall(g(scr), new Vector3(0, 0, 1), '#ffd166', 0.8, 1.2, 0.1);
+          W.dots(this.routeCurve(scr.x, scr.y, z.x, z.y, this.def(a.who)), '#7ef0c0', 0.08, 0.3, 1.4);
+          mid = g(scr, 0.4);
+        } else if (a.t === 'giveandgo') {
+          const p = at(gngPartner(st), i);
+          W.dots(new ArcCurve(g(holder, 1.2), g(p, 1.2), 0.3), '#9be7ff', 0.06, 0.3, 1.3);
+          W.dots(this.routeCurve(holder.x, holder.y, z.x, z.y, this.def(st.ball)), '#7ef0c0', 0.08, 0.3, 1.4);
+          W.dots(new ArcCurve(g(p, 1.2), g(z, 1.2), 0.3), '#9be7ff', 0.06, 0.3, 1.3);
+          mid = g(p, 0.4);
+        } else {
+          const route = a.t === 'backdoor' ? this.backdoorCurve(from.x, from.y, z.x, z.y) : this.routeCurve(from.x, from.y, z.x, z.y, this.def(a.who));
+          W.dots(route, a.t === 'backdoor' ? '#c3a6ff' : '#7ef0c0', 0.08, 0.3, 1.4);
+          mid = route.getPoint(0.5);
+        }
+        P.push(...this.pts(from), ...this.pts(z));
+      } else if (a.k === 'pass') {
+        const to = at(a.to, i);
+        const F = g(holder, 1.3);
+        if (c.id === 'alley') {
+          const near = { x: HOOP.x + (to.x - HOOP.x) * 0.2, y: HOOP.y + (to.y - HOOP.y) * 0.2 };
+          const T = g(near, RIM_H + 0.4);
+          if (c.look === 'glass') { const bp = boardPoint(holder.x); W.dots(new ArcCurve(F, bp, 1.2), '#c3a6ff', 0.075, 0.3, 1.1); W.dots(new ArcCurve(bp, T, 0.2), '#c3a6ff', 0.07, 0.2, 1.1); }
+          else W.dots(new ArcCurve(F, T, 2.0), '#c3a6ff', 0.075, 0.3, 1.1);
+          W.dots(new CatmullRomCurve3([g(to, 0.08), g(near, 0.08)]), '#7ef0c0', 0.07, 0.28, 1.4);
+          P.push(...this.rimPts());
+        } else if (a.t === 'bounce') {
+          const B = g(to, 1.1);
+          const md = F.clone().lerp(B, 0.55).setY(0.05);
+          W.dots(new CatmullRomCurve3([F, F.clone().lerp(md, 0.5).setY(0.6), md, md.clone().lerp(B, 0.5).setY(0.7), B], false, 'catmullrom', 0.1), '#9be7ff', 0.07, 0.3, 1.3);
+        } else W.dots(new ArcCurve(F, g(to, a.t === 'lob' ? 2.2 : 1.2), a.t === 'lob' ? 2.2 : a.t === 'skip' ? 1.5 : 0.35), a.t === 'lob' || a.t === 'skip' ? '#c3a6ff' : '#9be7ff', 0.07, 0.32, 1.3);
+        mid = F.clone().lerp(g(to, 1.2), 0.5).setY(1.6);
+        P.push(...this.pts(holder), ...this.pts(to));
+      } else if (a.k === 'drive') {
+        const z = ZONES[a.z];
+        const route = this.driveCurve(a.t, holder.x, holder.y, z.x, z.y, this.def(st.ball));
+        W.dots(route, '#ffd166', 0.09, 0.3, 1.4);
+        mid = route.getPoint(0.5);
+        P.push(...this.pts(holder), ...this.pts(z));
+      } else {
+        const sh = at(st.ball, i);
+        if (c.id === 'alley') mid = w3(HOOP.x + (sh.x - HOOP.x) * 0.2, HOOP.y + (sh.y - HOOP.y) * 0.2, RIM_H + 1.0);
+        else {
+          const dd = dist(sh.x, sh.y, HOOP.x, HOOP.y);
+          W.dots(new ArcCurve(g(sh, 2.1), RIM.clone().add(new Vector3(0, 0.12, 0)), a.t === 'dunk' || a.t === 'layup' ? 0.35 : shotApex(dd)), '#ffffff', 0.075, 0.34);
+          mid = g(sh, 2.6);
+        }
+        W.ghostBall(RIM.clone().add(new Vector3(0, 0.12, 0)), '#3ddc97');
+        W.floorRing(g(sh), '#3ddc97', 0.7);
+        P.push(...this.pts(sh), ...this.rimPts());
+      }
+      W.badge(mid, i + 1);
+      // Follow the path where this step works (the roll for a pick and roll).
+      const list = branches(m, st, a, 'press');
+      const go = list.find((b) => b.ev === 'open' && b.next) ?? list.find((b) => COMBO_GO.has(b.ev) && b.next);
+      if (!go || a.k === 'shoot') break;
+      prev = go;
+      st = go.next!;
+    }
+    W.floorRing(this.pos3(this.att(c.mate)), '#ffd166', 0.8);
+    this.world.frame(P, 2, 16, true);
+  }
+
   // ---------------------------------------------------------------- previews
   preview(id: string | null) {
     if (this.phase !== 'decide' || this.previewId === id) return;
@@ -1024,6 +1206,7 @@ export class Match {
     const toHoop = new Vector3(HOOP.x - h.x, 0, HOOP.y - h.y).normalize();
     const side = new Vector3(-toHoop.z, 0, toHoop.x);
     if (opt.dm) { this.previewStance(opt, lab); this.focusStance(opt.dm); return; }
+    if (opt.combo) { this.previewCombo(opt.combo); return; }
     const a = opt.act!;
     this.focusAct(a);
     const tp = this.targetPos(a);
@@ -1264,7 +1447,7 @@ export class Match {
   }
 
   /** Destination rings for a category and technique (tap targets in the world). */
-  showCategory(kind: ActKind | null, group?: string) {
+  showCategory(kind: UiKind | null, group?: string) {
     if (this.phase !== 'decide' || this.previewId) return;
     const W = this.world;
     W.clearPreview();
@@ -1272,16 +1455,21 @@ export class Match {
     const s = this.poss!;
     const P: ScenePt[] = [...this.pts(this.att(s.ball)), ...this.pts(this.def(s.ball))];
     for (const o of this.opts) {
-      if (o.kind !== kind || o.disabled || !o.act || (group && o.group !== group)) continue;
+      if (o.kind !== kind || o.disabled || !(o.act || o.combo) || (group && o.group !== group)) continue;
       if (kind === 'shoot') { P.push(...this.rimPts()); continue; }
-      const p = this.targetPos(o.act);
+      const p = this.optTarget(o);
       if (!p) continue;
-      W.floorRing(w3(p.x, p.y), o.act.k === 'cut' ? '#7ef0c0' : '#ffffff', 0.6);
+      W.floorRing(w3(p.x, p.y), o.combo ? '#ffd166' : o.act!.k === 'cut' ? '#7ef0c0' : '#ffffff', 0.6);
       P.push(...this.pts(p));
     }
-    this.world.frame(P, 3, 14);
+    this.world.frame(P, 2, 14, true);
   }
 
+  /** Court point that identifies an option (an action's target, or a combo's main teammate). */
+  private optTarget(o: OptionInfo): { x: number; y: number } | null {
+    if (o.combo) return o.combo.id === 'gng' ? ZONES[o.combo.zone!] : this.att(o.combo.mate);
+    return o.act ? this.targetPos(o.act) : null;
+  }
   /** Court point that identifies an option (receiver, destination, or the mover for picks). */
   private targetPos(a: Act): { x: number; y: number } | null {
     if (a.k === 'pass') return this.att(a.to);
@@ -1301,12 +1489,14 @@ export class Match {
    * Option under a tap, in canvas pixels: the tap can land on the ring or on the player's sprite above it.
    * Prefers the given kind and technique.
    */
-  optionAt(x: number, y: number, kind: ActKind | null, group?: string): string | null {
+  optionAt(x: number, y: number, kind: UiKind | null, group?: string): string | null {
     if (this.phase !== 'decide' || !this.userAttacks) return null;
     let best: string | null = null, bd = 1e9;
     for (const o of this.opts) {
-      if (!o.act || o.disabled || (kind && o.kind !== kind) || (group && o.group !== group)) continue;
-      const p = this.targetPos(o.act);
+      if (!(o.act || o.combo) || o.disabled || (kind && o.kind !== kind) || (group && o.group !== group)) continue;
+      // Tapping a teammate on the court picks a plain action unless the combo menu is open.
+      if (o.combo && kind !== 'combo') continue;
+      const p = this.optTarget(o);
       if (!p) continue;
       const q = this.world.screenOf(p.x, p.y);
       if (x < q.x - 12 || x > q.x + 12 || y < q.y - 34 || y > q.y + 8) continue;
@@ -1391,6 +1581,7 @@ export class Match {
     if (this.phase !== 'decide') return;
     const opt = this.opts.find((o) => o.id === id);
     if (!opt || opt.disabled) return;
+    if (opt.combo) { this.confirmCombo(opt.combo); return; }
     const s = this.poss!;
     const m = this.mu;
     let act: Act, dm: TechId;
@@ -1430,18 +1621,205 @@ export class Match {
     const good = b.ev === 'make' || b.ev === 'and1' || b.ev === 'beat' || b.ev === 'room' || b.ev === 'help' || b.ev === 'open' || b.ev === 'slip' || b.ev === 'catch' || b.ev === 'feed';
     if (good) this.lines[handler.pl.uid].duelsWon++;
     // Fire: a special spends the meter; duels won fill it, turnovers drain it.
-    const off = this.offense, before = [...this.heat];
-    if (act.sp) { this.heat[off] -= FIRE.cost; this.spent = true; this.bump(`sp:${act.sp}`); }
-    const fd = fireDelta(b.ev);
-    this.heat[off] = clamp(this.heat[off] + fd.att, 0, FIRE.max);
-    this.heat[1 - off] = clamp(this.heat[1 - off] + fd.def, 0, FIRE.max);
-    for (const t of [0, 1] as const) if (this.heat[t] >= FIRE.cost && before[t] < FIRE.cost) this.later(1.4, () => { if (t === 0) sfx.levelUp(); this.hooks.banner('FIRE READY', '#ffb02e', t === 0 ? 'Your specials are on' : 'Their specials are on'); });
+    if (act.sp) { this.heat[this.offense] -= FIRE.cost; this.spent = true; this.bump(`sp:${act.sp}`); }
+    this.applyFire(b.ev);
     this.world.clearPreview();
     this.world.clearMarks();
+    this.world.setDuelBox(null);
     this.hooks.decision(false);
     this.phase = 'resolve';
     this.focusAct(act);
     this.resolve(s, act, dm, b);
+  }
+
+  /** Fire: duels won fill the meter, turnovers drain it (one event). */
+  private applyFire(ev: Ev) {
+    const off = this.offense, before = [...this.heat];
+    const fd = fireDelta(ev);
+    this.heat[off] = clamp(this.heat[off] + fd.att, 0, FIRE.max);
+    this.heat[1 - off] = clamp(this.heat[1 - off] + fd.def, 0, FIRE.max);
+    for (const t of [0, 1] as const) if (this.heat[t] >= FIRE.cost && before[t] < FIRE.cost) this.later(1.4, () => { if (t === 0) sfx.levelUp(); this.hooks.banner('FIRE READY', '#ffb02e', t === 0 ? 'Your specials are on' : 'Their specials are on'); });
+  }
+
+  /** Tone of an event from the human's side. */
+  private toneOf(ev: Ev): Tone {
+    const attGood = ev === 'make' || ev === 'and1' || ev === 'beat' || ev === 'room' || ev === 'help' || ev === 'open' || ev === 'slip' || ev === 'catch' || ev === 'feed' || ev === 'oreb';
+    if (ev === 'held' || ev === 'covered' || ev === 'stopped') return 'mid';
+    return attGood === this.userAttacks ? 'good' : 'bad';
+  }
+
+  // ---------------------------------------------------------------- combined plays (resolution)
+  /**
+   * Run a combo: the defense's move is sampled once (as for any decision) and meets the first step; every later
+   * step meets its reaction (same family). Each step is a plain action with its own exact branches; the chain
+   * goes on while the steps work and stops (ball kept) or ends the possession otherwise.
+   */
+  private confirmCombo(c: ComboPlan) {
+    const s = this.poss!;
+    const m = this.mu;
+    const st = sampleStance(this.plan!.dist, this.rand());
+    const dm0 = this.plan!.v[st];
+    const first = c.next(0, s, null)!;
+    this.model.observe(m, s, this.plan!, first);
+    this.decisions++;
+    this.bump(`combo:${c.id}`);
+    this.bump(`dm:${dm0}`);
+    this.lines[this.att(s.ball).pl.uid].duels++;
+    this.comboRun = { c, dm0, dmPrev: dm0 };
+    this.world.clearPreview();
+    this.world.clearMarks();
+    this.world.setDuelBox(null);
+    this.hooks.decision(false);
+    this.phase = 'resolve';
+    // The defense shows its move; the play's name pops over the handler.
+    const hd = this.def(s.ball);
+    this.world.callout(this.pos3(hd, 2.8), `${icon(TECHS[dm0].icon, 24)}<small>${defName(dm0).toUpperCase()}</small>`, `move ${famOf(dm0)}`);
+    this.layout(s, dm0, 0.4, s.adv.map((x, i) => (x > 0 ? this.def(i) : null)).filter((x): x is Ent => !!x));
+    sfx.duel();
+    // The play's name over the main teammate (the defense's move sits over the handler's defender).
+    this.later(0.2, () => this.world.callout(this.pos3(this.att(c.mate), 3.0), `${icon(COMBOS[c.id].icon, 22)}<small>${COMBOS[c.id].name.toUpperCase()}</small>`, 'tech'));
+    this.later(0.6, () => this.comboStep(s, 0, null));
+  }
+
+  /** One step of the running combo. */
+  private comboStep(s: Poss, i: number, prev: Branch | null) {
+    const run = this.comboRun!;
+    const m = this.mu;
+    const act = run.c.next(i, s, prev)!;
+    const dm = i === 0 ? run.dm0 : reaction(run.dm0, act);
+    const b = pickBranch(branches(m, s, act, dm), this.rand());
+    this.poss = s;
+    this.bump(`combo:${run.c.id}:${i}:${b.ev}`);
+    this.bump(`tech:${act.t}`);
+    this.applyFire(b.ev);
+    this.pushHud();
+    const nextAct = b.next && COMBO_GO.has(b.ev) ? run.c.next(i + 1, b.next, b) : null;
+    // Alley-oop: the lob and the finish are one move (the catch happens in the air).
+    if (run.c.id === 'alley' && act.k === 'pass' && nextAct?.k === 'shoot') {
+      const dm2 = reaction(run.dm0, nextAct);
+      const b2 = pickBranch(branches(m, b.next!, nextAct, dm2), this.rand());
+      this.bump(`combo:alley:dunk:${b2.ev}`);
+      this.applyFire(b2.ev);
+      this.endCombo(b.next!, nextAct, dm2, b2);
+      this.focusAll([this.att(s.ball), this.att(act.to)], true);
+      const blocker = this.showReaction(b.next!, nextAct, dm2, dm);
+      this.later(blocker ? 0.3 : 0, () => this.animateAlley(s, act, b, b.next!, nextAct, dm2, b2, blocker ?? undefined));
+      return;
+    }
+    if (!nextAct) this.endCombo(s, act, dm, b);
+    else this.lastRes = { act, dm, ev: b.ev, text: explain(act, dm, b, true) };
+    const done = nextAct ? () => this.comboStep(b.next!, i + 1, b) : () => this.afterAction(b);
+    this.focusAct(act);
+    const changed = i > 0 && dm !== run.dmPrev;
+    const blocker = changed ? this.showReaction(s, act, dm, run.dmPrev) : null;
+    run.dmPrev = dm;
+    this.later(changed ? 0.3 : 0, () => {
+      this.chain = { final: !nextAct, done };
+      this.animateAction(s, act, dm, b, this.toneOf(b.ev), { blocker: blocker ?? undefined });
+    });
+  }
+
+  /** Last step of a combo: the result card names the play. */
+  private endCombo(s: Poss, act: Act, dm: TechId, b: Branch) {
+    const run = this.comboRun!;
+    this.lastRes = { act, dm, ev: b.ev, text: explain(act, dm, b, true) };
+    const d = this.duelInfo(s, act, run.dm0, b);
+    const name = COMBOS[run.c.id].name;
+    const scored = b.ev === 'make' || b.ev === 'and1';
+    d.you = { name, icon: COMBOS[run.c.id].icon };
+    d.head = `${name} vs ${defName(run.dm0)}: ${d.res === 'win' ? 'it worked' : d.res === 'lose' ? 'they stopped it' : 'held up'}.`;
+    if (scored && run.c.id === 'alley') d.word = 'ALLEY-OOP!';
+    this.lastDuel = d;
+    if (d.res === 'win') this.lines[this.att(run.c.who[0]).pl.uid].duelsWon++;
+  }
+
+  /**
+   * Show the defense's reaction to a combo step (a second or third defender joins the duel). Returns the
+   * defender who will contest a finish at the rim (help), if any.
+   */
+  private showReaction(s: Poss, act: Act, dm: TechId, before: TechId): Ent | null {
+    const word = REACT_WORD[dm];
+    if (!word || dm === before) return null;
+    if (dm === 'rim' && act.k === 'shoot') {
+      // Help at the rim: the defender nearest the hoop (not the shooter's own) slides over to block.
+      const own = this.def(s.ball);
+      const helper = [0, 1, 2].map((j) => this.def(j)).filter((d) => d !== own).sort((a, b) => dist(a.x, a.y, HOOP.x, HOOP.y) - dist(b.x, b.y, HOOP.x, HOOP.y))[0];
+      const sh = this.att(s.ball);
+      this.glide(helper, HOOP.x + (sh.x - HOOP.x) * 0.25, HOOP.y + (sh.y - HOOP.y) * 0.25 + 0.3, 0.35);
+      helper.fast = true;
+      this.world.callout(this.pos3(helper, 2.8), `${icon(TECHS.rim.icon, 22)}<small>${word}</small>`, 'move space');
+      pxsfx.squeak();
+      return helper;
+    }
+    if (act.k === 'pass') {
+      const dd = this.def(act.to), from = this.att(s.ball);
+      if (dm === 'jump') this.glide(dd, dd.x + (from.x - dd.x) * 0.25, dd.y + (from.y - dd.y) * 0.25, 0.3);
+      this.world.callout(this.pos3(dd, 2.8), `${icon(TECHS[dm].icon, 22)}<small>${word}</small>`, `move ${famOf(dm)}`);
+      return null;
+    }
+    if (act.k === 'cut' && dm === 'switch') {
+      // The defenders swap men: the screener's defender takes the cutter.
+      const other = [0, 1, 2].find((j) => j !== s.ball && j !== act.who);
+      const a = this.def(act.who), b = other !== undefined ? this.def(other) : null;
+      if (b) { const ax = a.x, ay = a.y; this.glide(a, b.x, b.y, 0.4); this.glide(b, ax, ay, 0.4); }
+      this.world.callout(this.pos3(a, 2.8), `${icon(TECHS.switch.icon, 22)}<small>${word}</small>`, 'move deny');
+      pxsfx.squeak();
+      return null;
+    }
+    const d = act.k === 'cut' ? this.def(act.who) : this.def(s.ball);
+    this.world.callout(this.pos3(d, 2.8), `${icon(TECHS[dm].icon, 22)}<small>${word}</small>`, `move ${famOf(dm)}`);
+    return null;
+  }
+
+  /** Frame a few players and the rim. */
+  private focusAll(es: Ent[], rim = false) {
+    const P: ScenePt[] = [];
+    for (const e of es) P.push(...this.pts(e));
+    if (rim) P.push(...this.rimPts());
+    this.world.frame(P, 2, 14, true);
+  }
+
+  /**
+   * Alley-oop: the passer throws it up (or off the glass), the finisher sprints to the rim, takes off, catches it
+   * in the air and finishes with his own dunk (pack Dunk animations). A picked lob is a plain pass animation.
+   */
+  private animateAlley(s0: Poss, pass: Act & { k: 'pass' }, bp: Branch, s1: Poss, fin: Act, dm2: TechId, b2: Branch, blocker?: Ent) {
+    const h = this.att(s0.ball), j = this.att(pass.to);
+    const glass = this.comboRun?.c.look === 'glass';
+    const tone2 = this.toneOf(b2.ev);
+    const near = { x: HOOP.x + (j.x - HOOP.x) * 0.2, y: HOOP.y + (j.y - HOOP.y) * 0.2 + 0.15 };
+    this.faceTo(h, glass ? HOOP.x : near.x, glass ? HOOP.y : near.y);
+    pxsfx.squeak();
+    sfx.pass();
+    this.play(h, 'Free_Throw', 60);
+    const ri = releaseIndex('Free_Throw');
+    const wait = (ri > 0 ? ri : 3) * 0.06;
+    const F = glass ? 0.7 : 0.75;
+    this.shooter = h;
+    this.holder = null;
+    j.fast = true;
+    this.glide(j, near.x, near.y, wait + F - 0.1);
+    // The finisher's own defender trails the cut.
+    const jd = this.def(pass.to);
+    this.later(0.15, () => this.glide(jd, jd.x + (near.x - jd.x) * 0.5, jd.y + (near.y - jd.y) * 0.5, wait + F - 0.2));
+    const catchPt = w3(near.x, near.y, RIM_H + 0.35);
+    const onCatch = () => {
+      this.shooter = j;
+      this.world.callout(this.pos3(j, 3.4), `${icon('t_lob', 22)}<small>${glass ? 'OFF THE GLASS' : 'ALLEY-OOP'}</small>`, 'tech');
+      this.chain = { final: true, done: () => this.afterAction(b2) };
+      this.poss = s1;
+      this.animateAction(s1, fin, dm2, b2, tone2, { lead0: true, blocker, alley: true });
+    };
+    this.later(wait, () => {
+      const from = this.hand(h, 2.0);
+      if (glass) {
+        const bpnt = boardPoint(h.x);
+        this.fly(from, bpnt, 1.3, F * 0.62, () => { sfx.rim(); this.world.kickRim(); this.fly(bpnt, catchPt, 0.15, F * 0.38, onCatch); });
+      } else this.fly(from, catchPt, 2.0, F, onCatch);
+    });
+    // Take-off just before the ball gets there.
+    this.later(wait + F - 0.3, () => { j.fast = false; this.faceTo(j, HOOP.x, HOOP.y); this.play(j, 'Jump_TwoFeet_Ball', 70); this.jump(j, 1.1, 1.05); j.armsT = 0.8; });
+    void bp;
   }
 
   /** "Your Block beats their Dunk": both moves, who won, and why. */
@@ -1511,11 +1889,14 @@ export class Match {
     this.later(0.5, () => this.animateAction(s, act, dm, b, t));
   }
 
-  private animateAction(s: Poss, act: Act, dm: TechId, b: Branch, tone: Tone) {
+  private animateAction(s: Poss, act: Act, dm: TechId, b: Branch, tone: Tone, opts: AnimOpts = {}) {
     const h = this.att(s.ball);
-    const hd = this.def(s.ball);
-    const say = (delay: number) => this.later(delay, () => { this.hooks.explain(this.lastRes!.text, tone); if (this.lastDuel) this.hooks.duel?.(this.lastDuel); });
-    const next = (delay: number) => this.later(delay, () => this.afterAction(b));
+    const hd = opts.blocker ?? this.def(s.ball);
+    // Inside a combo, a step that leads to another one shows no result card and hands over sooner.
+    const chain = this.chain;
+    this.chain = null;
+    const say = (delay: number) => { if (chain && !chain.final) return; this.later(delay, () => { this.hooks.explain(this.lastRes!.text, tone); if (this.lastDuel) this.hooks.duel?.(this.lastDuel); }); };
+    const next = (delay: number) => this.later(chain && !chain.final ? Math.max(0.6, delay - 0.85) : delay, () => (chain ? chain.done() : this.afterAction(b)));
     const stance = famOf(dm);
     switch (act.k) {
       case 'shoot': {
@@ -1537,7 +1918,10 @@ export class Match {
         const ms = sd ? (sd.anim === 'Dunk_3' || sd.anim === 'Fake_Fadeaway_Right' ? 55 : 70) : dunk ? (running ? 55 : 65) : act.t === 'fade' ? 75 : act.t === 'layup' ? 80 : 70;
         const wind = Math.max(1, releaseIndex(tag)) * ms / 1000;
         const toRim = act.t === 'layup' || dunk;
-        if (toRim) {
+        if (toRim && opts.lead0) {
+          // Alley-oop: already in the air at the rim.
+          if (dunk && !sd) { this.world.aura(h.i, 'fire', wind + 0.5); this.world.ballTrail('fire'); }
+        } else if (toRim) {
           // Steps to the rim, then a high finish (right under the rim for a dunk; a long run from the elbow).
           const k = dunk ? 0.12 : 0.35;
           const near = { x: HOOP.x + (h.x - HOOP.x) * k, y: HOOP.y + (h.y - HOOP.y) * k };
@@ -1555,7 +1939,7 @@ export class Match {
           h.fast = false;
           this.faceTo(h, HOOP.x, HOOP.y);
           this.play(h, tag, ms);
-          this.jump(h, dunk ? (running ? 1.05 : 0.9) : act.t === 'layup' ? 0.75 : act.t === 'fade' ? 0.55 : 0.45, dunk ? 0.75 : act.t === 'fade' ? 0.75 : 0.6);
+          if (!(opts.alley && h.jumpT > 0)) this.jump(h, dunk ? (running ? 1.05 : 0.9) : act.t === 'layup' ? 0.75 : act.t === 'fade' ? 0.55 : 0.45, dunk ? 0.75 : act.t === 'fade' ? 0.75 : 0.6);
           h.armsT = 0.5;
           // A dunk in slow motion, the camera on the rim (skipped with reduced effects).
           if (dunk && !sd && !this.o.reduceFx) { this.slow = Math.max(this.slow, 0.55); this.world.cinematic(HOOP.x, HOOP.y + 0.5, 2.0, 1.1); this.fxOn = true; }
@@ -1589,6 +1973,9 @@ export class Match {
           };
           if (b.ev === 'block') {
             sfx.clash();
+            this.world.hitStop(dunk ? 0.1 : 0.07);
+            this.world.cheer(0.8);
+            pxsfx.ooh();
             this.world.shake = dunk ? 0.5 : 0.3;
             this.world.burst(hd.x, hd.y, 2.6, 'spark', dunk ? 0.8 : 0.5);
             if (!this.o.reduceFx) this.slow = Math.max(this.slow, 0.35);
@@ -1605,11 +1992,13 @@ export class Match {
               this.score[h.team] += pts;
               this.lines[h.pl.uid].pts += pts;
               this.world.shake = sd ? 0.7 : dunk ? 0.6 : act.t === 'layup' ? 0.35 : 0.2;
-              if (dunk) { this.world.kickRim(); sfx.clash(); }
+              if (dunk) { this.world.kickRim(); sfx.clash(); this.world.hitStop(0.1); pxsfx.slam(); }
+              this.world.cheer(dunk || pts > 1 ? 1.4 : 1);
+              pxsfx.crowd(dunk || opts.alley ? 1 : 0.6);
               if (sd) { this.world.burst(HOOP.x, HOOP.y, RIM_H, sd.fx, 1.6); this.world.flashNow(); }
               else if (dunk) { this.world.burst(HOOP.x, HOOP.y, RIM_H, 'fire', running ? 1.3 : 1.0); this.world.flashNow('#ffe066', 0.5); }
               else if (pts > 1) this.world.burst(HOOP.x, HOOP.y, RIM_H, 'spark', 0.5);
-              const word = b.ev === 'and1' ? 'AND ONE' : dunk ? 'SLAM' : pts > 1 ? 'SPLASH' : '';
+              const word = b.ev === 'and1' ? 'AND ONE' : opts.alley ? 'ALLEY-OOP' : dunk ? 'SLAM' : pts > 1 ? 'SPLASH' : '';
               this.world.callout(RIM.clone().add(new Vector3(0, 0.9, 0)), `+${pts}${word ? `<small>${word}</small>` : ''}`, h.team === 0 ? 'good big' : 'bad big');
               this.pushHud();
               this.celebrate(h);
@@ -1625,15 +2014,7 @@ export class Match {
             viaBoard(front, () => {
               this.world.kickRim();
               sfx.rim();
-              const spot = { x: clamp(HOOP.x + (reb.x - HOOP.x) * 0.5, 1, COURT_W - 1), y: clamp(HOOP.y + 1.6, 1, COURT_H - 1) };
-              this.glide(reb, spot.x, spot.y, 0.45);
-              // Offensive boards and defensive boards use different rebound animations from the pack.
-              this.later(0.3, () => { this.faceTo(reb, HOOP.x, HOOP.y); this.play(reb, b.ev === 'oreb' ? 'Rebound_2' : 'Rebound_1', 70); });
-              this.fly(RIM.clone(), w3(spot.x, spot.y, 1.8), 0.9, 0.5, () => {
-                this.jump(reb, 0.35, 0.4);
-                this.holder = reb;
-                this.world.callout(this.pos3(reb, 2.6), icon('ball', 24), reb.team === 0 ? 'good' : 'bad');
-              });
+              this.scramble(reb, h, b.ev === 'oreb');
             });
             say(1.3); next(2.6);
           }
@@ -1976,11 +2357,56 @@ export class Match {
     return running ? RUN_DUNKS[n % RUN_DUNKS.length] : POST_DUNKS[(n >>> 3) % POST_DUNKS.length];
   }
 
-  /** Teammates of a scorer celebrate (the pack's Jump). */
+  /**
+   * A real rebound: the ball comes off the rim long or short (sometimes it hits the floor first), the nearest
+   * players crash and box out, the two closest jump for it (pack Rebound / Block animations) and one comes down with it.
+   */
+  private scramble(reb: Ent, shooter: Ent, offensive: boolean) {
+    const a = Math.atan2(shooter.x - HOOP.x, shooter.y - HOOP.y) + (Math.random() - 0.5) * 1.4;
+    const r = 1.4 + Math.random() * 1.3;
+    const spot = { x: clamp(HOOP.x + Math.sin(a) * r, 1, COURT_W - 1), y: clamp(HOOP.y + Math.abs(Math.cos(a)) * r + 0.5, 1.2, COURT_H - 1) };
+    const rival = this.ents.filter((e) => e.team !== reb.team).sort((p, q) => dist(p.x, p.y, spot.x, spot.y) - dist(q.x, q.y, spot.x, spot.y))[0];
+    // Everyone near the rim crashes; the defender of each attacker boxes out (between him and the ball).
+    for (const e of this.ents) {
+      if (e === reb || e === rival) continue;
+      if (dist(e.x, e.y, spot.x, spot.y) > 6) continue;
+      const k = e.team === reb.team ? 0.35 : 0.45;
+      this.later(0.05 + Math.random() * 0.15, () => this.glide(e, e.x + (spot.x - e.x) * k, e.y + (spot.y - e.y) * k, 0.5));
+    }
+    const side = rival.x > spot.x ? 1 : -1;
+    reb.fast = true; rival.fast = true;
+    this.glide(reb, spot.x, spot.y, 0.45);
+    this.glide(rival, spot.x + side * 0.6, spot.y + 0.35, 0.45);
+    pxsfx.squeak();
+    const floor = Math.random() < 0.4;
+    const T = floor ? 0.8 : 0.55;
+    const grab = () => {
+      this.holder = reb;
+      this.world.callout(this.pos3(reb, 2.6), icon('ball', 24), reb.team === 0 ? 'good' : 'bad');
+      if (offensive) this.world.cheer(0.6);
+    };
+    if (floor) {
+      const fp = w3(spot.x + (spot.x - HOOP.x) * 0.15, spot.y + (spot.y - HOOP.y) * 0.15, 0.12);
+      this.fly(RIM.clone(), fp, 1.1, 0.45, () => { pxsfx.dribble(); this.fly(fp, w3(spot.x, spot.y, 2.2), 0.7, 0.35, grab); });
+    } else this.fly(RIM.clone(), w3(spot.x, spot.y, 2.4), 1.0, T, grab);
+    // Both go up for it: the one who gets it with a rebound animation, the other reaching.
+    this.later(T - 0.3, () => {
+      this.faceTo(reb, HOOP.x, HOOP.y); this.faceTo(rival, HOOP.x, HOOP.y);
+      this.play(reb, offensive ? 'Rebound_2' : 'Rebound_1', 70); this.jump(reb, 0.6, 0.55); reb.armsT = 0.5;
+      this.play(rival, 'Block_1', 70); this.jump(rival, 0.45, 0.5); rival.armsT = 0.4;
+    });
+  }
+
+  /** The scorer celebrates, the teammates run to him and jump (the pack's Jump); the crowd goes up. */
   private celebrate(scorer: Ent) {
+    this.later(0.65, () => this.play(scorer, 'Jump', 60));
+    let k = 0;
     for (const e of this.ents) {
       if (e.team !== scorer.team || e === scorer) continue;
-      this.later(0.1 + Math.random() * 0.2, () => { this.play(e, 'Jump', 60); });
+      const side = k++ === 0 ? -1 : 1;
+      const tx = clamp(scorer.x + side * 0.9, 0.8, COURT_W - 0.8), ty = clamp(scorer.y + 0.6, 0.8, COURT_H - 0.8);
+      this.later(0.15 + k * 0.1, () => { e.fast = true; this.glide(e, tx, ty, 0.55); });
+      this.later(0.8 + k * 0.12, () => { this.faceTo(e, scorer.x, scorer.y); this.play(e, 'Jump', 60); });
     }
   }
 
@@ -2017,6 +2443,8 @@ export class Match {
 
   private afterAction(b: Branch) {
     if (this.phase === 'over') return;
+    this.comboRun = null;
+    this.chain = null;
     if (this.cine || this.fxOn) { this.cine = null; this.fxOn = false; this.world.endCinematic(); }
     this.world.ballTrail(null);
     if (b.next) {
@@ -2031,7 +2459,8 @@ export class Match {
       this.later(0.7, () => this.openDecision());
       return;
     }
-    // Possession over.
+    // Possession over. Whoever won the ball (rebound, steal, block) keeps it to clear it out.
+    this.nextHandler = this.holder && this.holder.team !== this.offense ? this.holder : null;
     this.world.overview();
     this.possN[this.offense]++;
     this.poss = null;
@@ -2072,6 +2501,8 @@ export class Match {
     this.last = now;
     let k = this.timeScale;
     if (this.slow > 0 && !this.paused) { this.slow -= dt; k *= 0.4; }
+    // Hit-stop: the action holds for a few frames on a big impact.
+    if (this.world.holding) k = 0;
     if (!this.paused) this.update(dt * k);
     this.sync(this.paused ? 0 : dt);
     this.raf = requestAnimationFrame(this.loop);
@@ -2079,6 +2510,7 @@ export class Match {
 
   /** Advance animations and timers (exposed for tests). */
   update(dt: number) {
+    if (this.phase === 'decide' && dt > 0) this.offBall(dt);
     const due = this.timers.filter((t) => (t.t -= dt) <= 0);
     this.timers = this.timers.filter((t) => t.t > 0);
     for (const t of due) t.fn();
@@ -2108,6 +2540,41 @@ export class Match {
     }
   }
 
+  /**
+   * Movement without the ball while you decide: teammates take short V-cuts and steps off their spot and back,
+   * and their defenders follow them (the court never stands still). Small enough that previews stay on target.
+   */
+  private offBall(dt: number) {
+    const s = this.poss;
+    if (!s) return;
+    for (let i = 0; i < 3; i++) {
+      const a = this.att(i);
+      if (i === s.ball || a.anim || a.act) continue;
+      const w = this.wander[i];
+      w.t -= dt;
+      if (w.t > 0) continue;
+      const z = ZONES[s.zones[i]];
+      const d = this.def(i);
+      const home = this.defSpot(s, i, this.shownStance);
+      if (!w.back) {
+        const l = dist(z.x, z.y, HOOP.x, HOOP.y) || 1;
+        const tx = (HOOP.x - z.x) / l, ty = (HOOP.y - z.y) / l;
+        const sgn = Math.random() < 0.5 ? -1 : 1;
+        const off = Math.random() < 0.5 ? { x: tx * 0.45, y: ty * 0.45 } : { x: -ty * 0.4 * sgn, y: tx * 0.4 * sgn };
+        this.glide(a, clamp(z.x + off.x, 0.4, COURT_W - 0.4), clamp(z.y + off.y, 0.4, COURT_H - 0.4), 0.45);
+        this.later(0.12, () => { if (this.phase === 'decide' && !d.anim) this.glide(d, home.x + off.x * 0.8, home.y + off.y * 0.8, 0.45); });
+        if (Math.random() < 0.4) pxsfx.squeak();
+        w.back = true;
+        w.t = 0.7 + Math.random() * 0.6;
+      } else {
+        this.glide(a, z.x, z.y, 0.5);
+        this.later(0.1, () => { if (this.phase === 'decide' && !d.anim) this.glide(d, home.x, home.y, 0.5); });
+        w.back = false;
+        w.t = 1.6 + Math.random() * 2.4;
+      }
+    }
+  }
+
   // ---------------------------------------------------------------- sync
   private sync(dt: number) {
     const W = this.world;
@@ -2119,8 +2586,14 @@ export class Match {
       const moving = !!h.anim;
       if (this.phase === 'decide' || h.jumpT > 0) this.ballPos.copy(this.hand(h, h.jumpT > 0 ? 2.0 : 1.2));
       else {
-        const bounce = Math.abs(Math.sin(performance.now() / 1000 * (moving ? 8 : 5)));
+        const w = moving ? 8 : 5;
+        const tt = performance.now() / 1000 * w;
+        const bounce = Math.abs(Math.sin(tt));
         this.ballPos.copy(this.hand(h, 0.22 + bounce * 0.85));
+        // A dribble sound on each floor contact while the handler moves with the ball.
+        const ph = Math.floor(tt / Math.PI);
+        if (moving && ph !== this.bouncePh && dt > 0) pxsfx.dribble();
+        this.bouncePh = ph;
       }
     } else if (this.looseBall) this.ballPos.copy(this.looseBall);
     W.setBall(this.ballPos, this.flight ? 0.25 : 0.05);
@@ -2159,6 +2632,18 @@ export class Match {
 }
 
 const userTone = (userAttacks: boolean): Tone => (userAttacks ? 'good' : 'bad');
+
+/** Spectators: pack characters in plain street clothes (no team kit, no team mark), faces taken from the rosters. */
+function fanLooks(teams: [TeamSetup, TeamSetup]): PixelLook[] {
+  const kits: Kit[] = [
+    { jersey: '#8d99ae', shade: '#5c667a', stripe: null, stripe2: null, band: null },
+    { jersey: '#6b4f7a', shade: '#4a3556', stripe: null, stripe2: null, band: null },
+    { jersey: '#c9a227', shade: '#8f7219', stripe: null, stripe2: null, band: null },
+  ];
+  const src = [...teams[0].players, ...teams[1].players];
+  const looks: PixelLook[] = kits.map((kit, i) => ({ skin: src[(i * 2 + 1) % src.length].skin, hair: src[(i * 3 + 2) % src.length].hair, hairStyle: (i * 2) % 5, kit, marker: 'home', num: 0 }));
+  return [looks[0], looks[1], looks[2], looks[1], looks[0]];
+}
 
 /** Pack animation of each dribble move. */
 const DRIVE_TAG: Partial<Record<TechId, string>> = {

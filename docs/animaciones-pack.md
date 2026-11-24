@@ -124,3 +124,19 @@ auditoria este completa.
 | `decor/Decor.png`, `decor/Grass.png` | Farolas, valla, bancos, papelera, botella, monopatin, cesped |
 | `characters/Character_Customizer.exe` | No se usa ni se copia (es una herramienta, no arte) |
 | `Hoops_in_pixels.zip` | No se usa ni se copia |
+
+## Usos nuevos (camara suave y jugadas combinadas)
+
+Sin hojas ni recortes nuevos: el atlas es el mismo y se reutilizan animaciones que ya estaban exportadas.
+
+| Etiqueta | Uso nuevo |
+|---|---|
+| Sprint | Carreras sin balon a toda velocidad: el finalizador del alley-oop, la ayuda que llega al aro, la carrera al rebote, los companeros que van a celebrar |
+| Jump_TwoFeet_Ball | Despegue del alley-oop (el finalizador salta antes de que llegue el balon) |
+| Dunk_1 a Dunk_7 | Mate en el aire del alley-oop y finales de las combinadas (cada jugador con su mate) |
+| Free_Throw | Pase bombeado del alley-oop, tambien el pase al tablero |
+| Jab, Free_Throw | Pases de las combinadas (give and go, kick-out, backdoor, drive and dish, swing) |
+| Rebound_1, Rebound_2, Block_1 | Rebote disputado: el que lo gana con Rebound, el rival estirandose con Block_1 |
+| Jump | Espectadores que celebran; companeros que corren hacia el anotador y saltan |
+| Idle | Espectadores en reposo |
+| Run, Slide | Movimiento sin balon mientras decides (V-cuts y el defensor que sigue) |

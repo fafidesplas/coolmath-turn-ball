@@ -1,5 +1,6 @@
 // Battle command window (JRPG style). One bordered window below the stage with a hand cursor:
-//   Attack:  Shoot / Dribble / Pass / Play  ->  the moves of that kind  ->  the target, when there is more than one.
+//   Attack:  Shoot / Dribble / Pass / Play / Combo  ->  the moves of that kind  ->  the target, when there is more than one.
+//   Combo lists the combined plays (alley-oop, pick and roll, give and go...); its target is the teammate.
 //   Defense: Press / Steal / Contest / Give space / More  ->  Block / Charge / Deny.
 // The info box shows one big number (the chance of the move under the cursor) and one badge: whether the move
 // beats the opponent's tell (the icon over their player), loses to it, or neither. Shape and color both change.
@@ -8,12 +9,14 @@
 // has a fixed size and only its content changes.
 import { sfx } from '../audio';
 import { icon } from './pxicons';
-import type { ActKind } from '../rules';
-import { DEF_ORDER, KIND_ICON, KIND_LABEL, defName, type DecisionInfo, type DuelInfo, type Match, type OptionInfo } from './match';
+import { DEF_ORDER, KIND_ICON, KIND_LABEL, defName, type DecisionInfo, type DuelInfo, type Match, type OptionInfo, type UiKind } from './match';
+import { COMBOS, COMBO_ORDER, type ComboId } from './combos';
 import { TECHS, type TechId } from '../techs';
 import { SPECIALS, type SpecialId } from '../specials';
 
-const KINDS: ActKind[] = ['shoot', 'drive', 'pass', 'cut'];
+const KINDS: UiKind[] = ['shoot', 'drive', 'pass', 'cut', 'combo'];
+/** Combo of a menu group ("combo_alley"), if it is one. */
+const comboOf = (g: string) => (g.startsWith('combo_') ? COMBOS[g.slice(6) as ComboId] : null);
 /** Shots in menu order: the dunk first, then closest to farthest. */
 const SHOT_ORDER = ['dunk', 'layup', 'floater', 'jumper', 'bank', 'fade'];
 /** Defense: four main moves on the first page, the rest under More. */
@@ -29,8 +32,8 @@ const SHORT: Partial<Record<TechId, string>> = {
 
 type Level =
   | { k: 'root' }
-  | { k: 'kind'; kind: ActKind }
-  | { k: 'target'; kind: ActKind; group: string }
+  | { k: 'kind'; kind: UiKind }
+  | { k: 'target'; kind: UiKind; group: string }
   | { k: 'more' };
 
 interface Row {
@@ -100,6 +103,7 @@ export class DecisionUI {
     root.addEventListener('pointerdown', (e) => { this.lastPointer = e.pointerType; }, { capture: true });
     root.addEventListener('click', this.onClick);
     root.addEventListener('pointerover', this.onOver);
+    this.listEl.addEventListener('scroll', () => this.moreMark(), { passive: true });
     this.idle('');
   }
 
@@ -124,6 +128,7 @@ export class DecisionUI {
     if (this.open) return;
     this.titleEl.innerHTML = side ? `${icon(side === 'att' ? 'ball' : 'protect', 16)}<span>${side === 'att' ? 'ATTACK' : 'DEFENSE'}</span>` : '';
     this.listEl.innerHTML = '';
+    this.moreMark();
     this.infoEl.innerHTML = this.infoHTML(null);
   }
 
@@ -136,6 +141,7 @@ export class DecisionUI {
       <div class="w-vs you ${d.res === 'win' ? 'won' : ''}"><i class="mark home"></i>${icon(d.you.icon, 32)}<b>${d.you.name}</b></div>
       <div class="w-vs them ${d.res === 'lose' ? 'won' : ''}"><i class="mark away"></i>${icon(d.them.icon, 32)}<b>${d.them.name}</b></div>`;
     this.infoEl.innerHTML = `<div class="wi-res r-${d.res}">${icon(mark, 32)}</div>${this.buttonsHTML(false, false)}`;
+    this.moreMark();
   }
 
   // ---------------------------------------------------------------- levels
@@ -158,7 +164,7 @@ export class DecisionUI {
             key: k, name: KIND_LABEL[k], ic: KIND_ICON[k], pct: b?.main, edge: b?.edge, disabled: !b,
             special: live(list).some((o) => o.sp), hint: list.some((o) => o.hint),
             go: () => this.enter({ k: 'kind', kind: k }),
-            show: () => { m.preview(null); if (k === 'pass' || k === 'cut') m.showCategory(k); },
+            show: () => { m.preview(null); if (k === 'pass' || k === 'cut' || k === 'combo') m.showCategory(k); },
           });
         }
       } else if (L.k === 'kind') {
@@ -168,12 +174,13 @@ export class DecisionUI {
           const lock = list.find((o) => o.locked);
           const b = best(list);
           const sp = g in SPECIALS ? SPECIALS[g as SpecialId] : null;
+          const cb = comboOf(g);
           const first = list[0];
           const three = first?.label === 'Three';
-          const name = sp ? sp.name : three ? 'Three' : g === 'dunk' && first?.label ? first.label : SHORT[g as TechId] ?? TECHS[g as TechId].name;
+          const name = cb ? cb.short : sp ? sp.name : three ? 'Three' : g === 'dunk' && first?.label ? first.label : SHORT[g as TechId] ?? TECHS[g as TechId].name;
           const many = live(list).length > 1;
           rows.push({
-            key: g, name, ic: lock ? 'lock' : sp ? 'fire' : three ? 't_three' : TECHS[g as TechId].icon,
+            key: g, name, ic: lock ? 'lock' : cb ? cb.icon : sp ? 'fire' : three ? 't_three' : TECHS[g as TechId].icon,
             opt: b, pct: b?.main, edge: b?.edge, disabled: !b, special: !!sp, hint: list.some((o) => o.hint),
             line: lock ? lock.locked : undefined,
             go: () => { if (!b) return; if (many) this.enter({ k: 'target', kind: L.kind, group: g }); else this.confirm(b); },
@@ -183,10 +190,11 @@ export class DecisionUI {
       } else if (L.k === 'target') {
         const list = this.opts.filter((o) => o.kind === L.kind && grp(o) === L.group);
         const sp = L.group in SPECIALS ? SPECIALS[L.group as SpecialId] : null;
-        title = `${icon(sp ? 'fire' : TECHS[L.group as TechId]?.icon ?? 'next', 16)}<span>${(sp ? sp.name : SHORT[L.group as TechId] ?? TECHS[L.group as TechId].name).toUpperCase()}</span>`;
+        const cb = comboOf(L.group);
+        title = `${icon(cb ? cb.icon : sp ? 'fire' : TECHS[L.group as TechId]?.icon ?? 'next', 16)}<span>${(cb ? cb.short : sp ? sp.name : SHORT[L.group as TechId] ?? TECHS[L.group as TechId].name).toUpperCase()}</span>`;
         for (const o of list) {
           rows.push({
-            key: o.id, name: o.short ?? o.tag ?? o.label, ic: L.kind === 'pass' ? 'pass' : L.kind === 'drive' ? 'next' : 'cut',
+            key: o.id, name: o.short ?? o.tag ?? o.label, ic: L.kind === 'pass' ? 'pass' : L.kind === 'drive' ? 'next' : L.kind === 'combo' ? 'team' : 'cut',
             opt: o, pct: o.main, edge: o.edge, disabled: o.disabled, special: !!o.sp, hint: o.hint,
             go: () => this.confirm(o),
             show: () => m.preview(o.id),
@@ -226,12 +234,21 @@ export class DecisionUI {
       this.cur = h >= 0 ? h : Math.max(0, rows.findIndex((r) => !r.disabled));
     }
     this.moveTo(this.cur, true);
+    this.moreMark();
   }
 
-  private groupsIn(kind: ActKind): string[] {
+  /** A down arrow over the bottom of the list when more rows are below (an overlay: nothing moves). */
+  private moreMark() {
+    const l = this.listEl;
+    l.parentElement!.classList.toggle('more', l.scrollTop + l.clientHeight < l.scrollHeight - 2);
+  }
+
+  private groupsIn(kind: UiKind): string[] {
     const out: string[] = [];
     for (const o of this.opts) if (o.kind === kind && !out.includes(grp(o))) out.push(grp(o));
     const rank = (g: string) => {
+      const cb = comboOf(g);
+      if (cb) return COMBO_ORDER.indexOf(cb.id);
       if (g in SPECIALS) return -1;
       if (kind === 'shoot') { const i = SHOT_ORDER.indexOf(g); return i < 0 ? 50 : i; }
       return TECHS[g as TechId]?.base ? 0 : 1;
@@ -310,10 +327,10 @@ export class DecisionUI {
     const tell = info?.tell;
     const back = !!r && this.stack.length > 0;
     if (!r) return `<div class="wi-num"></div><div class="wi-edge"></div><div class="wi-line"></div>${this.buttonsHTML(false, false)}`;
-    const kindIc = info?.side === 'def' ? 'protect' : r.opt ? KIND_ICON[r.opt.kind as ActKind] ?? 'ball' : r.ic;
-    const num = r.pct !== undefined && !r.disabled ? `<span class="wi-ic">${icon(r.special ? 'fire' : kindIc, 32)}</span><b>${r.pct}<small>%</small></b>` : r.line ? `<span class="wi-ic">${icon('lock', 32)}</span>` : '';
+    const kindIc = info?.side === 'def' ? 'protect' : r.opt ? KIND_ICON[r.opt.kind as UiKind] ?? 'ball' : r.ic;
+    const num = r.pct !== undefined && !r.disabled ? `<span class="wi-ic">${icon(r.special ? 'fire' : kindIc, 32)}</span><b class="${r.pct >= 100 ? 'w3' : ''}">${r.pct}<small>%</small></b>` : r.line ? `<span class="wi-ic">${icon('lock', 32)}</span>` : '';
     const vs = tell && r.edge !== undefined && !r.disabled ? `${this.edgeHTML(r.edge)}<span class="wi-vs">vs</span><span class="wi-tell">${icon(tell.icon, 32)}</span>` : '';
-    const line = r.line ?? (r.hint ? info?.hint ?? '' : r.special ? 'FIRE' : '');
+    const line = r.line ?? (r.hint ? info?.hint ?? '' : r.special ? 'FIRE' : r.opt?.combo ? `${r.opt.combo.steps} STEPS` : '');
     return `<div class="wi-num">${num}</div><div class="wi-edge">${vs}</div><div class="wi-line ${r.special ? 'fire' : ''}">${line}</div>${this.buttonsHTML(back, !r.disabled)}`;
   }
 
@@ -332,11 +349,11 @@ export class DecisionUI {
     const g = grp(o);
     const live = this.opts.filter((q) => q.kind === o.kind && grp(q) === g && !q.disabled);
     if (!(L.k === 'target' && L.group === g)) {
-      this.stack = [{ level: { k: 'root' }, cur: KINDS.indexOf(o.kind as ActKind) }];
+      this.stack = [{ level: { k: 'root' }, cur: KINDS.indexOf(o.kind as UiKind) }];
       if (live.length > 1) {
-        this.stack.push({ level: { k: 'kind', kind: o.kind as ActKind }, cur: this.groupsIn(o.kind as ActKind).indexOf(g) });
-        this.level = { k: 'target', kind: o.kind as ActKind, group: g };
-      } else this.level = { k: 'kind', kind: o.kind as ActKind };
+        this.stack.push({ level: { k: 'kind', kind: o.kind as UiKind }, cur: this.groupsIn(o.kind as UiKind).indexOf(g) });
+        this.level = { k: 'target', kind: o.kind as UiKind, group: g };
+      } else this.level = { k: 'kind', kind: o.kind as UiKind };
       this.build(true);
     }
     const i = this.rows.findIndex((r) => r.opt?.id === id || r.key === g);

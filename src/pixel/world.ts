@@ -1,9 +1,11 @@
 // Pixel-art renderer: a 264x234 scene drawn at native resolution and scaled by a whole number of device
 // pixels (image-rendering: pixelated). Top-down court from the asset pack, side-view player sprites,
 // hoop and net sprites, and pixel previews (dotted routes, rings, walls) for the decision UI.
-// A battle camera crops the scene and enlarges it by a whole number (1x, 2x, 3x): close on a duel,
-// wide for a pass preview, back to the whole court between plays. It never scales by a fraction.
-// It offers the same calls the match code used on the 3D world, in court meters.
+// A camera crops the scene and enlarges it: close on a duel, wide for a play, back to the whole court
+// between plays. Every change is a smooth eased move (no cuts); at rest the zoom is a whole number of
+// device pixels per scene pixel and the view starts on a whole scene pixel, so the pixel art stays sharp.
+// Three modes: full (up to 2x, frames every preview), soft (one gentle zoom on the duel, few moves) and off.
+// Reduced motion never moves it. It offers the same calls the match code used on the 3D world, in court meters.
 import { Vector3, type Curve } from 'three';
 import { ZONES } from '../rules';
 import { COURT_H, COURT_W, HOOP } from './court';
@@ -18,8 +20,16 @@ const KX = 15, KY = 11.1, KZ = 14.4;
 /** Hoop floor point on screen. */
 const HX = 184, HY = 114;
 const COURT_OX = -30;
-/** Largest camera zoom. */
-export const MAX_ZOOM = 3;
+/** Largest camera zoom (full mode). */
+export const MAX_ZOOM = 2;
+/** Camera modes: full (frames every move, up to 2x), soft (gentle zoom on the duel only), off (whole court). */
+export type CamMode = 'full' | 'soft' | 'off';
+const MODE_ZOOM: Record<CamMode, number> = { full: 2, soft: 1.5, off: 1 };
+const MODE_TIME: Record<CamMode, number> = { full: 0.55, soft: 0.65, off: 0.6 };
+/** Ease in and out (cubic). */
+const easeIO = (k: number) => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
+/** A camera view: top-left of the visible part of the scene (scene pixels) and its zoom. */
+interface View { x: number; y: number; z: number }
 
 export const project = (x: number, y: number, h = 0) => ({ x: HX - (y - HOOP.y) * KX, y: HY + (x - HOOP.x) * KY - h * KZ });
 const fromWorld = (v: Vector3) => project(v.x + COURT_W / 2, v.z + COURT_H / 2, v.y);
@@ -119,11 +129,24 @@ export class PixelWorld {
   private ro: ResizeObserver;
   /** CSS pixels per canvas pixel. */
   private k = 1;
-  /** Camera: top-left of the visible part of the scene and its whole-number zoom. */
-  private cam = { x: 0, y: 0, z: 1 };
-  private camGoal = { x: 0, y: 0, z: 1 };
-  /** A short close-up that overrides the camera (dunks, specials). */
-  private zoom: { x: number; y: number; t: number; dur: number } | null = null;
+  /** Camera: the view shown now, where it is going and the eased move between them. */
+  private cam: View = { x: 0, y: 0, z: 1 };
+  private camGoal: View = { x: 0, y: 0, z: 1 };
+  private tween: { a: View; b: View; t: number; dur: number } | null = null;
+  /** A short close-up (dunks, specials): the view to return to and the time left. */
+  private zoom: { back: View; t: number; dur: number } | null = null;
+  /** Camera mode (pause menu). */
+  camMode: CamMode = 'soft';
+  /** Device pixels per scene pixel at zoom 1 (the canvas is drawn at device resolution). */
+  private S = 1;
+  /** Light frame drawn around the two players of a duel (scene pixels), or null. */
+  private duelBox: { x0: number; y0: number; x1: number; y1: number } | null = null;
+  /** Numbered step badges of a combo preview. */
+  private badges: { x: number; y: number; n: number }[] = [];
+  /** Spectators: pack characters behind the baseline and on the bench (cheer on big plays). */
+  private fans: { look: PixelLook; x: number; y: number; flip: boolean; clock: number; cheer: number }[] = [];
+  /** Hit-stop: the picture holds for a few frames on a big impact (dunk, block). */
+  private hold = 0;
   /** Hand cursor pointing at a scene point (target selection). */
   private hand: ScenePt | null = null;
   /** Persistent labels (the opponent's tell) that previews do not clear. */
@@ -231,6 +254,13 @@ export class PixelWorld {
         win: { l: Math.round(left + cw + gap), t: Math.round(bodyT), w: winW, h: Math.round(bodyH) },
       };
     }
+    // The canvas is drawn at device resolution: s device pixels per scene pixel at zoom 1.
+    if (this.canvas.width !== VIEW_W * s || this.canvas.height !== VIEW_H * s) {
+      this.canvas.width = VIEW_W * s;
+      this.canvas.height = VIEW_H * s;
+      this.vg.imageSmoothingEnabled = false;
+    }
+    this.S = s;
     for (const el of [this.canvas, this.labelsEl]) {
       el.style.width = `${L.court.w}px`;
       el.style.height = `${L.court.h}px`;
@@ -289,6 +319,7 @@ export class PixelWorld {
   // ---------------------------------------------------------------- previews
   clearPreview() {
     this.rings = []; this.dotPaths = []; this.walls = []; this.ghosts = [];
+    this.badges = [];
     this.hand = null;
     for (const l of this.labels) l.el.remove();
     this.labels = [];
@@ -311,42 +342,105 @@ export class PixelWorld {
   pointAt(x: number | null, y = 0) { this.hand = x === null ? null : project(x, y); }
 
   // ---------------------------------------------------------------- camera
+  /** Largest zoom of the current mode, as a whole number of device pixels per scene pixel. */
+  private maxZoom(cap = MAX_ZOOM) {
+    if (this.reduce || this.camMode === 'off') return 1;
+    return this.quant(Math.min(cap, MODE_ZOOM[this.camMode]));
+  }
+  /** Round a zoom down so one scene pixel covers a whole number of device pixels. */
+  private quant(z: number) { return Math.max(1, Math.floor(this.S * z + 1e-6) / this.S); }
   /**
-   * Frame a set of scene points: the biggest whole-number zoom (up to `maxZ`) that keeps them all in view
-   * with a margin, centered on them. Reduced motion keeps the whole court (no zoom).
+   * Frame a set of scene points: the biggest zoom (up to `maxZ` and the mode's limit) that keeps them all in view
+   * with a margin, centered on them. Soft mode moves as little as it can: one gentle zoom on the duel, and for
+   * previews (`keep`) it stays put if the points are in view, else it opens to the whole court. Off and reduced
+   * motion keep the whole court.
    */
-  frame(pts: ScenePt[], maxZ = MAX_ZOOM, margin = 14) {
-    if (!pts.length || this.reduce) { this.overview(); return; }
+  frame(pts: ScenePt[], maxZ = MAX_ZOOM, margin = 14, keep = false) {
+    if (!pts.length || this.reduce || this.camMode === 'off') { this.overview(); return; }
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const p of pts) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
     x0 -= margin; x1 += margin; y0 -= margin; y1 += margin;
-    let z = Math.max(1, Math.min(MAX_ZOOM, maxZ));
-    while (z > 1 && (x1 - x0 > VIEW_W / z || y1 - y0 > VIEW_H / z)) z--;
-    this.camGoal = this.clampCam((x0 + x1) / 2, (y0 + y1) / 2, z);
+    if (this.camMode === 'soft' && keep) {
+      // Previews in soft mode: stay if everything is in view, else open to the whole court (never a new close-up).
+      const g = this.camGoal, w = VIEW_W / g.z, h = VIEW_H / g.z;
+      if (!(x0 >= g.x && y0 >= g.y && x1 <= g.x + w && y1 <= g.y + h)) this.overview();
+      return;
+    }
+    let z = this.maxZoom(maxZ);
+    const fit = Math.min(VIEW_W / Math.max(1, x1 - x0), VIEW_H / Math.max(1, y1 - y0));
+    if (fit < z) z = this.quant(fit);
+    if (this.camMode === 'soft' && z < this.maxZoom(maxZ)) z = 1;
+    this.goTo(this.clampCam((x0 + x1) / 2, (y0 + y1) / 2, z));
   }
   /** The whole court. */
-  overview() { this.camGoal = { x: 0, y: 0, z: 1 }; }
+  overview() { this.goTo({ x: 0, y: 0, z: 1 }); }
   /** Current zoom (tests). */
-  get zoomLevel() { return this.zoom && !this.reduce ? 2 : this.cam.z; }
-  private clampCam(cx: number, cy: number, z: number) {
+  get zoomLevel() { return this.cam.z; }
+  /** The camera is moving (tests, shake). */
+  get camMoving() { return !!this.tween; }
+  /** Change the camera mode: the view eases to what the mode allows. */
+  setCamMode(m: CamMode) {
+    this.camMode = m;
+    const g = this.camGoal;
+    if (m === 'off') this.overview();
+    else if (g.z > this.maxZoom()) this.goTo(this.clampCam(g.x + VIEW_W / g.z / 2, g.y + VIEW_H / g.z / 2, this.maxZoom()));
+  }
+  private clampCam(cx: number, cy: number, z: number): View {
     const w = VIEW_W / z, h = VIEW_H / z;
-    return { x: Math.round(Math.min(VIEW_W - w, Math.max(0, cx - w / 2))), y: Math.round(Math.min(VIEW_H - h, Math.max(0, cy - h / 2))), z };
+    return { x: Math.floor(Math.min(VIEW_W - w, Math.max(0, Math.round(cx - w / 2)))), y: Math.floor(Math.min(VIEW_H - h, Math.max(0, Math.round(cy - h / 2)))), z };
   }
-  /** The view used this frame (a close-up overrides the camera). */
-  private view0() {
-    if (this.zoom && !this.reduce) {
-      const z = Math.max(2, this.cam.z);
-      return this.clampCam(this.zoom.x, this.zoom.y + VIEW_H / z * 0.12, z);
-    }
-    return this.cam;
+  /** Ease the camera to a view (reduced motion: no move at all, the court stays whole). */
+  private goTo(v: View) {
+    const g = this.camGoal;
+    if (this.zoom) { this.zoom.back = v; return; }
+    if (g.x === v.x && g.y === v.y && g.z === v.z) return;
+    this.camGoal = v;
+    if (this.reduce) { this.cam = { ...v }; this.tween = null; return; }
+    // Small pans at the same zoom (a few pixels) are not worth a move: they would only wobble.
+    if (!this.tween && v.z === this.cam.z && Math.abs(v.x - this.cam.x) <= 2 && Math.abs(v.y - this.cam.y) <= 2) { this.cam = { ...v }; return; }
+    this.tween = { a: { ...this.cam }, b: { ...v }, t: 0, dur: MODE_TIME[this.camMode] };
   }
-  /** Move the camera toward its goal: a zoom change is a cut; at the same zoom it pans in whole pixels. */
+  /** The view used this frame. */
+  private view0(): View { return this.cam; }
+  /** Advance the eased move: the center moves along a straight line, the zoom on a log scale (steady growth). */
   private stepCam(dt: number) {
-    const g = this.camGoal, c = this.cam;
-    if (g.z !== c.z || this.reduce) { this.cam = { ...g }; return; }
-    const k = Math.min(1, dt * 12);
-    const step = (a: number, b: number) => (a === b ? a : Math.abs(b - a) <= 1 ? b : Math.round(a + (b - a) * k) === a ? a + Math.sign(b - a) : Math.round(a + (b - a) * k));
-    c.x = step(c.x, g.x); c.y = step(c.y, g.y);
+    if (this.zoom) {
+      this.zoom.t += dt;
+      if (this.zoom.t >= this.zoom.dur) { const back = this.zoom.back; this.zoom = null; this.labelsEl.classList.remove('hide'); this.goTo(back); }
+    }
+    const tw = this.tween;
+    if (!tw) return;
+    tw.t += dt;
+    const k = Math.min(1, tw.t / tw.dur);
+    if (k >= 1) { this.cam = { ...tw.b }; this.tween = null; return; }
+    const e = easeIO(k);
+    const z = tw.a.z * Math.pow(tw.b.z / tw.a.z, e);
+    const ca = { x: tw.a.x + VIEW_W / tw.a.z / 2, y: tw.a.y + VIEW_H / tw.a.z / 2 };
+    const cb = { x: tw.b.x + VIEW_W / tw.b.z / 2, y: tw.b.y + VIEW_H / tw.b.z / 2 };
+    const cx = ca.x + (cb.x - ca.x) * e, cy = ca.y + (cb.y - ca.y) * e;
+    const w = VIEW_W / z, h = VIEW_H / z;
+    this.cam = { x: Math.min(VIEW_W - w, Math.max(0, cx - w / 2)), y: Math.min(VIEW_H - h, Math.max(0, cy - h / 2)), z };
+  }
+
+  /** Light corner brackets around the duel (scene points), or none. */
+  setDuelBox(pts: ScenePt[] | null) {
+    if (!pts?.length) { this.duelBox = null; return; }
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of pts) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+    this.duelBox = { x0: Math.round(x0 - 6), y0: Math.round(y0 - 4), x1: Math.round(x1 + 6), y1: Math.round(y1 + 6) };
+  }
+  /** Numbered badge of a combo step at a court point (meters, height in meters). */
+  badge(p: Vector3, n: number) { const s = fromWorld(p); this.badges.push({ x: Math.round(s.x), y: Math.round(s.y), n }); }
+  /** Hold the picture for a moment (hit-stop on a big impact). */
+  hitStop(t = 0.08) { if (!this.reduce) this.hold = Math.max(this.hold, t); }
+  /** The picture is holding (the match pauses its clock too). */
+  get holding() { return this.hold > 0; }
+  /** Spectators cheer (big plays). */
+  cheer(k = 1) { for (const f of this.fans) f.cheer = Math.max(f.cheer, 0.6 + Math.random() * 0.5 * k); }
+  /** Spectators: a few pack characters behind the baseline and behind the bench. */
+  setFans(looks: PixelLook[]) {
+    const spots = [{ x: 252, y: 96 }, { x: 247, y: 128 }, { x: 254, y: 160 }, { x: 52, y: 214 }, { x: 118, y: 214 }];
+    this.fans = spots.slice(0, looks.length).map((p, i) => ({ look: looks[i], x: p.x, y: p.y, flip: p.x < 200, clock: Math.random() * 3, cheer: 0 }));
   }
 
   dots(curve: Curve<Vector3>, color: string, radius = 0.07, spacing = 0.32, speed = 0.9) {
@@ -436,6 +530,8 @@ export class PixelWorld {
 
   // ---------------------------------------------------------------- frame
   render(dt: number) {
+    // Hit-stop: the picture holds still for a few frames.
+    if (this.hold > 0) { this.hold = Math.max(0, this.hold - dt); this.blit(0); return; }
     this.time += dt;
     const g = this.g;
     g.setTransform(1, 0, 0, 1, 0, 0);
@@ -448,6 +544,13 @@ export class PixelWorld {
     drawPiece(g, sheet, 'court', COURT_OX, 0);
     drawPiece(g, sheet, 'fence', 240, 2);
     drawPiece(g, sheet, 'fence', 240, 176);
+    // Spectators (pack characters): idle, jumping while they cheer.
+    for (const f of this.fans) {
+      f.clock += dt;
+      f.cheer = Math.max(0, f.cheer - dt);
+      const fr = f.cheer > 0 ? tagFrame('Jump', f.clock, true, 70) : tagFrame('Idle', f.clock, true);
+      drawPlayer(g, f.look, fr, f.x - FEET.x, f.y - FEET.y, f.flip, false);
+    }
     drawPiece(g, sheet, 'bench3', 40, 210);
     drawPiece(g, sheet, 'trash', 76, 207);
     drawPiece(g, sheet, 'bench1', 100, 210);
@@ -505,7 +608,7 @@ export class PixelWorld {
       if (s.act) { tag = s.act.tag; t = s.act.t; loop = false; ms = s.act.ms; }
       else {
         t = pv.clock;
-        if (s.moving) tag = s.carry ? (s.fast ? 'Sprint_Ball' : 'Run_Ball') : s.defending ? 'Slide' : 'Run';
+        if (s.moving) tag = s.carry ? (s.fast ? 'Sprint_Ball' : 'Run_Ball') : s.fast ? 'Sprint' : s.defending ? 'Slide' : 'Run';
         else if (s.carry) {
           const k = s.style ?? 0;
           if (s.post) tag = s.deciding ? (k % 2 ? 'Back_Idle' : 'Back_Idle_2') : 'Back_Dribble';
@@ -562,6 +665,27 @@ export class PixelWorld {
       this.ellipse(gb.x, gb.y + 1, 5, 5, INK);
       this.ellipse(gb.x, gb.y, 5, 5, gb.color === GOOD ? '#b7ffd9' : gb.color);
     }
+    // Combo steps: numbered square badges (dark box, light digit) along the routes.
+    for (const b of this.badges) {
+      const label = String(b.n);
+      const w = pixTextW(label) + 6;
+      this.px(b.x - Math.ceil(w / 2) - 1, b.y - 6, INK, w + 2, 11);
+      this.px(b.x - Math.ceil(w / 2), b.y - 5, '#fff7ea', w, 9);
+      this.px(b.x - Math.ceil(w / 2) + 1, b.y - 4, INK, w - 2, 7);
+      pixText(g, label, b.x - Math.floor(pixTextW(label) / 2), b.y - 3, '#ffd166');
+    }
+    // Duel frame: light corner brackets around the two players facing off (the duel stays on the court).
+    if (this.duelBox) {
+      const d = this.duelBox, L = 6;
+      const corner = (x: number, y: number, sx: number, sy: number, c: string, o: number) => {
+        this.px(Math.min(x, x + sx * (L - 1)) + o, y + o, c, L, 1);
+        this.px(x + o, Math.min(y, y + sy * (L - 1)) + o, c, 1, L);
+      };
+      for (const [c, o] of [[INK, 1], ['#fff7ea', 0]] as [string, number][]) {
+        corner(d.x0, d.y0, 1, 1, c, o); corner(d.x1, d.y0, -1, 1, c, o);
+        corner(d.x0, d.y1, 1, -1, c, o); corner(d.x1, d.y1, -1, -1, c, o);
+      }
+    }
 
     // Overlays: handler arrow, numbers, dazed stars.
     for (const pv of this.players) {
@@ -614,7 +738,8 @@ export class PixelWorld {
   /** Clear every running effect (new possession, destroy). */
   fxClear() {
     this.parts = []; this.auras = []; this.ghosts2 = []; this.trail = null;
-    this.zoom = null; this.bars = 0; this.flash = 0; this.speedLines = 0;
+    if (this.zoom) { const back = this.zoom.back; this.zoom = null; this.goTo(back); }
+    this.bars = 0; this.flash = 0; this.speedLines = 0; this.hold = 0;
     this.labelsEl.classList.remove('hide');
   }
 
@@ -667,17 +792,29 @@ export class PixelWorld {
   /** The ball leaves a burning trail while it flies. */
   ballTrail(style: FxStyle | null) { this.trail = style ? { style, pts: [] } : null; }
   flashNow(color = '#ffffff', k = 0.7) { if (this.reduce) return; this.flash = k; this.flashCol = color; }
-  /** Snap a close-up (whole-number zoom: pixels stay square) on a court point, with letterbox bars. */
+  /**
+   * A close-up on a court point (dunks, specials), with letterbox bars. Full camera only: it eases in and back
+   * out like every other camera move. Soft and off keep the view; reduced motion has no bars either.
+   */
   cinematic(x: number | null, y = 0, h = 1, dur = 1.2) {
-    if (x === null) { this.zoom = null; this.labelsEl.classList.remove('hide'); return; }
-    this.bars = 1;
+    if (x === null) { this.endCinematic(); return; }
     if (this.reduce) return;
+    this.bars = 1;
+    if (this.camMode !== 'full') return;
     const p = project(x, y, h);
-    this.zoom = { x: p.x, y: p.y, t: 0, dur };
+    const back = this.zoom ? this.zoom.back : { ...this.camGoal };
+    this.zoom = null;
+    const z = this.maxZoom();
+    this.goTo(this.clampCam(p.x, p.y + (VIEW_H / z) * 0.12, z));
+    this.zoom = { back, t: 0, dur };
     this.labelsEl.classList.add('hide');
   }
   cutInLines(dur = 0.8) { if (!this.reduce) this.speedLines = dur; }
-  endCinematic() { this.zoom = null; this.bars = 0; this.labelsEl.classList.remove('hide'); }
+  endCinematic() {
+    if (this.zoom) { const back = this.zoom.back; this.zoom = null; this.goTo(back); }
+    this.bars = 0;
+    this.labelsEl.classList.remove('hide');
+  }
 
   private drawFx(dt: number) {
     const g = this.g;
@@ -772,28 +909,33 @@ export class PixelWorld {
     this.g.globalAlpha = 1;
   }
 
-  /** Copy the scene to the screen: camera (whole-number zoom), shake, letterbox, cut-in speed lines, flash. */
+  /**
+   * Copy the scene to the screen (device resolution): camera, shake, letterbox, cut-in speed lines, flash.
+   * At rest the zoom is a whole number of device pixels per scene pixel and the offset a whole device pixel.
+   */
   private blit(dt: number) {
-    const v = this.vg;
+    const v = this.vg, S = this.S;
     v.setTransform(1, 0, 0, 1, 0, 0);
     v.fillStyle = '#1b1029';
-    v.fillRect(0, 0, VIEW_W, VIEW_H);
+    v.fillRect(0, 0, VIEW_W * S, VIEW_H * S);
     let sx = 0, sy = 0;
     if (this.shake > 0) {
       this.shake = Math.max(0, this.shake - dt);
-      if (!this.reduce) {
-        const m = Math.ceil(this.shake * 8);
+      // No shake while the camera moves (that is where it makes people dizzy), less of it in soft mode, none when off.
+      const amp = this.reduce || this.camMode === 'off' || this.tween ? 0 : this.camMode === 'soft' ? 3 : 8;
+      if (amp) {
+        const m = Math.ceil(this.shake * amp);
         sx = Math.round((Math.random() - 0.5) * m); sy = Math.round((Math.random() - 0.5) * m);
       }
     }
-    this.stepCam(dt);
-    if (this.zoom) {
-      this.zoom.t += dt;
-      if (this.zoom.t >= this.zoom.dur) { this.zoom = null; this.labelsEl.classList.remove('hide'); }
-    }
+    if (dt > 0) this.stepCam(dt);
     const c = this.view0();
-    const w = VIEW_W / c.z, h = VIEW_H / c.z;
-    v.drawImage(this.view, c.x, c.y, w, h, sx, sy, VIEW_W, VIEW_H);
+    const k = S * c.z;
+    v.imageSmoothingEnabled = false;
+    v.setTransform(k, 0, 0, k, Math.round(-c.x * k) + sx * S, Math.round(-c.y * k) + sy * S);
+    v.drawImage(this.view, 0, 0);
+    // Overlays in screen space, one scene pixel = S device pixels.
+    v.setTransform(S, 0, 0, S, 0, 0);
     if (this.speedLines > 0) {
       this.speedLines -= dt;
       const cx = VIEW_W / 2, cy = VIEW_H / 2;
@@ -817,6 +959,7 @@ export class PixelWorld {
       v.globalAlpha = 1;
       this.flash = Math.max(0, this.flash - dt * 4);
     }
+    v.setTransform(1, 0, 0, 1, 0, 0);
   }
 
   private netSlice(y: number, h: number): [number, number, number, number] {

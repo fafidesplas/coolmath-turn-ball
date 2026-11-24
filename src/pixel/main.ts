@@ -29,6 +29,13 @@ let match: Match | null = null;
 let dui: DecisionUI | null = null;
 
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+/** Camera mode, kept in the pixel save (soft by default: one gentle zoom on the duel, smooth moves). */
+type CamMode = 'full' | 'soft' | 'off';
+const camOf = (): CamMode => (save as unknown as { cam?: CamMode }).cam ?? 'soft';
+const setCam = (m: CamMode) => { (save as unknown as { cam?: CamMode }).cam = m; persist(save); };
+const CAM_NAME: Record<CamMode, string> = { full: 'Full', soft: 'Soft', off: 'Off' };
+const camButtons = () => (['full', 'soft', 'off'] as CamMode[]).map((c) =>
+  `<button class="btn camb" data-cam="${c}" aria-pressed="${camOf() === c}">${icon(camOf() === c ? 'check' : 'slot', 16)}<span>${CAM_NAME[c]}</span></button>`).join('');
 const coinsHTML = () => `<div class="coins">${icon('coin', 20)}<b>${save.coins}</b></div>`;
 
 document.addEventListener('pointerdown', unlockAudio, { capture: true });
@@ -258,6 +265,7 @@ function howScreen() {
       ${card(`${icon('up', 24)}${icon('cross', 24)}`, 'Beat their move', 'The icon over their player is what they will likely do. Up arrow: your move beats it. Cross: it loses to it.')}
       ${card(`${icon('fire', 30)}`, 'Fire and specials', `Win duels to fill your Fire meter (${FIRE.max} flames: +1 per duel won, +2 per steal, pick, block or charge, +1 per forced miss, -1 per turnover). Full Fire unlocks each player's signature special for one move. Every special has a defense that stops it.`)}
       ${card(`${icon('t_pnr', 24)}${icon('t_iso', 24)}${icon('t_pop', 24)}`, 'Plays and passes', 'Players learn passes and team plays (pick and roll, clear-out, hand-off...) by leveling up and training. Shots, dribble moves and defense are the same for everyone.')}
+      ${card(`${icon('team', 26)}${icon('t_lob', 24)}`, 'Combos', 'Combo runs a play between two or three players in one move: alley-oop (off the glass too), pick and roll with the roll, give and go, kick-out, backdoor, drive and dish, swing. Each step can fail, and the defense reacts: help at the rim, a switch, a defender jumping the pass.')}
       ${card(`<span class="pips att"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>`, 'Moves', `${TUNE.actions} moves per possession. The last one is a shot.`)}
       ${card(icon('hoop', 32), 'Score', `1 inside the arc, 2 outside. First to ${MATCH_RULES.winScore}, or most after ${MATCH_RULES.maxPoss} possessions each.`)}
       <div class="center menu row"><button class="btn primary" id="tut">${icon('play', 22)} Tutorial</button><button class="btn" data-go="league">${icon('play', 22)} Play</button></div>
@@ -366,6 +374,8 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
     ov.innerHTML = `<div class="panel"><h2>Paused</h2>
       <button class="btn primary" id="resume">${icon('play', 22)} Resume</button>
       <button class="btn" id="pfx">${icon(save.reduceFx ? 'even' : 'fire', 20)} FX ${save.reduceFx ? 'low' : 'full'}</button>
+      <div class="camsel" role="group" aria-label="Camera"><span class="camh">${icon('scout', 16)}Camera</span><div class="camrow">${camButtons()}</div>
+        <small class="camnote">${save.reduceFx ? 'FX low: the camera stays still' : '&nbsp;'}</small></div>
       <button class="btn ghost" id="quit">${icon('cross', 20)} Quit</button></div>`;
     el.appendChild(ov);
     ov.querySelector('#resume')!.addEventListener('click', () => { m.paused = false; ov.remove(); });
@@ -373,6 +383,15 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
       save.reduceFx = !save.reduceFx; persist(save);
       m.setReduceFx(!!save.reduceFx);
       (e.currentTarget as HTMLElement).innerHTML = `${icon(save.reduceFx ? 'even' : 'fire', 20)} FX ${save.reduceFx ? 'low' : 'full'}`;
+      ov.querySelector('.camnote')!.innerHTML = save.reduceFx ? 'FX low: the camera stays still' : '&nbsp;';
+    });
+    ov.querySelector('.camrow')!.addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest<HTMLElement>('[data-cam]');
+      if (!b) return;
+      sfx.tap();
+      setCam(b.dataset.cam as CamMode);
+      m.setCamMode(camOf());
+      ov.querySelector('.camrow')!.innerHTML = camButtons();
     });
     ov.querySelector('#quit')!.addEventListener('click', () => {
       if (opts.tutorial) { save.tutorialDone = true; }
@@ -384,13 +403,13 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
 
 function tutorialScreen() {
   const el = mount(matchHud('TUT', RIVALS[0].color), 'match-screen');
-  bindMatch(el, null, { tier: 0, tutorial: TUTORIAL, kits: TUTORIAL_KITS, hints: true, reduceFx: save.reduceFx });
+  bindMatch(el, null, { tier: 0, tutorial: TUTORIAL, kits: TUTORIAL_KITS, hints: true, reduceFx: save.reduceFx, cam: camOf() });
 }
 
 function matchScreen(rival: RivalTeam) {
   if (!save.tutorialDone) { tutorialScreen(); return; }
   const el = mount(matchHud(rival.name.slice(0, 3).toUpperCase(), rival.color), 'match-screen');
-  bindMatch(el, rival, { tier: rival.tier, hints: save.duelsSeen < 6, reduceFx: save.reduceFx, coach: { att: !save.coachedAtt, def: !save.coachedDef } });
+  bindMatch(el, rival, { tier: rival.tier, hints: save.duelsSeen < 6, reduceFx: save.reduceFx, cam: camOf(), coach: { att: !save.coachedAtt, def: !save.coachedDef } });
 }
 
 function resultScreen(rival: RivalTeam, r: MatchResult) {

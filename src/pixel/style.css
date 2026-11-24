@@ -488,3 +488,24 @@ h1, h2, h3 { font-weight: 700; letter-spacing: 1px; }
 .sig b, .pc-name b { line-height: 1.4; }
 .tech { line-height: 1.4; }
 .wcols .wi-line { white-space: normal; height: 40px; line-height: 20px; overflow: hidden; }
+
+/* Pause menu: camera mode (selected: light box and a check mark, never color alone). */
+.camsel { display: flex; flex-direction: column; gap: 6px; }
+.camsel .camh { display: inline-flex; align-items: center; justify-content: center; gap: 6px; font-size: 12px; }
+.camrow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.camrow .btn.camb { min-height: 48px; min-width: 0; padding: 8px 6px; font-size: 12px; gap: 4px; }
+.camrow .btn.camb[aria-pressed="true"] { background: #fff7ea; color: var(--ink); box-shadow: inset 0 0 0 3px var(--ink), inset -3px -4px 0 #0003; }
+.camnote { display: block; height: 14px; line-height: 14px; font-size: 10px; color: #c9c3e6; white-space: nowrap; }
+
+/* More rows below: a pixel down arrow (dark outline, gold fill) over the bottom right of the list. */
+.win .w-list { position: relative; }
+.win .w-list::after { content: ''; position: absolute; right: 10px; bottom: 2px; width: 0; height: 0; border-left: 9px solid transparent; border-right: 9px solid transparent; border-top: 11px solid #1b1029; visibility: hidden; pointer-events: none; }
+.win .w-list::before { content: ''; position: absolute; right: 13px; bottom: 5px; width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 7px solid #ffd166; visibility: hidden; pointer-events: none; z-index: 1; }
+.win .w-list.more::after, .win .w-list.more::before { visibility: visible; }
+
+/* The big number keeps one width whatever it shows (8%, 26%, a lock, nothing): hovering never moves the info box. */
+.wi-num b { display: inline-block; min-width: 2.5em; white-space: nowrap; }
+.wi-num b.w3 { font-size: 24px; }
+.match-screen:not(.small) .wi-num b.w3 { font-size: 30px; }
+.screen:not(.wcols) .wi-num { width: 120px; flex: none; }
+.match-screen:not(.small):not(.wcols) .wi-num { width: 140px; }
