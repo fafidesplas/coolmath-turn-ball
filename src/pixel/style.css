@@ -463,6 +463,15 @@ h1, h2, h3 { font-weight: 700; letter-spacing: 1px; }
 .callout.move { background: var(--ink); color: #ffd166; box-shadow: inset 0 0 0 3px #ffd166; }
 .callout.move.press { color: #ff8fc0; box-shadow: inset 0 0 0 3px #ff8fc0; }
 .callout.move.space { color: #8fe3ff; box-shadow: inset 0 0 0 3px #8fe3ff; }
+.callout.move.deny { color: #ffd166; box-shadow: inset 0 0 0 3px #ffd166; outline: 2px dashed #ffd166; outline-offset: 2px; }
+/* Beat 3 of a duel: a big stamp (icon, at most one word) over the player who decided it. */
+.callout.stamp { flex-direction: column; gap: 2px; padding: 6px 10px; animation: stampin 0.2s steps(3); z-index: 2; }
+.callout.stamp .ico { width: 48px; height: 48px; }
+.callout.stamp small { font-size: 12px; }
+@keyframes stampin { 0% { scale: 1.9; } 100% { scale: 1; } }
+.callout.stamp.calm { animation: none; }
+/* Who leaves his man to help (defense previews). */
+.wlabel.help { background: #1b1029e6; color: #8fe3ff; padding: 2px; box-shadow: inset 0 0 0 2px #8fe3ff; }
 .px-labels.hide .wlabel, .px-labels.hide .callout:not(.big) { visibility: hidden; }
 
 /* Banner (whose ball) and the big result word, both over the stage. */
@@ -480,7 +489,7 @@ h1, h2, h3 { font-weight: 700; letter-spacing: 1px; }
 .bigres.r-win em { color: var(--ink); }
 .bigres.r-lose .br-in { background: repeating-linear-gradient(135deg, #a3123a 0 6px, #5a0020 6px 12px); box-shadow: inset 0 0 0 4px #ffb3c4, inset 0 0 0 7px var(--ink); }
 .bigres.r-even .br-in { background: #3a3a6a; outline: 4px dashed #d8d6ee; outline-offset: -6px; }
-@media (prefers-reduced-motion: reduce) { .bigres.show { animation: none; } .row.cur .hand, .wlabel.tell { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .bigres.show { animation: none; } .row.cur .hand, .wlabel.tell, .callout.stamp { animation: none; } }
 
 /* Press Start 2P has tall glyphs: give small text room so lines never touch. */
 .screen:not(.match-screen) { line-height: 1.5; }
@@ -509,3 +518,9 @@ h1, h2, h3 { font-weight: 700; letter-spacing: 1px; }
 .match-screen:not(.small) .wi-num b.w3 { font-size: 30px; }
 .screen:not(.wcols) .wi-num { width: 120px; flex: none; }
 .match-screen:not(.small):not(.wcols) .wi-num { width: 140px; }
+
+/* Big words (turn banner, duel result, Fire ready) sit on the bottom edge of the court, never over the play. */
+.match-screen .banner, .match-screen .bigres { top: auto; bottom: calc(100% - var(--court-top) - var(--court-h) + 6px); }
+/* Callouts point at their player: a small tail under the box. */
+.callout::after { content: ''; position: absolute; left: 50%; bottom: -7px; margin-left: -6px; border: 6px solid transparent; border-bottom: 0; border-top-color: #fff7ea; }
+.callout.big::after { display: none; }

@@ -19,7 +19,7 @@ import { TECHS, isDefTech, type TechId } from '../techs';
 import { FIRE, SPECIALS, fireDelta, specialFor, type SpecialDef, type SpecialId } from '../specials';
 import { ArcCurve, COURT_H, COURT_W, HOOP, RIM, RIM_H, w3 } from './court';
 import { hairStyleFor, releaseIndex, tagLen, type Kit } from './sprites';
-import { PixelWorld, type CamMode, type PixelLook, type ScenePt } from './world';
+import { PixelWorld, type CamMode, type Hatch, type PixelLook, type ScenePt } from './world';
 import { COMBOS, REACT_WORD, comboOdds, comboScoreVs, combosFor, reaction, type ComboPlan } from './combos';
 import { pxsfx } from './pxsfx';
 
@@ -57,6 +57,8 @@ interface Ent {
   act: Act1 | null;
   /** Moving at sprint speed (drives). */
   fast: boolean;
+  /** A long move (more than a step or two): runs facing where it goes instead of a defensive slide. */
+  jog: boolean;
   /** Signature special. */
   sp: SpecialDef;
 }
@@ -207,7 +209,12 @@ export interface MatchOptions {
 
 type Phase = 'intro' | 'decide' | 'resolve' | 'over';
 
+type Pt = { x: number; y: number };
 const dist = (ax: number, ay: number, bx: number, by: number) => Math.hypot(ax - bx, ay - by);
+/** Top running speed on the court (m/s, at the peak of an eased move): a sprint, never faster. */
+const VMAX = 8.5;
+/** Slower pace of the action while a duel resolves (1 = real time): three clear beats instead of a blur. */
+const DUEL_PACE = 0.8;
 const ease = (k: number) => k * k * (3 - 2 * k);
 const shotApex = (d: number) => 0.7 + d * 0.09;
 const pct = (p: number) => Math.round(p * 100);
@@ -255,6 +262,8 @@ export const moveIcon = (t: TechId, zoneKind?: string) => (t === 'jumper' && zon
 /** 1-3 pips from a percentage. */
 const lvl = (p: number, a: number, b: number) => (p < a ? 1 : p < b ? 2 : 3);
 const FAM_COLOR: Record<Stance, string> = { press: '#f72585', space: '#4cc9f0', deny: '#ffd166' };
+/** What each defensive move leaves open (drawn as the risk in its preview). */
+const RISK: Partial<Record<TechId, 'drive' | 'shot'>> = { press: 'drive', hawk: 'drive', contest: 'drive', deny: 'drive', space: 'shot', rim: 'shot', charge: 'shot' };
 /** Point on the backboard used by bank shots (left or right of the square). */
 const boardPoint = (fromX: number) => w3(HOOP.x + (fromX < HOOP.x ? -0.32 : 0.32), 1.27, RIM_H + 0.42);
 
@@ -321,6 +330,14 @@ export class Match {
   private wander: { t: number; back: boolean }[] = [{ t: 1.2, back: false }, { t: 2.0, back: false }, { t: 2.8, back: false }];
   /** Phase of the dribble bounce (sound on each floor contact). */
   private bouncePh = 0;
+  /** Time the defense's reaction in a combo needs before the step plays (a helper running over). */
+  private reactWait = 0.3;
+  /** Scene points of the threat shown on defense (the camera keeps them in view). */
+  private threatPts: ScenePt[] = [];
+  /** Teams whose Fire meter filled during the play (told at the next decision). */
+  private fireNews: (0 | 1)[] = [];
+  /** Real seconds the action holds still on a decisive moment (the picture keeps drawing). */
+  private freeze = 0;
   /** Who won the ball at the end of the last possession (keeps it to clear it out). */
   private nextHandler: Ent | null = null;
 
@@ -330,7 +347,7 @@ export class Match {
     teams.forEach((t, ti) => t.players.slice(0, 3).forEach((pl, slot) => {
       this.ents.push({
         i: this.ents.length, pl, team: ti as 0 | 1, slot, x: 7.5, y: 8, px: 7.5, py: 8, face: Math.PI,
-        daze: 0, jumpT: 0, jumpDur: 0, jumpH: 0, armsT: 0, arms: 0, anim: null, act: null, fast: false, sp: SPECIALS[specialFor(pl.tid, slot)],
+        daze: 0, jumpT: 0, jumpDur: 0, jumpH: 0, armsT: 0, arms: 0, anim: null, act: null, fast: false, jog: false, sp: SPECIALS[specialFor(pl.tid, slot)],
       });
       looks.push({ skin: pl.skin, hair: pl.hair, hairStyle: hairStyleFor(pl.tid), kit: t.kit, marker: t.marker, num: pl.num });
       this.lines[pl.uid] = { pts: 0, duels: 0, duelsWon: 0, steals: 0 };
@@ -404,17 +421,29 @@ export class Match {
   /** Start a one-shot sprite animation (`ms` per frame). */
   private play(e: Ent, tag: string, ms = 80) { e.act = { tag, t: 0, ms, dur: (tagLen(tag) * ms) / 1000 }; }
   private faceTo(e: Ent, x: number, y: number) { e.face = Math.atan2(x - e.x, y - e.y); }
-  private glide(e: Ent, x: number, y: number, dur: number, curve?: { x: number; y: number }) {
+  /**
+   * Move a player along a straight line or a curve. The duration asked for is a minimum: no one moves faster than
+   * a sprint (VMAX), so a long trip takes the time a person needs. Returns the real duration (callers schedule
+   * what comes next with it). Long moves run (or sprint); short ones keep the defensive slide.
+   */
+  private glide(e: Ent, x: number, y: number, dur: number, curve?: { x: number; y: number }, vmax = VMAX): number {
     const sx = e.x, sy = e.y;
-    if (dist(sx, sy, x, y) < 0.03) { e.anim = null; return; }
+    const d = dist(sx, sy, x, y);
+    if (d < 0.03) { e.anim = null; return 0; }
+    const len = curve ? (dist(sx, sy, curve.x, curve.y) + dist(curve.x, curve.y, x, y) + d) / 2 : d;
+    // Eased moves peak at 1.5x their mean speed: the cap applies to that peak.
+    const T = Math.max(dur, (len * 1.5) / vmax);
+    if ((len * 1.5) / T > 5.2) e.fast = true;
+    e.jog = len > 1.6;
     e.anim = {
-      t: 0, dur, path: (k) => {
+      t: 0, dur: T, path: (k) => {
         const q = ease(k);
         if (!curve) return { x: sx + (x - sx) * q, y: sy + (y - sy) * q };
         const a = (1 - q) * (1 - q), b = 2 * (1 - q) * q, c = q * q;
         return { x: a * sx + b * curve.x + c * x, y: a * sy + b * curve.y + c * y };
       },
     };
+    return T;
   }
   private fly(from: Vector3, to: Vector3, apex: number, dur: number, onLand: () => void) {
     this.holder = null;
@@ -460,14 +489,17 @@ export class Match {
     return { x: clamp(p.x, 0.5, COURT_W - 0.5), y: clamp(p.y, 0.5, COURT_H - 0.5) };
   }
 
-  private layout(s: Poss, dm: TechId | null, dur: number, skip: Ent[] = []) {
+  /** Everyone to their spot for state s (defense in move dm). Returns when the last one gets there. */
+  private layout(s: Poss, dm: TechId | null, dur: number, skip: Ent[] = [], vmax = VMAX): number {
+    let T = 0;
     for (let i = 0; i < 3; i++) {
       const a = this.att(i), d = this.def(i);
       const z = ZONES[s.zones[i]];
-      if (!skip.includes(a)) this.glide(a, z.x, z.y, dur);
+      if (!skip.includes(a)) T = Math.max(T, this.glide(a, z.x, z.y, dur, undefined, vmax));
       const p = this.defSpot(s, i, dm);
-      if (!skip.includes(d)) this.glide(d, p.x, p.y, dur);
+      if (!skip.includes(d)) T = Math.max(T, this.glide(d, p.x, p.y, dur, undefined, vmax));
     }
+    return T;
   }
 
   private snapLayout(s: Poss, dm: TechId | null) {
@@ -496,8 +528,12 @@ export class Match {
       this.hooks.banner(t.title, '#ffd166', `${this.tutIdx + 1} / ${tut.length}`);
     } else {
       // Transition: the player who won the ball (rebound, steal, block) keeps it and clears it out to the arc.
+      // After a basket the ball is under the rim: the new attacker nearest it picks it up.
       const won = this.nextHandler && this.nextHandler.team === this.offense ? this.nextHandler.slot : -1;
-      s = setupPoss(SETUPS[Math.floor(this.rand() * SETUPS.length)], won >= 0 ? won : Math.floor(this.rand() * 3));
+      const bp = this.looseBall ?? w3(HOOP.x, HOOP.y + 0.5, 0.2);
+      const near = [0, 1, 2].sort((a, b) => dist(this.att(a).x, this.att(a).y, bp.x + COURT_W / 2, bp.z + COURT_H / 2) - dist(this.att(b).x, this.att(b).y, bp.x + COURT_W / 2, bp.z + COURT_H / 2))[0];
+      const setup = SETUPS[Math.floor(this.rand() * SETUPS.length)];
+      s = first ? setupPoss(setup, Math.floor(this.rand() * 3)) : this.nearestSetup(setup, won >= 0 ? won : near);
       if (this.golden) this.hooks.banner('NEXT SCORE WINS', '#ffd60a');
       else this.hooks.banner(this.offense === 0 ? 'YOUR BALL' : 'DEFENSE', this.teams[this.offense].color);
     }
@@ -509,24 +545,86 @@ export class Match {
     this.world.overview();
     if (tut && this.tutIdx === tut.length - 1) this.heat[0] = FIRE.max;
     this.freed = null;
-    this.holder = this.att(s.ball);
-    this.flight = null;
-    this.looseBall = null;
     for (const e of this.ents) { e.daze = 0; e.armsT = 0; }
-    if (first) this.snapLayout(s, this.shownStance);
-    else {
-      this.layout(s, this.shownStance, 0.8);
-      // The ball carrier dribbles out at speed; the others jog to their spots.
-      const hh = this.att(s.ball);
-      if (this.nextHandler === hh && dist(hh.x, hh.y, ZONES[s.zones[s.ball]].x, ZONES[s.zones[s.ball]].y) > 2) { hh.fast = true; this.glide(hh, ZONES[s.zones[s.ball]].x, ZONES[s.zones[s.ball]].y, 0.9); }
-    }
+    let ready = 1.2;
+    if (first) {
+      this.snapLayout(s, this.shownStance);
+      this.holder = this.att(s.ball);
+      this.flight = null;
+      this.looseBall = null;
+    } else ready = this.transition(s);
     this.nextHandler = null;
     this.comboRun = null;
     this.chain = null;
     this.phase = 'intro';
     sfx.whistle();
     this.pushHud();
-    this.later(first ? 1.2 : 1.0, () => this.openDecision());
+    this.later(ready, () => this.openDecision());
+  }
+
+  /**
+   * The setup's zones with the two teammates placed where they have the least to run (both teams' trips
+   * counted). The handler keeps the setup's first zone. Same zones as the rules' setup, only who goes where.
+   */
+  private nearestSetup(setup: Zone[], handler: number): Poss {
+    const a = setupPoss(setup, handler);
+    const mates = [0, 1, 2].filter((j) => j !== handler);
+    const zb = [...a.zones];
+    [zb[mates[0]], zb[mates[1]]] = [zb[mates[1]], zb[mates[0]]];
+    const b: Poss = { ...a, zones: zb, adv: [...a.adv] };
+    const cost = (s: Poss) => {
+      let c = 0;
+      for (const j of mates) {
+        const z = ZONES[s.zones[j]], at = this.att(j), d = this.def(j), p = this.defSpot(s, j, null);
+        c += dist(at.x, at.y, z.x, z.y) + dist(d.x, d.y, p.x, p.y);
+      }
+      return c;
+    };
+    return cost(b) < cost(a) ? b : a;
+  }
+
+  /**
+   * Between possessions everyone runs to a spot of their own side: the attackers to their zones on the arc, the
+   * defenders back to their man (the team that just lost the ball sprints back, it never appears in place).
+   * The ball reaches the new handler in plain sight: he dribbles it out, picks it up under the rim after a
+   * basket, or gets a pass from whoever holds it. Returns when the last player is in place.
+   */
+  private transition(s: Poss): number {
+    const hh = this.att(s.ball);
+    const hz = ZONES[s.zones[s.ball]];
+    let T = this.layout(s, this.shownStance, 0.7, [hh]);
+    this.flight = null;
+    const ballHolder = this.holder;
+    if (ballHolder === hh) {
+      // He already has it: clears it out to the arc, dribbling.
+      T = Math.max(T, this.glide(hh, hz.x, hz.y, 0.7));
+    } else if (ballHolder) {
+      // Someone else holds it (a lesson after a turnover): a pass to the handler, then he walks into his spot.
+      const from = ballHolder;
+      this.later(0.15, () => {
+        this.faceTo(from, hh.x, hh.y);
+        this.play(from, 'Jab', 60);
+        sfx.pass();
+        this.fly(this.hand(from), this.pos3(hh, 1.2), 0.4, 0.45, () => { this.holder = hh; this.glide(hh, hz.x, hz.y, 0.6); });
+      });
+      T = Math.max(T, 0.6 + dist(hh.x, hh.y, hz.x, hz.y) * 1.5 / VMAX + 0.6);
+    } else {
+      // A loose ball (under the rim after a basket): run to it, pick it up, dribble out.
+      const lb = this.looseBall ?? w3(HOOP.x, HOOP.y + 0.5, 0.2);
+      const bx = lb.x + COURT_W / 2, by = lb.z + COURT_H / 2;
+      this.holder = null;
+      this.looseBall = lb.clone().setY(0.2);
+      const l = dist(hh.x, hh.y, bx, by) || 1;
+      const px = bx + ((hh.x - bx) / l) * 0.3, py = by + ((hh.y - by) / l) * 0.3;
+      const t1 = this.glide(hh, px, py, 0.4);
+      this.later(t1, () => {
+        this.holder = hh;
+        this.play(hh, 'Rebound_3', 60);
+        this.later(0.25, () => this.glide(hh, hz.x, hz.y, 0.7));
+      });
+      T = Math.max(T, t1 + 0.25 + Math.max(0.7, (dist(px, py, hz.x, hz.y) * 1.5) / VMAX));
+    }
+    return Math.max(1.0, T + 0.35);
   }
 
   private openDecision() {
@@ -547,15 +645,53 @@ export class Match {
     for (let i = 0; i < 3; i++) { this.faceTo(this.att(i), HOOP.x, HOOP.y); this.faceTo(this.def(i), this.att(i).x, this.att(i).y); }
     this.wander = this.wander.map((_, i) => ({ t: 0.9 + i * 0.7 + Math.random() * 0.6, back: false }));
     // Battle camera: close on the two players facing off; the opponent's tell floats over their player.
-    this.camDuel();
     this.world.clearMarks();
+    this.threatPts = [];
     const tell = this.tell();
     if (tell) {
       const who = this.userAttacks ? this.def(s.ball) : this.att(s.ball);
-      this.world.mark(this.pos3(who, 3.2), icon(tell.icon, 16), `tell ${this.userAttacks ? 'def' : 'att'}`);
+      this.world.mark(this.pos3(who, 3.75), icon(tell.icon, 16), `tell ${this.userAttacks ? 'def' : 'att'}`);
     }
+    if (!this.userAttacks) this.showThreat();
+    this.camDuel();
     this.hooks.decision(true);
     this.pushHud();
+    const news = this.fireNews.filter((t) => this.heat[t] >= FIRE.cost);
+    this.fireNews = [];
+    if (news.length) { if (news.includes(0)) sfx.levelUp(); this.hooks.banner('FIRE READY', '#ffb02e', news.includes(0) ? 'Your specials are on' : 'Their specials are on'); }
+  }
+
+  /**
+   * On defense, before you choose: the attack's most likely move drawn on the floor as a threat (orange dashes
+   * with a warning sign where it ends): the shot at the rim, the pass to a man, the drive to a spot, the cut.
+   * It stays while you browse your options.
+   */
+  private showThreat() {
+    const s = this.poss!;
+    const k = this.tell()?.k;
+    if (!k || !this.attDist) return;
+    const top = this.attDist.filter((x) => x.item.k === k).sort((a, b) => b.w - a.w)[0]?.item;
+    if (!top) return;
+    const W = this.world, h = this.att(s.ball), hz = this.Z(s, s.ball);
+    const end = top.k === 'shoot' ? { x: HOOP.x, y: HOOP.y } : top.k === 'pass' ? this.att(top.to) : ZONES[top.z];
+    this.threatPts = [...this.pts(end)];
+    if (top.k === 'shoot') {
+      const dd = dist(h.x, h.y, HOOP.x, HOOP.y);
+      W.threat(new ArcCurve(this.hand(h, 2.1), RIM.clone().add(new Vector3(0, 0.12, 0)), top.t === 'dunk' || top.t === 'layup' ? 0.35 : shotApex(dd)));
+    } else if (top.k === 'pass') {
+      const to = this.att(top.to);
+      W.threat(new ArcCurve(this.hand(h), this.pos3(to, 1.2), top.t === 'lob' ? 2.2 : 0.35));
+    } else if (top.k === 'drive') {
+      const z = ZONES[top.z];
+      if (z.x === hz.x && z.y === hz.y) W.warnAt(this.pos3(h, 2.4));
+      else W.threat(this.driveCurve(top.t, h.x, h.y, z.x, z.y, this.home(s, s.ball)));
+    } else {
+      const z = ZONES[top.z];
+      const mover = top.t === 'giveandgo' || top.t === 'iso' || top.t === 'handoff' ? s.ball : top.who;
+      const from = this.Z(s, mover);
+      if (top.t === 'iso' || top.t === 'handoff') W.warnAt(this.pos3(this.att(mover), 2.4));
+      else W.threat(this.routeCurve(from.x, from.y, z.x, z.y, this.home(s, mover)));
+    }
   }
 
   // ---------------------------------------------------------------- camera
@@ -570,11 +706,12 @@ export class Match {
     const s = this.poss;
     if (!s) return;
     const P = [...this.pts(this.att(s.ball)), ...this.pts(this.def(s.ball))];
-    this.world.frame(P, 2, 16);
+    // On defense the frame also holds the threat (where the attack is likely to go).
+    this.world.frame(this.userAttacks ? P : [...P, ...this.threatPts], 2, 16);
     if (this.phase === 'decide') this.world.setDuelBox(P);
   }
   /** Frame everything an action involves (the shooter and the rim, the passer and the receiver...). */
-  private focusAct(a: Act) {
+  private focusAct(a: Act, keep = true) {
     const s = this.poss!;
     const h = this.att(s.ball), hd = this.def(s.ball);
     const P: ScenePt[] = [...this.pts(h), ...this.pts(hd)];
@@ -585,7 +722,7 @@ export class Match {
       if (a.t === 'iso' || a.t === 'giveandgo') for (let j = 0; j < 3; j++) P.push(...this.pts(this.att(j)));
       P.push(...this.pts(this.att(a.who)), ...this.pts(this.def(a.who)), ...this.pts(ZONES[a.z]));
     }
-    this.world.frame(P, 2, 14, true);
+    this.world.frame(P, 2, 14, keep);
   }
   /** Frame a defensive move: the duel, plus the rim or the whole team when the move involves them. */
   private focusStance(dm: TechId) {
@@ -1103,7 +1240,10 @@ export class Match {
 
   /**
    * Preview of a combo: every step's route on the court with a numbered badge (1, 2, 3), following the path
-   * where each step works. The camera frames all of it.
+   * where each step works. Routes start from the zones and bend around the defenders' neutral spots: the very
+   * same geometry the play uses on the court. Runs are arrows, the ball is dots (hollow for lobs). Where the
+   * play can fork (pick and roll: feed the roller, or shoot when you come off free) both are drawn, the second
+   * with a dashed badge. The camera frames all of it.
    */
   private previewCombo(c: ComboPlan) {
     const W = this.world;
@@ -1111,65 +1251,65 @@ export class Match {
     let st = this.poss!;
     let prev: Branch | null = null;
     const P: ScenePt[] = [];
-    const at = (j: number, i: number) => (i === 0 ? { x: this.att(j).x, y: this.att(j).y } : ZONES[st.zones[j]]);
+    const at = (j: number) => ZONES[st.zones[j]];
     const g = (q: { x: number; y: number }, h = 0) => w3(q.x, q.y, h);
+    const shotArc = (sh: Pt, t: TechId, alt = false) => {
+      const dd = dist(sh.x, sh.y, HOOP.x, HOOP.y);
+      W.dots(new ArcCurve(g(sh, 2.1), RIM.clone().add(new Vector3(0, 0.12, 0)), t === 'dunk' || t === 'layup' ? 0.35 : shotApex(dd)), '#ffffff', 0.075, 0.34, 0.9, alt ? 'ring' : 'dot');
+      return g(sh, 2.6);
+    };
     for (let i = 0; i < 4; i++) {
       const a = c.next(i, st, prev);
       if (!a) break;
-      const holder = at(st.ball, i);
+      const holder = at(st.ball);
       let mid: Vector3;
       if (a.k === 'cut') {
-        const from = at(a.who, i), z = ZONES[a.z];
+        const from = at(a.who), z = ZONES[a.z];
         if (a.t === 'pnr') {
-          const hd = this.def(st.ball);
-          const scr = { x: hd.x + (holder.x - hd.x) * 0.35, y: hd.y + (holder.y - hd.y) * 0.35 };
-          W.dots(new CatmullRomCurve3([g(from, 0.08), g(scr, 0.08)]), '#ffd166', 0.07, 0.26, 1.2);
+          const scr = this.screenSpot(this.home(st, st.ball), holder);
+          W.dots(new CatmullRomCurve3([g(from, 0.08), g(scr, 0.08)]), '#ffd166', 0.07, 0.26, 1.2, 'chev');
           W.wall(g(scr), new Vector3(0, 0, 1), '#ffd166', 0.8, 1.2, 0.1);
-          W.dots(this.routeCurve(scr.x, scr.y, z.x, z.y, this.def(a.who)), '#7ef0c0', 0.08, 0.3, 1.4);
+          W.dots(this.routeCurve(scr.x, scr.y, z.x, z.y, this.home(st, st.ball)), '#7ef0c0', 0.08, 0.3, 1.4, 'chev');
           mid = g(scr, 0.4);
         } else if (a.t === 'giveandgo') {
-          const p = at(gngPartner(st), i);
+          const p = at(gngPartner(st));
           W.dots(new ArcCurve(g(holder, 1.2), g(p, 1.2), 0.3), '#9be7ff', 0.06, 0.3, 1.3);
-          W.dots(this.routeCurve(holder.x, holder.y, z.x, z.y, this.def(st.ball)), '#7ef0c0', 0.08, 0.3, 1.4);
+          W.dots(this.routeCurve(holder.x, holder.y, z.x, z.y, this.home(st, st.ball)), '#7ef0c0', 0.08, 0.3, 1.4, 'chev');
           W.dots(new ArcCurve(g(p, 1.2), g(z, 1.2), 0.3), '#9be7ff', 0.06, 0.3, 1.3);
           mid = g(p, 0.4);
         } else {
-          const route = a.t === 'backdoor' ? this.backdoorCurve(from.x, from.y, z.x, z.y) : this.routeCurve(from.x, from.y, z.x, z.y, this.def(a.who));
-          W.dots(route, a.t === 'backdoor' ? '#c3a6ff' : '#7ef0c0', 0.08, 0.3, 1.4);
+          const route = a.t === 'backdoor' ? this.backdoorCurve(from.x, from.y, z.x, z.y) : this.routeCurve(from.x, from.y, z.x, z.y, this.home(st, a.who));
+          W.dots(route, a.t === 'backdoor' ? '#c3a6ff' : '#7ef0c0', 0.08, 0.3, 1.4, 'chev');
           mid = route.getPoint(0.5);
         }
         P.push(...this.pts(from), ...this.pts(z));
       } else if (a.k === 'pass') {
-        const to = at(a.to, i);
+        const to = at(a.to);
         const F = g(holder, 1.3);
         if (c.id === 'alley') {
           const near = { x: HOOP.x + (to.x - HOOP.x) * 0.2, y: HOOP.y + (to.y - HOOP.y) * 0.2 };
           const T = g(near, RIM_H + 0.4);
-          if (c.look === 'glass') { const bp = boardPoint(holder.x); W.dots(new ArcCurve(F, bp, 1.2), '#c3a6ff', 0.075, 0.3, 1.1); W.dots(new ArcCurve(bp, T, 0.2), '#c3a6ff', 0.07, 0.2, 1.1); }
-          else W.dots(new ArcCurve(F, T, 2.0), '#c3a6ff', 0.075, 0.3, 1.1);
-          W.dots(new CatmullRomCurve3([g(to, 0.08), g(near, 0.08)]), '#7ef0c0', 0.07, 0.28, 1.4);
+          if (c.look === 'glass') { const bp = boardPoint(holder.x); W.dots(new ArcCurve(F, bp, 1.2), '#c3a6ff', 0.075, 0.3, 1.1, 'ring'); W.dots(new ArcCurve(bp, T, 0.2), '#c3a6ff', 0.07, 0.2, 1.1, 'ring'); }
+          else W.dots(new ArcCurve(F, T, 2.0), '#c3a6ff', 0.075, 0.3, 1.1, 'ring');
+          W.dots(new CatmullRomCurve3([g(to, 0.08), g(near, 0.08)]), '#7ef0c0', 0.07, 0.28, 1.4, 'chev');
           P.push(...this.rimPts());
         } else if (a.t === 'bounce') {
           const B = g(to, 1.1);
           const md = F.clone().lerp(B, 0.55).setY(0.05);
           W.dots(new CatmullRomCurve3([F, F.clone().lerp(md, 0.5).setY(0.6), md, md.clone().lerp(B, 0.5).setY(0.7), B], false, 'catmullrom', 0.1), '#9be7ff', 0.07, 0.3, 1.3);
-        } else W.dots(new ArcCurve(F, g(to, a.t === 'lob' ? 2.2 : 1.2), a.t === 'lob' ? 2.2 : a.t === 'skip' ? 1.5 : 0.35), a.t === 'lob' || a.t === 'skip' ? '#c3a6ff' : '#9be7ff', 0.07, 0.32, 1.3);
+        } else W.dots(new ArcCurve(F, g(to, a.t === 'lob' ? 2.2 : 1.2), a.t === 'lob' ? 2.2 : a.t === 'skip' ? 1.5 : 0.35), a.t === 'lob' || a.t === 'skip' ? '#c3a6ff' : '#9be7ff', 0.07, 0.32, 1.3, a.t === 'lob' || a.t === 'skip' ? 'ring' : 'dot');
         mid = F.clone().lerp(g(to, 1.2), 0.5).setY(1.6);
         P.push(...this.pts(holder), ...this.pts(to));
       } else if (a.k === 'drive') {
         const z = ZONES[a.z];
-        const route = this.driveCurve(a.t, holder.x, holder.y, z.x, z.y, this.def(st.ball));
-        W.dots(route, '#ffd166', 0.09, 0.3, 1.4);
+        const route = this.driveCurve(a.t, holder.x, holder.y, z.x, z.y, this.home(st, st.ball));
+        W.dots(route, '#ffd166', 0.09, 0.3, 1.4, 'chev');
         mid = route.getPoint(0.5);
         P.push(...this.pts(holder), ...this.pts(z));
       } else {
-        const sh = at(st.ball, i);
+        const sh = at(st.ball);
         if (c.id === 'alley') mid = w3(HOOP.x + (sh.x - HOOP.x) * 0.2, HOOP.y + (sh.y - HOOP.y) * 0.2, RIM_H + 1.0);
-        else {
-          const dd = dist(sh.x, sh.y, HOOP.x, HOOP.y);
-          W.dots(new ArcCurve(g(sh, 2.1), RIM.clone().add(new Vector3(0, 0.12, 0)), a.t === 'dunk' || a.t === 'layup' ? 0.35 : shotApex(dd)), '#ffffff', 0.075, 0.34);
-          mid = g(sh, 2.6);
-        }
+        else mid = shotArc(sh, a.t);
         W.ghostBall(RIM.clone().add(new Vector3(0, 0.12, 0)), '#3ddc97');
         W.floorRing(g(sh), '#3ddc97', 0.7);
         P.push(...this.pts(sh), ...this.rimPts());
@@ -1179,6 +1319,14 @@ export class Match {
       const list = branches(m, st, a, 'press');
       const go = list.find((b) => b.ev === 'open' && b.next) ?? list.find((b) => COMBO_GO.has(b.ev) && b.next);
       if (!go || a.k === 'shoot') break;
+      // The other way the play can go on from here (pick and roll: the handler comes off free and shoots).
+      const alt = list.find((b) => b !== go && COMBO_GO.has(b.ev) && b.next);
+      const altAct = alt ? c.next(i + 1, alt.next!, alt) : null;
+      if (alt && altAct && altAct.k === 'shoot' && alt.next!.ball === st.ball) {
+        const sh = this.Z(alt.next!, alt.next!.ball);
+        W.badge(shotArc(sh, altAct.t, true), i + 2, true);
+        P.push(...this.rimPts());
+      }
       prev = go;
       st = go.next!;
     }
@@ -1197,21 +1345,34 @@ export class Match {
     const opt = this.opts.find((o) => o.id === id);
     if (!opt) return;
     // Previews are drawn, not written: routes, rings, the target hand. The numbers live in the command window.
-    const lab = (_k: string, _pos: Vector3) => {};
-    const techTag = (_pos: Vector3) => {
-      if (opt.sp) W.floorRing(this.pos3(this.spActor(opt.act!)), '#ffb02e', 1.1);
-    };
-    const h = this.att(s.ball);
-    const A = this.pos3(h);
-    const toHoop = new Vector3(HOOP.x - h.x, 0, HOOP.y - h.y).normalize();
-    const side = new Vector3(-toHoop.z, 0, toHoop.x);
-    if (opt.dm) { this.previewStance(opt, lab); this.focusStance(opt.dm); return; }
+    if (opt.dm) { this.previewStance(opt); this.focusStance(opt.dm); return; }
     if (opt.combo) { this.previewCombo(opt.combo); return; }
     const a = opt.act!;
     this.focusAct(a);
     const tp = this.targetPos(a);
     if (tp) W.pointAt(tp.x, tp.y);
-    techTag(A.clone().add(new Vector3(0, 3.5, 0)));
+    if (opt.sp) W.floorRing(this.pos3(this.spActor(a)), '#ffb02e', 1.1);
+    this.drawAct(a, opt.odds.some((x) => x.key === 'help'));
+    void s;
+  }
+
+  /**
+   * The route of an attack action on the court: the preview while you choose, and the attacker's intention in
+   * the first beat of a duel. Runs are arrows, the ball is dots (hollow for lobs), the target a double ring,
+   * the defender in the way a dashed ring with a cross. Routes start from the zones and bend around the
+   * defenders' neutral spots, exactly as the play then runs.
+   */
+  private drawAct(a: Act, help: boolean, routeOnly = false) {
+    // The intention (first beat of a duel) is the route alone: no target rings, no defender marks.
+    const R = this.world;
+    const none = () => {};
+    const W: Pick<PixelWorld, 'dots' | 'floorRing' | 'ghostBall' | 'wall'> = routeOnly ? { dots: R.dots.bind(R), floorRing: none, ghostBall: none, wall: none } : R;
+    const s = this.poss!;
+    const lab = (_k: string, _pos: Vector3) => {};
+    const h = this.att(s.ball);
+    const A = this.pos3(h);
+    const toHoop = new Vector3(HOOP.x - h.x, 0, HOOP.y - h.y).normalize();
+    const side = new Vector3(-toHoop.z, 0, toHoop.x);
     switch (a.k) {
       case 'shoot': {
         const D = this.pos3(this.def(s.ball));
@@ -1221,7 +1382,7 @@ export class Match {
         if (a.t === 'fade') {
           // Step back away from the defender, then a higher arc.
           const back = A.clone().addScaledVector(toHoop, -1.0);
-          W.dots(new CatmullRomCurve3([A.clone().setY(0.08), back.clone().setY(0.08)]), '#ffd166', 0.07, 0.25, 1.2);
+          W.dots(new CatmullRomCurve3([A.clone().setY(0.08), back.clone().setY(0.08)]), '#ffd166', 0.07, 0.25, 1.2, 'chev');
           W.floorRing(back, '#ffd166', 0.45, false);
           from = back.clone().setY(2.4);
           W.dots(new ArcCurve(from, target, shotApex(dd) + 0.8), '#ffffff', 0.075, 0.34);
@@ -1232,7 +1393,7 @@ export class Match {
           W.floorRing(w3(HOOP.x, 1.3, 0.02), '#9be7ff', 0.5, false);
         } else if (a.t === 'layup' || a.t === 'dunk') {
           const near = w3(HOOP.x + (h.x - HOOP.x) * 0.35, HOOP.y + (h.y - HOOP.y) * 0.35);
-          W.dots(new CatmullRomCurve3([A.clone().setY(0.08), near.clone().setY(0.08)]), '#ffd166', 0.08, 0.28, 1.4);
+          W.dots(new CatmullRomCurve3([A.clone().setY(0.08), near.clone().setY(0.08)]), '#ffd166', 0.08, 0.28, 1.4, 'chev');
           W.dots(new ArcCurve(near.clone().setY(2.6), target, 0.35), '#ffffff', 0.075, 0.22);
           lab('and1', near.clone().add(new Vector3(0, 1.6, 0)).addScaledVector(side, -1.1));
         } else {
@@ -1254,9 +1415,9 @@ export class Match {
           W.dots(new CatmullRomCurve3([F, F.clone().lerp(mid, 0.5).setY(0.6), mid, mid.clone().lerp(B, 0.5).setY(0.7), B], false, 'catmullrom', 0.1), '#9be7ff', 0.07, 0.3, 1.3);
           W.floorRing(mid, '#9be7ff', 0.3, false);
         } else if (a.t === 'lob') {
-          W.dots(new ArcCurve(F, B, 2.2), '#c3a6ff', 0.075, 0.32, 1.1);
+          W.dots(new ArcCurve(F, B, 2.2), '#c3a6ff', 0.075, 0.32, 1.1, 'ring');
         } else if (a.t === 'skip') {
-          W.dots(new ArcCurve(F, B, 1.5), '#c3a6ff', 0.075, 0.36, 1.2);
+          W.dots(new ArcCurve(F, B, 1.5), '#c3a6ff', 0.075, 0.36, 1.2, 'ring');
         } else if (a.t === 'nolook') {
           W.dots(new ArcCurve(F, B, 0.3), '#ff9be0', 0.06, 0.24, 1.8);
         } else {
@@ -1284,7 +1445,7 @@ export class Match {
         }
         if (a.t === 'stepback') {
           const back = A.clone().addScaledVector(toHoop, -1.1);
-          W.dots(new CatmullRomCurve3([A.clone().setY(0.08), back.clone().setY(0.08)]), '#ffd166', 0.09, 0.25, 1.4);
+          W.dots(new CatmullRomCurve3([A.clone().setY(0.08), back.clone().setY(0.08)]), '#ffd166', 0.09, 0.25, 1.4, 'chev');
           W.floorRing(back, '#3ddc97', 0.55);
           W.floorRing(this.pos3(hd), '#ff4d6d', 0.7, false);
           lab('room', back.clone().add(new Vector3(0, 2.6, 0)));
@@ -1292,15 +1453,15 @@ export class Match {
           lab('steal', this.pos3(hd, 2.5));
           break;
         }
-        const route = this.driveCurve(a.t, h.x, h.y, z.x, z.y, hd);
-        W.dots(route, a.t === 'drive' ? '#ffd166' : '#ffb347', 0.09, 0.3, 1.4);
+        const route = this.driveCurve(a.t, h.x, h.y, z.x, z.y, this.home(s, s.ball));
+        W.dots(route, a.t === 'drive' ? '#ffd166' : '#ffb347', 0.09, 0.3, 1.4, 'chev');
         if (a.t === 'hesi') W.floorRing(route.getPoint(0.4), '#ffffff', 0.35, false);
         W.floorRing(w3(z.x, z.y), '#3ddc97', 0.65);
         W.floorRing(this.pos3(hd), '#ff4d6d', 0.7, false);
         lab('beat', w3(z.x, z.y, 0.5));
         lab('held', A.clone().add(new Vector3(0, 2.7, 0)).addScaledVector(side, -0.7));
         lab('steal', this.pos3(hd, 2.5));
-        if (opt.odds.some((x) => x.key === 'help')) {
+        if (help) {
           const fr = helperFor(s, a.z);
           W.floorRing(this.pos3(this.def(fr)), '#ff9f40', 0.7, false);
           W.floorRing(this.pos3(this.att(fr)), '#3ddc97', 0.75);
@@ -1310,13 +1471,14 @@ export class Match {
       }
       case 'cut': {
         const c = this.att(a.who);
+        const cz = this.Z(s, a.who), hz = this.Z(s, s.ball);
         const z = ZONES[a.z];
         if (a.t === 'pnr') {
           const hd = this.def(s.ball);
-          const scr = this.screenSpot(hd, h);
-          W.dots(new CatmullRomCurve3([this.pos3(c, 0.08), w3(scr.x, scr.y, 0.08)]), '#7ef0c0', 0.07, 0.28, 1.3);
+          const scr = this.screenSpot(this.home(s, s.ball), hz);
+          W.dots(new CatmullRomCurve3([w3(cz.x, cz.y, 0.08), w3(scr.x, scr.y, 0.08)]), '#7ef0c0', 0.07, 0.28, 1.3, 'chev');
           W.wall(w3(scr.x, scr.y), toHoop, '#7ef0c0', 0.8, 1.2, 0.1);
-          W.dots(this.routeCurve(scr.x, scr.y, z.x, z.y, hd), '#7ef0c0', 0.08, 0.3, 1.4);
+          W.dots(this.routeCurve(scr.x, scr.y, z.x, z.y, this.home(s, s.ball)), '#7ef0c0', 0.08, 0.3, 1.4, 'chev');
           W.floorRing(A, '#3ddc97', 0.8);
           W.floorRing(w3(z.x, z.y), '#3ddc97', 0.65);
           lab('beat', A.clone().add(new Vector3(0, 2.8, 0)));
@@ -1329,8 +1491,8 @@ export class Match {
           const zs = isoZones(s);
           for (let j = 0; j < 3; j++) {
             if (j === s.ball || zs[j] === s.zones[j]) continue;
-            const mt = this.att(j), q = ZONES[zs[j]];
-            W.dots(this.routeCurve(mt.x, mt.y, q.x, q.y, this.def(j)), '#7ef0c0', 0.06, 0.3, 1.2);
+            const mt = this.Z(s, j), q = ZONES[zs[j]];
+            W.dots(this.routeCurve(mt.x, mt.y, q.x, q.y, this.home(s, j)), '#7ef0c0', 0.06, 0.3, 1.2, 'chev');
             W.floorRing(w3(q.x, q.y), '#7ef0c0', 0.45, false);
           }
           W.floorRing(A, '#3ddc97', 1.3);
@@ -1341,7 +1503,7 @@ export class Match {
           break;
         }
         if (a.t === 'handoff') {
-          W.dots(this.routeCurve(c.x, c.y, h.x + (c.x - h.x) * 0.25, h.y + (c.y - h.y) * 0.25, this.def(a.who)), '#7ef0c0', 0.08, 0.3, 1.4);
+          W.dots(this.routeCurve(cz.x, cz.y, hz.x + (cz.x - hz.x) * 0.25, hz.y + (cz.y - hz.y) * 0.25, this.home(s, a.who)), '#7ef0c0', 0.08, 0.3, 1.4, 'chev');
           W.floorRing(this.pos3(c), '#3ddc97', 0.8);
           W.floorRing(this.pos3(this.def(a.who)), '#ff4d6d', 0.7, false);
           lab('beat', this.pos3(c, 2.8));
@@ -1351,10 +1513,10 @@ export class Match {
         }
         if (a.t === 'pop') {
           const hd = this.def(s.ball);
-          const scr = this.screenSpot(hd, h);
-          W.dots(new CatmullRomCurve3([this.pos3(c, 0.08), w3(scr.x, scr.y, 0.08)]), '#7ef0c0', 0.07, 0.28, 1.3);
+          const scr = this.screenSpot(this.home(s, s.ball), hz);
+          W.dots(new CatmullRomCurve3([w3(cz.x, cz.y, 0.08), w3(scr.x, scr.y, 0.08)]), '#7ef0c0', 0.07, 0.28, 1.3, 'chev');
           W.wall(w3(scr.x, scr.y), toHoop, '#7ef0c0', 0.8, 1.2, 0.1);
-          W.dots(this.routeCurve(scr.x, scr.y, z.x, z.y, hd), '#c3a6ff', 0.08, 0.3, 1.4);
+          W.dots(this.routeCurve(scr.x, scr.y, z.x, z.y, this.home(s, s.ball)), '#c3a6ff', 0.08, 0.3, 1.4, 'chev');
           W.floorRing(w3(z.x, z.y), '#3ddc97', 0.65);
           lab('open', w3(z.x, z.y, 0.6));
           lab('covered', this.pos3(this.def(a.who), 2.4));
@@ -1365,7 +1527,7 @@ export class Match {
           const mate = this.att(gngPartner(s));
           const M = this.pos3(mate, 1.2);
           W.dots(new ArcCurve(this.hand(h), M, 0.3), '#9be7ff', 0.06, 0.3, 1.3);
-          W.dots(this.routeCurve(h.x, h.y, z.x, z.y, this.def(s.ball)), '#7ef0c0', 0.08, 0.3, 1.4);
+          W.dots(this.routeCurve(hz.x, hz.y, z.x, z.y, this.home(s, s.ball)), '#7ef0c0', 0.08, 0.3, 1.4, 'chev');
           W.dots(new ArcCurve(M, w3(z.x, z.y, 1.2), 0.3), '#9be7ff', 0.06, 0.3, 1.3);
           W.floorRing(w3(z.x, z.y), '#3ddc97', 0.65);
           lab('open', w3(z.x, z.y, 0.6));
@@ -1374,13 +1536,14 @@ export class Match {
           break;
         }
         const cd = this.def(a.who);
-        const route = a.t === 'backdoor' ? this.backdoorCurve(c.x, c.y, z.x, z.y) : this.routeCurve(c.x, c.y, z.x, z.y, cd);
-        W.dots(route, a.t === 'backdoor' ? '#c3a6ff' : '#7ef0c0', 0.08, 0.3, 1.4);
+        const route = a.t === 'backdoor' ? this.backdoorCurve(cz.x, cz.y, z.x, z.y) : this.routeCurve(cz.x, cz.y, z.x, z.y, this.home(s, a.who));
+        W.dots(route, a.t === 'backdoor' ? '#c3a6ff' : '#7ef0c0', 0.08, 0.3, 1.4, 'chev');
         if (a.t === 'screen') {
           const sc = this.att(screenerFor(s, a.who));
-          const spot = this.screenSpot(cd, c);
-          W.dots(new CatmullRomCurve3([this.pos3(sc, 0.08), w3(spot.x, spot.y, 0.08)]), '#ffd166', 0.06, 0.26, 1.2);
-          W.wall(w3(spot.x, spot.y), new Vector3(z.x - c.x, 0, z.y - c.y).normalize(), '#ffd166', 0.8, 1.2, 0.1);
+          const scz = this.Z(s, sc.slot);
+          const spot = this.screenSpot(this.home(s, a.who), cz);
+          W.dots(new CatmullRomCurve3([w3(scz.x, scz.y, 0.08), w3(spot.x, spot.y, 0.08)]), '#ffd166', 0.06, 0.26, 1.2, 'chev');
+          W.wall(w3(spot.x, spot.y), new Vector3(z.x - cz.x, 0, z.y - cz.y).normalize(), '#ffd166', 0.8, 1.2, 0.1);
           lab('slip', this.pos3(sc, 2.6));
         }
         W.floorRing(w3(z.x, z.y), '#3ddc97', 0.65);
@@ -1393,57 +1556,71 @@ export class Match {
     }
   }
 
-  private previewStance(opt: OptionInfo, lab: (k: string, p: Vector3) => void) {
+  /**
+   * Preview of a defensive move, drawn on the court (no text): where your three defenders go (arrows), what the
+   * move covers (a hatched area: cross-hatch for pressure, lines for giving space, diagonals for denying), who
+   * leaves his man to help (a help icon over him), and the risk: what it leaves open (a path of crosses ending
+   * in a crossed ring: the drive past you, or the open shot).
+   */
+  private previewStance(opt: OptionInfo) {
     const s = this.poss!;
     const W = this.world;
     const dm = opt.dm!;
     const st = famOf(dm);
     const color = FAM_COLOR[st];
-    for (let i = 0; i < 3; i++) {
-      const p = this.defSpot(s, i, dm);
-      W.floorRing(w3(p.x, p.y), color, 0.55);
-      const d = this.def(i);
-      W.dots(new CatmullRomCurve3([this.pos3(d, 0.06), w3(p.x, p.y, 0.06)]), color, 0.06, 0.28, 1.2);
-    }
+    const hatch: Hatch = st === 'press' ? 'cross' : st === 'space' ? 'lines' : 'diag';
     const h = this.att(s.ball);
-    const H = this.pos3(h);
-    if (st === 'press') W.floorRing(H, '#f72585', dm === 'hawk' ? 1.6 : 1.25);
-    if (dm === 'hawk') {
-      // Hands in the lanes: arrows from the off-ball defenders toward the passing lanes.
-      for (let j = 0; j < 3; j++) {
-        if (j === s.ball) continue;
-        const a = this.att(j);
-        const mid = { x: (a.x + h.x) / 2, y: (a.y + h.y) / 2 };
-        W.dots(new CatmullRomCurve3([this.pos3(this.def(j), 0.06), w3(mid.x, mid.y, 0.06)]), '#ff4d6d', 0.05, 0.25, 1.6);
-      }
-    }
-    if (st === 'space') W.floorRing(w3(HOOP.x, HOOP.y + 1.4), '#4cc9f0', dm === 'float' ? 2.3 : 1.6, false);
-    if (dm === 'recover') {
-      for (let j = 0; j < 3; j++) {
-        if (j === s.ball) continue;
-        const a = this.att(j);
-        W.dots(new ArcCurve(w3(HOOP.x, HOOP.y + 1.6, 0.06), this.pos3(a, 0.06), 0.25), '#8fe3ff', 0.05, 0.3, 1.2);
-      }
-    }
-    if (st === 'deny') {
-      for (let j = 0; j < 3; j++) {
-        if (j === s.ball) continue;
-        W.dots(new ArcCurve(this.hand(h), this.pos3(this.att(j), 1.2), 0.3), '#ff4d6d', dm === 'jump' ? 0.08 : 0.05, 0.4, 0.6);
-      }
-      if (dm === 'switch') {
-        const ds = [0, 1, 2].filter((j) => j !== s.ball).map((j) => this.defSpot(s, j, dm));
-        W.dots(new ArcCurve(w3(ds[0].x, ds[0].y, 0.06), w3(ds[1].x, ds[1].y, 0.06), 0.4), '#ffd166', 0.06, 0.3, 1.4);
-        W.dots(new ArcCurve(w3(ds[1].x, ds[1].y, 0.06), w3(ds[0].x, ds[0].y, 0.06), 0.8), '#ffd166', 0.06, 0.3, 1.4);
-      }
-    }
     const ob = this.defSpot(s, s.ball, dm);
+    // A strip of floor along a segment (court meters), w wide.
+    const strip = (x0: number, y0: number, x1: number, y1: number, w: number) => {
+      const l = dist(x0, y0, x1, y1) || 1, nx = (-(y1 - y0) / l) * w / 2, ny = ((x1 - x0) / l) * w / 2;
+      return [{ x: x0 + nx, y: y0 + ny }, { x: x1 + nx, y: y1 + ny }, { x: x1 - nx, y: y1 - ny }, { x: x0 - nx, y: y0 - ny }];
+    };
+    // 1. Where your defenders go.
+    for (let i = 0; i < 3; i++) {
+      const p = this.defSpot(s, i, dm), d = this.def(i);
+      if (dist(d.x, d.y, p.x, p.y) > 0.35) W.dots(new CatmullRomCurve3([this.pos3(d, 0.06), w3(p.x, p.y, 0.06)]), '#fff7ea', 0.06, 0.28, 1.2, 'chev');
+      W.floorRing(w3(p.x, p.y), '#fff7ea', 0.45, false);
+    }
+    // 2. What it covers.
+    const mates = [0, 1, 2].filter((j) => j !== s.ball);
+    if (dm === 'press') W.disc(h.x, h.y, 1.3, color, hatch);
+    else if (dm === 'hawk') {
+      W.disc(h.x, h.y, 1.0, color, hatch);
+      for (const j of mates) { const a = this.att(j); W.area(strip(h.x + (a.x - h.x) * 0.2, h.y + (a.y - h.y) * 0.2, h.x + (a.x - h.x) * 0.55, h.y + (a.y - h.y) * 0.55, 0.8), color, hatch); }
+    } else if (dm === 'contest') {
+      const l = dist(h.x, h.y, ob.x, ob.y) || 1;
+      W.area(strip(ob.x, ob.y, h.x + ((h.x - ob.x) / l) * 0.3, h.y + ((h.y - ob.y) / l) * 0.3, 1.3), color, hatch);
+    } else if (dm === 'space') W.area(strip(ob.x, ob.y, HOOP.x, HOOP.y + 0.6, 2.6), color, hatch);
+    else if (dm === 'rim') W.disc(HOOP.x, HOOP.y + 0.9, 1.6, color, hatch);
+    else if (dm === 'charge') W.disc(ob.x, ob.y, 0.7, color, hatch);
+    else for (const j of mates) { const a = this.att(j); W.area(strip(h.x + (a.x - h.x) * 0.15, h.y + (a.y - h.y) * 0.15, h.x + (a.x - h.x) * 0.85, h.y + (a.y - h.y) * 0.85, 1.0), color, hatch); }
+    // The move's own marks: a hand up (contest), a wall at the rim (block), a planted spot (charge).
     const toward = new Vector3(HOOP.x - h.x, 0, HOOP.y - h.y).normalize();
-    if (dm === 'contest') W.wall(w3(ob.x, ob.y), toward, '#ff4d6d', 1.0, 0.9, 2.4);
-    if (dm === 'rim') { W.wall(w3(HOOP.x, HOOP.y + 0.9), toward, '#4cc9f0', 1.2, 0.9, 2.8); W.floorRing(w3(HOOP.x, HOOP.y + 0.9), '#4cc9f0', 1.1, false); }
-    if (dm === 'charge') { W.wall(w3(ob.x, ob.y), toward, '#ffd166', 1.1, 1.2, 0.15); W.dots(new CatmullRomCurve3([H.clone().setY(0.08), w3(ob.x, ob.y, 0.08)]), '#ffd166', 0.07, 0.3, 1.2); }
-    lab('ball', H.clone().add(new Vector3(0, 2.9, 0)));
-    lab('beat', RIM.clone().add(new Vector3(0, 0.75, 0)));
-    lab('held', H.clone().add(new Vector3(1.3, 1.6, 0)));
+    if (dm === 'contest') W.wall(w3(ob.x, ob.y), toward, '#fff7ea', 1.0, 0.9, 2.4);
+    if (dm === 'rim') W.wall(w3(HOOP.x, HOOP.y + 0.9), toward, '#fff7ea', 1.2, 0.9, 2.8);
+    if (dm === 'charge') W.wall(w3(ob.x, ob.y), toward, '#fff7ea', 1.1, 1.2, 0.15);
+    // 3. Who helps: off-ball defenders who leave their man (give space sags to the paint, deny and steal jump the lanes).
+    if (st !== 'press' || dm === 'hawk') {
+      for (const j of mates) {
+        const p = this.defSpot(s, j, dm), d = this.def(j);
+        if (dist(d.x, d.y, p.x, p.y) < 0.6 && dm !== 'hawk') continue;
+        W.label({ pos: w3(p.x, p.y, 2.4), html: icon(st === 'space' ? 'help' : 'steal', 16), cls: 'help' });
+      }
+    }
+    // 4. The risk: what this move leaves open.
+    const hz = this.Z(s, s.ball);
+    if (RISK[dm] === 'drive') {
+      // The drive past you to the rim, on the side you leave.
+      const end = { x: HOOP.x + (hz.x - HOOP.x) * 0.25, y: HOOP.y + (hz.y - HOOP.y) * 0.25 };
+      W.dots(this.routeCurve(hz.x, hz.y, end.x, end.y, ob), '#ff4d6d', 0.08, 0.3, 1.2, 'x');
+      W.floorRing(w3(end.x, end.y), '#ff4d6d', 0.6, false);
+    } else {
+      // The open shot: the shooter has room (crossed ring at his feet) and a clear arc to the rim.
+      const dd = dist(h.x, h.y, HOOP.x, HOOP.y);
+      W.dots(new ArcCurve(this.hand(h, 2.1), RIM.clone().add(new Vector3(0, 0.12, 0)), shotApex(dd)), '#ff4d6d', 0.075, 0.34, 0.9, 'x');
+      W.floorRing(this.pos3(h), '#ff4d6d', 0.9, false);
+    }
   }
 
   /** Destination rings for a category and technique (tap targets in the world). */
@@ -1514,12 +1691,19 @@ export class Match {
     this.onPick?.(p.x, p.y);
   };
 
+  /**
+   * Fixed reference points of a decision: the zone of each attacker and the neutral spot of each defender. Every
+   * route is drawn from them, in the preview and on the court, so the path you see is the path that is played.
+   */
+  private home(s: Poss, j: number): Pt { return this.defSpot(s, j, null); }
+  private Z(s: Poss, j: number): Pt { return ZONES[s.zones[j]]; }
+
   /** Spot where a screener stands: on the defender's side, between defender and the player screened for. */
-  private screenSpot(def: Ent, forWho: Ent) {
+  private screenSpot(def: Pt, forWho: Pt) {
     return { x: def.x + (forWho.x - def.x) * 0.35, y: def.y + (forWho.y - def.y) * 0.35 };
   }
 
-  private driveCurve(t: TechId, x0: number, y0: number, x1: number, y1: number, around: Ent): Curve<Vector3> {
+  private driveCurve(t: TechId, x0: number, y0: number, x1: number, y1: number, around: Pt): Curve<Vector3> {
     if (t === 'cross') {
       // Fake one way, go the other: a zigzag start.
       const mid = this.routeMid(x0, y0, x1, y1, around);
@@ -1551,7 +1735,7 @@ export class Match {
     return new CatmullRomCurve3([w3(x0, y0, 0.08), w3(mid.x, Math.max(0.6, mid.y), 0.08), w3(x1, y1, 0.08)]);
   }
 
-  private routeCurve(x0: number, y0: number, x1: number, y1: number, around: Ent) {
+  private routeCurve(x0: number, y0: number, x1: number, y1: number, around: Pt) {
     const mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
     const dx = x1 - x0, dy = y1 - y0;
     const l = Math.hypot(dx, dy) || 1;
@@ -1566,7 +1750,7 @@ export class Match {
     return new CatmullRomCurve3(pts);
   }
 
-  private routeMid(x0: number, y0: number, x1: number, y1: number, around: Ent) {
+  private routeMid(x0: number, y0: number, x1: number, y1: number, around: Pt) {
     const mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
     const dx = x1 - x0, dy = y1 - y0;
     const l = Math.hypot(dx, dy) || 1;
@@ -1628,7 +1812,7 @@ export class Match {
     this.world.setDuelBox(null);
     this.hooks.decision(false);
     this.phase = 'resolve';
-    this.focusAct(act);
+    this.focusAct(act, false);
     this.resolve(s, act, dm, b);
   }
 
@@ -1638,7 +1822,8 @@ export class Match {
     const fd = fireDelta(ev);
     this.heat[off] = clamp(this.heat[off] + fd.att, 0, FIRE.max);
     this.heat[1 - off] = clamp(this.heat[1 - off] + fd.def, 0, FIRE.max);
-    for (const t of [0, 1] as const) if (this.heat[t] >= FIRE.cost && before[t] < FIRE.cost) this.later(1.4, () => { if (t === 0) sfx.levelUp(); this.hooks.banner('FIRE READY', '#ffb02e', t === 0 ? 'Your specials are on' : 'Their specials are on'); });
+    // Told at the next decision, never over the play (the ball stays in view).
+    for (const t of [0, 1] as const) if (this.heat[t] >= FIRE.cost && before[t] < FIRE.cost && !this.fireNews.includes(t)) this.fireNews.push(t);
   }
 
   /** Tone of an event from the human's side. */
@@ -1673,12 +1858,12 @@ export class Match {
     this.phase = 'resolve';
     // The defense shows its move; the play's name pops over the handler.
     const hd = this.def(s.ball);
-    this.world.callout(this.pos3(hd, 2.8), `${icon(TECHS[dm0].icon, 24)}<small>${defName(dm0).toUpperCase()}</small>`, `move ${famOf(dm0)}`);
-    this.layout(s, dm0, 0.4, s.adv.map((x, i) => (x > 0 ? this.def(i) : null)).filter((x): x is Ent => !!x));
+    this.world.callout(this.pos3(hd, 2.5), icon(TECHS[dm0].icon, 24), `move ${famOf(dm0)}`);
+    const Tr = this.layout(s, dm0, 0.4, s.adv.map((x, i) => (x > 0 ? this.def(i) : null)).filter((x): x is Ent => !!x));
     sfx.duel();
     // The play's name over the main teammate (the defense's move sits over the handler's defender).
-    this.later(0.2, () => this.world.callout(this.pos3(this.att(c.mate), 3.0), `${icon(COMBOS[c.id].icon, 22)}<small>${COMBOS[c.id].name.toUpperCase()}</small>`, 'tech'));
-    this.later(0.6, () => this.comboStep(s, 0, null));
+    this.later(0.2, () => this.world.callout(this.pos3(this.att(c.mate), 2.5), icon(COMBOS[c.id].icon, 24), 'tech'));
+    this.later(Math.max(0.6, Tr + 0.2), () => this.comboStep(s, 0, null));
   }
 
   /** One step of the running combo. */
@@ -1702,21 +1887,35 @@ export class Match {
       this.applyFire(b2.ev);
       this.endCombo(b.next!, nextAct, dm2, b2);
       this.focusAll([this.att(s.ball), this.att(act.to)], true);
+      this.stepMark(act, i);
       const blocker = this.showReaction(b.next!, nextAct, dm2, dm);
-      this.later(blocker ? 0.3 : 0, () => this.animateAlley(s, act, b, b.next!, nextAct, dm2, b2, blocker ?? undefined));
+      this.later(blocker ? this.reactWait : 0, () => this.animateAlley(s, act, b, b.next!, nextAct, dm2, b2, blocker ?? undefined));
       return;
     }
     if (!nextAct) this.endCombo(s, act, dm, b);
     else this.lastRes = { act, dm, ev: b.ev, text: explain(act, dm, b, true) };
     const done = nextAct ? () => this.comboStep(b.next!, i + 1, b) : () => this.afterAction(b);
-    this.focusAct(act);
+    this.focusAct(act, false);
+    this.stepMark(act, i);
     const changed = i > 0 && dm !== run.dmPrev;
     const blocker = changed ? this.showReaction(s, act, dm, run.dmPrev) : null;
     run.dmPrev = dm;
-    this.later(changed ? 0.3 : 0, () => {
+    this.later(changed ? this.reactWait : 0, () => {
       this.chain = { final: !nextAct, done };
       this.animateAction(s, act, dm, b, this.toneOf(b.ev), { blocker: blocker ?? undefined });
     });
+  }
+
+  /**
+   * The step of a combo that is about to play: its route (the same one the numbered preview drew) and its
+   * number over the player who does it, so the play on the court reads 1, 2, 3 like the preview.
+   */
+  private stepMark(act: Act, i: number) {
+    const s = this.poss!;
+    this.world.clearPreview();
+    this.drawAct(act, false, true);
+    const who = act.k === 'cut' && act.t !== 'giveandgo' ? this.att(act.who) : this.att(s.ball);
+    this.world.badge(this.pos3(who, 3.0), i + 1);
   }
 
   /** Last step of a combo: the result card names the play. */
@@ -1739,14 +1938,15 @@ export class Match {
    */
   private showReaction(s: Poss, act: Act, dm: TechId, before: TechId): Ent | null {
     const word = REACT_WORD[dm];
+    this.reactWait = 0.3;
     if (!word || dm === before) return null;
     if (dm === 'rim' && act.k === 'shoot') {
       // Help at the rim: the defender nearest the hoop (not the shooter's own) slides over to block.
       const own = this.def(s.ball);
       const helper = [0, 1, 2].map((j) => this.def(j)).filter((d) => d !== own).sort((a, b) => dist(a.x, a.y, HOOP.x, HOOP.y) - dist(b.x, b.y, HOOP.x, HOOP.y))[0];
       const sh = this.att(s.ball);
-      this.glide(helper, HOOP.x + (sh.x - HOOP.x) * 0.25, HOOP.y + (sh.y - HOOP.y) * 0.25 + 0.3, 0.35);
-      helper.fast = true;
+      const t = this.glide(helper, HOOP.x + (sh.x - HOOP.x) * 0.25, HOOP.y + (sh.y - HOOP.y) * 0.25 + 0.3, 0.35);
+      this.reactWait = Math.max(0.3, t - 0.3);
       this.world.callout(this.pos3(helper, 2.8), `${icon(TECHS.rim.icon, 22)}<small>${word}</small>`, 'move space');
       pxsfx.squeak();
       return helper;
@@ -1761,7 +1961,7 @@ export class Match {
       // The defenders swap men: the screener's defender takes the cutter.
       const other = [0, 1, 2].find((j) => j !== s.ball && j !== act.who);
       const a = this.def(act.who), b = other !== undefined ? this.def(other) : null;
-      if (b) { const ax = a.x, ay = a.y; this.glide(a, b.x, b.y, 0.4); this.glide(b, ax, ay, 0.4); }
+      if (b) { const ax = a.x, ay = a.y; const t = Math.max(this.glide(a, b.x, b.y, 0.4), this.glide(b, ax, ay, 0.4)); this.reactWait = Math.max(0.3, t - 0.2); }
       this.world.callout(this.pos3(a, 2.8), `${icon(TECHS.switch.icon, 22)}<small>${word}</small>`, 'move deny');
       pxsfx.squeak();
       return null;
@@ -1805,7 +2005,7 @@ export class Match {
     const catchPt = w3(near.x, near.y, RIM_H + 0.35);
     const onCatch = () => {
       this.shooter = j;
-      this.world.callout(this.pos3(j, 3.4), `${icon('t_lob', 22)}<small>${glass ? 'OFF THE GLASS' : 'ALLEY-OOP'}</small>`, 'tech');
+      this.world.callout(this.pos3(j, 3.2), icon('t_lob', 24), 'tech');
       this.chain = { final: true, done: () => this.afterAction(b2) };
       this.poss = s1;
       this.animateAction(s1, fin, dm2, b2, tone2, { lead0: true, blocker, alley: true });
@@ -1852,12 +2052,16 @@ export class Match {
       return attGood === userAtt ? 'good' : 'bad';
     };
     const t = tone(b.ev);
-    // 1. Reveal the defensive move: the defense slides into it, its icon pops over the on-ball defender.
+    // Beat 1, anticipation: the defense moves into its move (its icon over the on-ball defender) and the
+    // attacker shows what he goes for: the route of his move on the floor and its icon over him. Nothing
+    // happens until everyone is in place.
     const onBallDef = this.def(s.ball);
     const st = famOf(dm);
-    this.world.callout(this.pos3(onBallDef, 2.8), `${icon(TECHS[dm].icon, 24)}<small>${defName(dm).toUpperCase()}</small>`, `move ${st}`);
-    this.layout({ ...s, adv: s.adv }, dm, 0.4, s.adv.map((x, i) => (x > 0 ? this.def(i) : null)).filter((x): x is Ent => !!x));
+    this.world.callout(this.pos3(onBallDef, 2.5), icon(TECHS[dm].icon, 24), `move ${st}`);
+    const T = this.layout({ ...s, adv: s.adv }, dm, 0.4, s.adv.map((x, i) => (x > 0 ? this.def(i) : null)).filter((x): x is Ent => !!x));
     sfx.duel();
+    this.drawAct(act, false, true);
+    const ready = Math.max(0.85, T + 0.3);
     // 2. A special: cut-in card and speed lines, then the action in slow motion with fire.
     if (act.sp) {
       const sd = SPECIALS[act.sp];
@@ -1867,8 +2071,9 @@ export class Match {
       this.world.cutInLines(0.8);
       this.world.aura(actor.i, sd.fx, 3.2);
       sfx.levelUp();
-      const pre = this.o.reduceFx ? 0.6 : 1.1;
+      const pre = Math.max(ready, this.o.reduceFx ? 0.6 : 1.1);
       this.later(pre, () => {
+        this.world.clearPreview();
         this.world.cinematic(actor.x, actor.y, 1.4, 1.5);
         if (!this.o.reduceFx) this.slow = 0.9;
         this.world.ballTrail(sd.fx);
@@ -1881,12 +2086,11 @@ export class Match {
       });
       return;
     }
-    // 2. The technique name over the attacker, then the action.
-    if (!TECHS[act.t].base) {
-      const who = act.k === 'cut' && act.t !== 'giveandgo' ? this.att(act.who) : this.att(s.ball);
-      this.later(0.25, () => this.world.callout(this.pos3(who, 3.1), `${icon(TECHS[act.t].icon, 22)}<small>${TECHS[act.t].name.toUpperCase()}</small>`, 'tech'));
-    }
-    this.later(0.5, () => this.animateAction(s, act, dm, b, t));
+    // The attacker's move over him (its icon), then beat 2: the action.
+    const who = act.k === 'cut' && act.t !== 'giveandgo' && act.t !== 'iso' && act.t !== 'handoff' ? this.att(act.who) : this.att(s.ball);
+    const zk = ZONES[s.zones[s.ball]].kind;
+    this.later(0.25, () => this.world.callout(this.pos3(who, 2.5), icon(moveIcon(act.t, act.k === 'shoot' ? zk : undefined), 24), 'tech'));
+    this.later(ready, () => { this.world.clearPreview(); this.animateAction(s, act, dm, b, t); });
   }
 
   private animateAction(s: Poss, act: Act, dm: TechId, b: Branch, tone: Tone, opts: AnimOpts = {}) {
@@ -1979,10 +2183,12 @@ export class Match {
             this.world.shake = dunk ? 0.5 : 0.3;
             this.world.burst(hd.x, hd.y, 2.6, 'spark', dunk ? 0.8 : 0.5);
             if (!this.o.reduceFx) this.slow = Math.max(this.slow, 0.35);
-            this.world.callout(this.pos3(hd, 3.0), `${icon('block', 30)}<small>${dunk ? 'STUFFED' : 'BLOCKED'}</small>`, tone);
-            const away = { x: clamp(h.x + (h.x - HOOP.x) * 0.25, 1, COURT_W - 1), y: clamp(h.y + 1.8, 1, COURT_H - 1) };
-            this.fly(from, w3(away.x, away.y, 0.9), 0.8, 0.5, () => { this.holder = hd; });
-            this.later(0.3, () => { this.faceTo(hd, away.x, away.y); this.glide(hd, away.x, away.y, 0.25); this.later(0.25, () => this.play(hd, 'Rebound_3', 70)); });
+            this.decisive(hd, 'block', tone, dunk ? 'STUFFED' : 'BLOCKED', 0.55);
+            // The ball drops a step behind the blocker (away from the rim): he turns and takes it.
+            const bl = dist(hd.x, hd.y, HOOP.x, HOOP.y) || 1;
+            const away = { x: clamp(hd.x + ((hd.x - HOOP.x) / bl) * 1.3, 1, COURT_W - 1), y: clamp(hd.y + ((hd.y - HOOP.y) / bl) * 1.3 + 0.3, 1, COURT_H - 1) };
+            this.fly(from, w3(away.x, away.y, 0.9), 0.8, 0.6, () => { this.holder = hd; });
+            this.later(0.2, () => { this.faceTo(hd, away.x, away.y); this.glide(hd, away.x, away.y, 0.3); this.later(0.3, () => this.play(hd, 'Rebound_3', 70)); });
             say(0.6); next(1.9);
           } else if (b.ev === 'make' || b.ev === 'and1') {
             viaBoard(RIM.clone().add(new Vector3(0, 0.12, 0)), () => {
@@ -2000,6 +2206,7 @@ export class Match {
               else if (pts > 1) this.world.burst(HOOP.x, HOOP.y, RIM_H, 'spark', 0.5);
               const word = b.ev === 'and1' ? 'AND ONE' : opts.alley ? 'ALLEY-OOP' : dunk ? 'SLAM' : pts > 1 ? 'SPLASH' : '';
               this.world.callout(RIM.clone().add(new Vector3(0, 0.9, 0)), `+${pts}${word ? `<small>${word}</small>` : ''}`, h.team === 0 ? 'good big' : 'bad big');
+              this.freeze = Math.max(this.freeze, 0.35);
               this.pushHud();
               this.celebrate(h);
               // And-one: the free throw after the foul (the pack's Free_Throw).
@@ -2059,7 +2266,10 @@ export class Match {
           say(0.8 + wait); next(1.8 + wait);
         } else {
           const thief = this.def(act.to);
-          const lp = { x: h.x + (to.x - h.x) * 0.6, y: h.y + (to.y - h.y) * 0.6 };
+          // He jumps the lane at the point of the pass nearest him (he gets there before the ball does).
+          const tx = to.x - h.x, ty = to.y - h.y, L2 = tx * tx + ty * ty || 1;
+          const kk = clamp(((thief.x - h.x) * tx + (thief.y - h.y) * ty) / L2, 0.45, 0.85);
+          const lp = { x: h.x + tx * kk, y: h.y + ty * kk };
           this.later(wait * 0.5, () => { this.glide(thief, lp.x, lp.y, 0.3); this.play(thief, act.t === 'lob' ? 'Block_1' : 'Steal', 60); });
           this.jump(thief, act.t === 'lob' ? 0.7 : 0.35, 0.45);
           thief.armsT = 0.4;
@@ -2067,8 +2277,8 @@ export class Match {
             sfx.steal();
             this.holder = thief;
             this.lines[thief.pl.uid].steals++;
-            this.world.callout(this.pos3(thief, 2.7), icon('steal', 28), tone);
-          }, 0.6);
+            this.decisive(thief, 'steal', tone);
+          }, kk);
           say(0.8 + wait); next(1.9 + wait);
         }
         break;
@@ -2081,15 +2291,15 @@ export class Match {
           if (b.ev === 'room') {
             this.later(0.15, () => { this.play(hd, dm === 'contest' ? 'Block_2' : 'Block_1', 70); this.jump(hd, dm === 'rim' || dm === 'contest' ? 0.8 : 0.6, 0.6); hd.armsT = 0.6; });
             this.later(0.5, () => this.world.burst(hd.x, hd.y, 0.2, 'wind', 0.4));
-            this.later(0.7, () => { hd.daze = 1.4; this.world.callout(this.pos3(h, 2.7), icon('t_pump', 26), tone); });
+            this.later(0.7, () => { hd.daze = 1.4; this.decisive(h, 't_pump', tone, '', 0.35); });
           } else if (b.ev === 'steal') {
             this.later(0.2, () => this.play(hd, 'Steal', 60));
             this.later(0.35, () => {
               sfx.steal();
               hd.armsT = 0.3;
-              this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone); });
+              this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.decisive(hd, 'steal', tone); });
             });
-          } else this.later(0.5, () => this.world.callout(this.pos3(h, 2.5).lerp(this.pos3(hd, 2.5), 0.5), icon('even', 26), 'mid'));
+          } else this.later(0.5, () => this.decisive(hd, 'even', 'mid', '', 0.3));
           say(0.9); next(1.9);
           break;
         }
@@ -2101,13 +2311,13 @@ export class Match {
           this.later(0.2, () => this.glide(h, back.x, back.y, 0.3));
           if (b.ev === 'room') {
             hd.daze = 1.4;
-            this.later(0.5, () => this.world.callout(this.pos3(h, 2.7), icon('t_stepback', 26), tone));
+            this.later(0.5, () => this.decisive(h, 't_stepback', tone, '', 0.35));
           } else if (b.ev === 'steal') {
             this.later(0.15, () => this.play(hd, 'Steal', 60));
             this.later(0.3, () => {
               sfx.steal();
               hd.armsT = 0.3;
-              this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone); });
+              this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.decisive(hd, 'steal', tone); });
             });
           } else {
             this.later(0.45, () => { const p = this.defSpot(s, s.ball, 'press'); this.glide(hd, p.x + (back.x - h.x), p.y + (back.y - h.y), 0.3); });
@@ -2116,10 +2326,11 @@ export class Match {
           break;
         }
         if (b.ev === 'charge') { this.animateCharge(s, h, hd, tone, say, next, false, act.z); break; }
-        const route = this.driveCurve(act.t, h.x, h.y, z.x, z.y, hd);
+        const route = this.driveCurve(act.t, h.x, h.y, z.x, z.y, this.home(s, s.ball));
         const along = (dur: number, until = 1, delay = 0) => {
           const start = { k0: 0 };
-          const go = () => { h.anim = { t: 0, dur, path: (k) => { const p = route.getPoint(start.k0 + (until - start.k0) * ease(k)); return { x: p.x + COURT_W / 2, y: p.z + COURT_H / 2 }; } }; };
+          dur = Math.max(dur, (route.getLength() * (until - 0) * 1.5) / VMAX);
+          const go = () => { h.anim = { t: 0, dur, path: (k) => { const p = route.getPointAt(start.k0 + (until - start.k0) * ease(k)); return { x: p.x + COURT_W / 2, y: p.z + COURT_H / 2 }; } }; };
           if (delay) this.later(delay, go); else go();
         };
         // Dribble move on the sprite; the base drive is a sprint with the ball.
@@ -2138,8 +2349,10 @@ export class Match {
           if (act.t === 'backdown') this.later(0.75, () => this.play(h, 'Back_Dribble', 110));
           if (act.t === 'hesi') {
             // Go, freeze, go again.
-            h.anim = { t: 0, dur: 0.3, path: (k) => { const p = route.getPoint(0.4 * ease(k)); return { x: p.x + COURT_W / 2, y: p.z + COURT_H / 2 }; } };
-            this.later(0.55, () => { h.anim = { t: 0, dur: 0.45, path: (k) => { const p = route.getPoint(0.4 + 0.6 * ease(k)); return { x: p.x + COURT_W / 2, y: p.z + COURT_H / 2 }; } }; });
+            // Go, freeze, go again (along the drawn route, never faster than a sprint).
+            const L = route.getLength(), t1 = Math.max(0.3, (0.4 * L * 1.5) / VMAX), t2 = Math.max(0.45, (0.6 * L * 1.5) / VMAX);
+            h.anim = { t: 0, dur: t1, path: (k) => { const p = route.getPointAt(0.4 * ease(k)); return { x: p.x + COURT_W / 2, y: p.z + COURT_H / 2 }; } };
+            this.later(t1 + 0.25, () => { h.anim = { t: 0, dur: t2, path: (k) => { const p = route.getPointAt(0.4 + 0.6 * ease(k)); return { x: p.x + COURT_W / 2, y: p.z + COURT_H / 2 }; } }; });
           } else along(act.t === 'spin' ? 0.95 : act.t === 'backdown' ? 1.3 : 0.75);
           if (b.ev === 'beat') {
             hd.daze = 1.6;
@@ -2152,7 +2365,7 @@ export class Match {
               this.later(0.3, () => { this.world.burst(hd.x, hd.y, 0.1, 'wind', 0.6); this.world.shake = 0.15; if (!this.o.reduceFx) this.slow = Math.max(this.slow, 0.3); });
             }
             if (act.t === 'backdown') this.later(0.6, () => { this.world.burst(hd.x, hd.y, 0.1, 'quake', 0.5); this.world.shake = 0.25; });
-            this.later(0.4, () => this.world.callout(this.pos3(h, 2.7), `${icon(TECHS[act.t].icon, 28)}${handle ? '<small>ANKLES</small>' : ''}`, tone));
+            this.later(0.4, () => this.decisive(h, TECHS[act.t].icon, tone, handle ? 'ANKLES' : '', 0.35));
           } else {
             const p = this.defSpot({ ...s, zones: s.zones.map((x, j) => (j === s.ball ? act.z : x)) }, s.ball, 'press');
             this.glide(hd, p.x, p.y, 0.75);
@@ -2170,7 +2383,7 @@ export class Match {
           this.glide(h, p.x, p.y, 0.3);
           this.glide(hd, hd.x + (p.x - hd.x) * 0.4, hd.y + (p.y - hd.y) * 0.4, 0.3);
           this.later(0.3, () => { h.fast = false; this.play(h, 'Jab', 60); });
-          this.later(0.35, () => { sfx.clash(); this.glide(h, ZONES[s.zones[s.ball]].x, ZONES[s.zones[s.ball]].y, 0.35); this.world.callout(this.pos3(h, 2.5).lerp(this.pos3(hd, 2.5), 0.5), icon('even', 26), 'mid'); });
+          this.later(0.35, () => { sfx.clash(); this.glide(h, ZONES[s.zones[s.ball]].x, ZONES[s.zones[s.ball]].y, 0.35); this.decisive(hd, 'even', 'mid', '', 0.3); });
           say(0.8); next(1.8);
         } else {
           along(0.3, 0.3);
@@ -2184,7 +2397,7 @@ export class Match {
             this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => {
               this.holder = hd;
               this.lines[hd.pl.uid].steals++;
-              this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone);
+              this.decisive(hd, 'steal', tone);
             });
           });
           say(0.8); next(1.9);
@@ -2196,59 +2409,61 @@ export class Match {
         if (act.t === 'pnr') {
           const sc = this.att(act.who);
           const scd = this.def(act.who);
-          const spot = this.screenSpot(hd, h);
-          this.glide(sc, spot.x, spot.y, 0.4);
-          this.glide(scd, spot.x + 0.5, spot.y + 0.3, 0.45);
-          this.later(0.45, () => {
+          const spot = this.screenSpot(this.home(s, s.ball), this.Z(s, s.ball));
+          const tS = Math.max(this.glide(sc, spot.x, spot.y, 0.4), this.glide(scd, spot.x + 0.5, spot.y + 0.3, 0.45));
+          const x0 = Math.max(0, tS - 0.45);
+          this.later(0.45 + x0, () => {
             // The handler comes off the screen, the screener rolls.
             const off = { x: h.x + (HOOP.x - h.x) * 0.15 + (spot.x > h.x ? -0.7 : 0.7), y: h.y + (HOOP.y - h.y) * 0.15 };
             this.glide(h, off.x, off.y, 0.4);
-            this.glide(sc, z.x, z.y, 0.6, this.routeMid(spot.x, spot.y, z.x, z.y, scd));
+            this.glide(sc, z.x, z.y, 0.6, this.routeMid(spot.x, spot.y, z.x, z.y, this.home(s, s.ball)));
             if (b.ev === 'beat') { hd.daze = 1.4; this.later(0.4, () => this.world.callout(this.pos3(h, 2.7), icon('check', 24), tone)); }
             else if (b.ev === 'open') { scd.daze = 1.2; this.later(0.6, () => this.world.callout(this.pos3(sc, 2.6), icon('check', 24), tone)); }
             else if (b.ev === 'steal') {
               hd.armsT = 0.3;
               this.play(hd, 'Steal', 60);
-              this.later(0.2, () => { sfx.steal(); this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone); }); });
+              this.later(0.2, () => { sfx.steal(); this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.decisive(hd, 'steal', tone); }); });
             } else {
               const p = this.defSpot({ ...s, zones: s.zones.map((x, j) => (j === act.who ? act.z : x)) }, act.who, 'press');
               this.glide(scd, p.x, p.y, 0.6);
               if (dm === 'switch') this.world.callout(this.pos3(hd, 2.6).lerp(this.pos3(scd, 2.6), 0.5), icon('t_switch', 24), 'mid');
             }
           });
-          say(1.2); next(2.3);
+          say(1.2 + x0); next(2.3 + x0);
           break;
         }
         if (act.t === 'iso') {
           const zs = isoZones(s);
           for (let j = 0; j < 3; j++) {
             if (j === s.ball || zs[j] === s.zones[j]) continue;
-            const q = ZONES[zs[j]];
-            this.glide(this.att(j), q.x, q.y, 0.7, this.routeMid(this.att(j).x, this.att(j).y, q.x, q.y, this.def(j)));
+            const q = ZONES[zs[j]], from = this.Z(s, j);
+            this.glide(this.att(j), q.x, q.y, 0.7, this.routeMid(from.x, from.y, q.x, q.y, this.home(s, j)));
             const dp = this.defSpot({ ...s, zones: zs }, j, null);
             this.later(0.1, () => this.glide(this.def(j), dp.x, dp.y, 0.7));
           }
           this.later(0.5, () => this.play(h, 'Pocket_Dribble', 90));
           this.later(0.9, () => {
-            if (b.ev === 'room') { this.play(h, 'Crossover', 80); hd.daze = 1.4; this.glide(hd, hd.x + (h.x - hd.x) * -0.3, hd.y + 0.6, 0.4); this.later(0.4, () => this.world.callout(this.pos3(h, 2.7), icon('t_iso', 26), tone)); }
+            if (b.ev === 'room') { this.play(h, 'Crossover', 80); hd.daze = 1.4; this.glide(hd, hd.x + (h.x - hd.x) * -0.3, hd.y + 0.6, 0.4); this.later(0.4, () => this.decisive(h, 't_iso', tone, '', 0.35)); }
             else if (b.ev === 'steal') {
               this.play(hd, 'Steal', 60); hd.armsT = 0.3;
-              this.later(0.2, () => { sfx.steal(); this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone); }); });
-            } else this.world.callout(this.pos3(h, 2.5).lerp(this.pos3(hd, 2.5), 0.5), icon('even', 26), 'mid');
+              this.later(0.2, () => { sfx.steal(); this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.decisive(hd, 'steal', tone); }); });
+            } else this.decisive(hd, 'even', 'mid', '', 0.3);
           });
           say(1.5); next(2.5);
           break;
         }
         if (act.t === 'handoff') {
           const mate = this.att(act.who), md = this.def(act.who);
-          const meet = { x: h.x + (mate.x - h.x) * 0.25, y: h.y + (mate.y - h.y) * 0.25 };
-          this.glide(mate, meet.x, meet.y, 0.45, this.routeMid(mate.x, mate.y, meet.x, meet.y, md));
-          this.glide(md, md.x + (meet.x - md.x) * 0.5, md.y + (meet.y - md.y) * 0.5, 0.5);
-          this.later(0.45, () => {
+          const hz = this.Z(s, s.ball), mz = this.Z(s, act.who);
+          const meet = { x: hz.x + (mz.x - hz.x) * 0.25, y: hz.y + (mz.y - hz.y) * 0.25 };
+          const tM = this.glide(mate, meet.x, meet.y, 0.45, this.routeMid(mz.x, mz.y, meet.x, meet.y, this.home(s, act.who)));
+          this.glide(md, md.x + (meet.x - md.x) * 0.5, md.y + (meet.y - md.y) * 0.5, Math.max(0.5, tM));
+          const x0 = Math.max(0, tM - 0.45);
+          this.later(0.45 + x0, () => {
             if (b.ev === 'steal') {
               this.play(hd, 'Steal', 60); hd.armsT = 0.3;
               sfx.steal();
-              this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone); });
+              this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.decisive(hd, 'steal', tone); });
               return;
             }
             this.play(h, 'Jab', 45);
@@ -2259,26 +2474,26 @@ export class Match {
             if (b.ev === 'beat') { md.daze = 1.4; this.later(0.6, () => this.world.callout(this.pos3(mate, 2.6), icon('t_handoff', 24), tone)); }
             else this.later(0.3, () => { const p = this.defSpot(s, act.who, 'press'); this.glide(md, p.x, p.y, 0.5); });
           });
-          say(1.2); next(2.2);
+          say(1.2 + x0); next(2.2 + x0);
           break;
         }
         if (act.t === 'pop') {
           const sc = this.att(act.who);
           const scd = this.def(act.who);
-          const spot = this.screenSpot(hd, h);
-          this.glide(sc, spot.x, spot.y, 0.4);
-          this.glide(scd, spot.x + 0.5, spot.y + 0.3, 0.45);
-          this.later(0.45, () => {
+          const spot = this.screenSpot(this.home(s, s.ball), this.Z(s, s.ball));
+          const tS = Math.max(this.glide(sc, spot.x, spot.y, 0.4), this.glide(scd, spot.x + 0.5, spot.y + 0.3, 0.45));
+          const x0 = Math.max(0, tS - 0.45);
+          this.later(0.45 + x0, () => {
             const off = { x: h.x + (HOOP.x - h.x) * 0.15 + (spot.x > h.x ? -0.7 : 0.7), y: h.y + (HOOP.y - h.y) * 0.15 };
             this.glide(h, off.x, off.y, 0.4);
-            this.glide(sc, z.x, z.y, 0.6, this.routeMid(spot.x, spot.y, z.x, z.y, scd));
+            this.glide(sc, z.x, z.y, 0.6, this.routeMid(spot.x, spot.y, z.x, z.y, this.home(s, s.ball)));
             if (b.ev === 'open') { scd.daze = 1.2; this.later(0.6, () => this.world.callout(this.pos3(sc, 2.6), icon('t_pop', 24), tone)); }
             else if (b.ev === 'steal') {
               hd.armsT = 0.3; this.play(hd, 'Steal', 60);
-              this.later(0.2, () => { sfx.steal(); this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone); }); });
+              this.later(0.2, () => { sfx.steal(); this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.decisive(hd, 'steal', tone); }); });
             } else { const p = this.defSpot({ ...s, zones: s.zones.map((x, j) => (j === act.who ? act.z : x)) }, act.who, 'press'); this.glide(scd, p.x, p.y, 0.6); }
           });
-          say(1.2); next(2.3);
+          say(1.2 + x0); next(2.3 + x0);
           break;
         }
         if (act.t === 'giveandgo') {
@@ -2286,7 +2501,7 @@ export class Match {
           sfx.pass();
           this.play(h, 'Jab', 45);
           this.fly(this.hand(h), this.pos3(mate, 1.2), 0.3, 0.25, () => { this.holder = mate; });
-          this.glide(h, z.x, z.y, 0.7, this.routeMid(h.x, h.y, z.x, z.y, hd));
+          this.glide(h, z.x, z.y, 0.7, this.routeMid(h.x, h.y, z.x, z.y, this.home(s, s.ball)));
           if (b.ev === 'open') { hd.daze = 1.4; this.glide(hd, hd.x + (z.x - hd.x) * 0.3, hd.y + (z.y - hd.y) * 0.3, 0.6); }
           else { const p = this.defSpot({ ...s, zones: s.zones.map((x, j) => (j === s.ball ? act.z : x)) }, s.ball, 'press'); this.glide(hd, p.x, p.y, 0.7); }
           this.later(0.65, () => {
@@ -2294,12 +2509,14 @@ export class Match {
             const target = w3(z.x, z.y, 1.2);
             if (b.ev === 'pick') {
               const thief = hd;
-              const lp = { x: mate.x + (z.x - mate.x) * 0.5, y: mate.y + (z.y - mate.y) * 0.5 };
+              const tx = z.x - mate.x, ty = z.y - mate.y, L2 = tx * tx + ty * ty || 1;
+              const kk = clamp(((thief.x - mate.x) * tx + (thief.y - mate.y) * ty) / L2, 0.35, 0.85);
+              const lp = { x: mate.x + tx * kk, y: mate.y + ty * kk };
               this.glide(thief, lp.x, lp.y, 0.25);
               this.play(thief, 'Steal', 60);
               this.play(mate, 'Jab', 45);
               thief.armsT = 0.4;
-              this.fly(this.hand(mate), w3(lp.x, lp.y, 1.4), 0.2, 0.25, () => { sfx.steal(); this.holder = thief; this.lines[thief.pl.uid].steals++; this.world.callout(this.pos3(thief, 2.7), icon('steal', 28), tone); });
+              this.fly(this.hand(mate), w3(lp.x, lp.y, 1.4), 0.2, 0.25, () => { sfx.steal(); this.holder = thief; this.lines[thief.pl.uid].steals++; this.decisive(thief, 'steal', tone); });
             } else {
               this.play(mate, 'Jab', 45);
               this.fly(this.hand(mate), target, 0.3, 0.25, () => { this.holder = h; if (b.ev === 'open') this.world.callout(this.pos3(h, 2.6), icon('check', 24), tone); });
@@ -2310,12 +2527,11 @@ export class Match {
         }
         const c = this.att(act.who);
         const cd = this.def(act.who);
-        let delay = 0;
+        let delay = 0, runT = 0.7;
         if (act.t === 'screen') {
           const sc = this.att(screenerFor(s, act.who));
-          const spot = this.screenSpot(cd, c);
-          this.glide(sc, spot.x, spot.y, 0.35);
-          delay = 0.35;
+          const spot = this.screenSpot(this.home(s, act.who), this.Z(s, act.who));
+          delay = Math.max(0.35, this.glide(sc, spot.x, spot.y, 0.35));
           if (b.ev === 'slip' && b.freed !== undefined) {
             this.later(0.75, () => { this.glide(sc, sc.x + (HOOP.x - sc.x) * 0.3, sc.y + (HOOP.y - sc.y) * 0.3, 0.4); this.def(b.freed!).daze = 1.2; });
             this.later(1.0, () => this.world.callout(this.pos3(sc, 2.6), icon('check', 24), userTone(this.userAttacks)));
@@ -2325,15 +2541,17 @@ export class Match {
         this.later(delay, () => {
           if (act.t === 'backdoor') {
             const curve = this.backdoorCurve(c.x, c.y, z.x, z.y);
-            c.anim = { t: 0, dur: 0.75, path: (k) => { const p = curve.getPoint(ease(k)); return { x: p.x + COURT_W / 2, y: p.z + COURT_H / 2 }; } };
-          } else this.glide(c, z.x, z.y, 0.7, this.routeMid(c.x, c.y, z.x, z.y, cd));
+            runT = Math.max(0.75, (curve.getLength() * 1.5) / VMAX);
+            c.jog = true;
+            c.anim = { t: 0, dur: runT, path: (k) => { const p = curve.getPointAt(ease(k)); return { x: p.x + COURT_W / 2, y: p.z + COURT_H / 2 }; } };
+          } else { const cz = this.Z(s, act.who); runT = this.glide(c, z.x, z.y, 0.7, this.routeMid(cz.x, cz.y, z.x, z.y, this.home(s, act.who))); }
           if (b.ev === 'open') {
             cd.daze = 1.4;
             this.glide(cd, cd.x + (z.x - cd.x) * 0.25, cd.y + (z.y - cd.y) * 0.25, 0.6);
-            this.later(0.6, () => this.world.callout(this.pos3(c, 2.6), icon('check', 24), tone));
+            this.later(Math.max(0.6, runT - 0.1), () => this.world.callout(this.pos3(c, 2.6), icon('check', 24), tone));
           } else {
             const p = this.defSpot({ ...s, zones: s.zones.map((x, j) => (j === act.who ? act.z : x)) }, act.who, 'press');
-            this.glide(cd, p.x, p.y, 0.7);
+            this.glide(cd, p.x, p.y, Math.max(0.7, runT));
           }
         });
         if (b.ev === 'steal') {
@@ -2342,14 +2560,24 @@ export class Match {
           hd.armsT = 0.3;
           this.later(0.3, () => {
             sfx.steal();
-            this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; });
-            this.world.callout(this.pos3(hd, 2.7), icon('steal', 28), tone);
+            this.fly(this.hand(h), this.pos3(hd, 1.2), 0.15, 0.22, () => { this.holder = hd; this.lines[hd.pl.uid].steals++; this.decisive(hd, 'steal', tone); });
           });
         }
-        say(0.9 + delay); next(1.9 + delay);
+        // A long cut takes longer than the default: the result waits for the runner.
+        const far = Math.max(0, (dist(c.x, c.y, z.x, z.y) * 1.6 * 1.5) / VMAX - 0.7);
+        say(0.9 + delay + far); next(1.9 + delay + far);
         break;
       }
     }
+  }
+
+  /**
+   * Beat 3, the result: on the decisive moment (steal, block, charge, rebound, a beaten defender) the action
+   * holds for a moment with a big icon over the player who decided it. The ball stays where it is, in view.
+   */
+  private decisive(e: Ent, ic: string, tone: Tone, word = '', hold = 0.45) {
+    this.world.stamp(this.pos3(e, 3.1), ic, tone, word);
+    this.freeze = Math.max(this.freeze, hold);
   }
 
   private dunkTag(e: Ent, running: boolean) {
@@ -2365,6 +2593,11 @@ export class Match {
     const a = Math.atan2(shooter.x - HOOP.x, shooter.y - HOOP.y) + (Math.random() - 0.5) * 1.4;
     const r = 1.4 + Math.random() * 1.3;
     const spot = { x: clamp(HOOP.x + Math.sin(a) * r, 1, COURT_W - 1), y: clamp(HOOP.y + Math.abs(Math.cos(a)) * r + 0.5, 1.2, COURT_H - 1) };
+    const floor = Math.random() < 0.4;
+    const T = floor ? 0.8 : 0.55;
+    // The ball bounces toward the side of the one who gets it: he can reach it at a sprint before it lands.
+    const reach = (VMAX / 1.5) * (T - 0.05), dr = dist(reb.x, reb.y, spot.x, spot.y);
+    if (dr > reach) { const k = 1 - reach / dr; spot.x += (reb.x - spot.x) * k; spot.y += (reb.y - spot.y) * k; }
     const rival = this.ents.filter((e) => e.team !== reb.team).sort((p, q) => dist(p.x, p.y, spot.x, spot.y) - dist(q.x, q.y, spot.x, spot.y))[0];
     // Everyone near the rim crashes; the defender of each attacker boxes out (between him and the ball).
     for (const e of this.ents) {
@@ -2378,11 +2611,9 @@ export class Match {
     this.glide(reb, spot.x, spot.y, 0.45);
     this.glide(rival, spot.x + side * 0.6, spot.y + 0.35, 0.45);
     pxsfx.squeak();
-    const floor = Math.random() < 0.4;
-    const T = floor ? 0.8 : 0.55;
     const grab = () => {
       this.holder = reb;
-      this.world.callout(this.pos3(reb, 2.6), icon('ball', 24), reb.team === 0 ? 'good' : 'bad');
+      this.decisive(reb, 'ball', reb.team === 0 ? 'good' : 'bad', '', 0.4);
       if (offensive) this.world.cheer(0.6);
     };
     if (floor) {
@@ -2428,7 +2659,7 @@ export class Match {
       this.glide(hd, hd.x + ((hd.x - h.x) / l) * 0.8, hd.y + ((hd.y - h.y) / l) * 0.8, 0.3);
       hd.daze = 1.2;
       h.fast = false;
-      this.world.callout(this.pos3(hd, 2.8), `${icon('t_charge', 28)}<small>CHARGE</small>`, tone);
+      this.decisive(hd, 't_charge', tone, 'CHARGE', 0.55);
       this.later(0.4, () => { this.fly(this.hand(h), this.pos3(hd, 1.2), 0.3, 0.3, () => { this.holder = hd; }); });
     });
     void s;
@@ -2447,16 +2678,24 @@ export class Match {
     this.chain = null;
     if (this.cine || this.fxOn) { this.cine = null; this.fxOn = false; this.world.endCinematic(); }
     this.world.ballTrail(null);
+    this.world.clearPreview();
     if (b.next) {
       this.poss = b.next;
       if (b.ev === 'help' || b.ev === 'slip') this.freed = b.freed ?? null;
-      this.holder = this.att(b.next.ball);
-      this.flight = null;
-      this.looseBall = null;
-      this.layout(b.next, this.shownStance, 0.45);
+      const nh = this.att(b.next.ball);
+      if (this.flight || (this.holder && this.holder !== nh)) {
+        // The ball is still on its way, or in the wrong hands: it goes to the handler in plain sight.
+        const from = this.flight ? this.ballPos.clone() : this.hand(this.holder!);
+        this.fly(from, this.pos3(nh, 1.2), 0.3, 0.3, () => { this.holder = nh; });
+      } else {
+        this.holder = nh;
+        this.flight = null;
+        this.looseBall = null;
+      }
+      const T = this.layout(b.next, this.shownStance, 0.45);
       this.world.overview();
       this.pushHud();
-      this.later(0.7, () => this.openDecision());
+      this.later(Math.max(0.7, T + 0.15), () => this.openDecision());
       return;
     }
     // Possession over. Whoever won the ball (rebound, steal, block) keeps it to clear it out.
@@ -2501,6 +2740,8 @@ export class Match {
     this.last = now;
     let k = this.timeScale;
     if (this.slow > 0 && !this.paused) { this.slow -= dt; k *= 0.4; }
+    // Duels play a little slower than life, and hold still on the decisive moment.
+    if (this.freeze > 0 && !this.paused) { this.freeze -= dt; k = 0; } else if (this.phase === 'resolve') k *= DUEL_PACE;
     // Hit-stop: the action holds for a few frames on a big impact.
     if (this.world.holding) k = 0;
     if (!this.paused) this.update(dt * k);
@@ -2526,7 +2767,7 @@ export class Match {
         // Shots keep facing the rim while drifting (fadeaway); everything else faces where it goes.
         if (Math.hypot(p.x - e.x, p.y - e.y) > 0.01 && !(e.act && KEEP_FACE.some((k) => e.act!.tag.startsWith(k)))) e.face = Math.atan2(p.x - e.x, p.y - e.y);
         e.x = p.x; e.y = p.y;
-        if (k >= 1) { e.anim = null; e.fast = false; }
+        if (k >= 1) { e.anim = null; e.fast = false; e.jog = false; }
       }
       if (e.act) {
         e.act.t += dt;
@@ -2581,20 +2822,26 @@ export class Match {
     if (this.flight) {
       const f = this.flight;
       f.curve.getPoint(Math.min(1, f.t / f.dur), this.ballPos);
-    } else if (this.holder) {
-      const h = this.holder;
+    } else if (this.shooter || this.holder) {
+      // A held ball follows the hand (dribble, gather, the wind-up of a shot or pass). Changes of grip ease in
+      // over a few frames: the ball never pops from one spot to another.
+      const h = (this.shooter ?? this.holder)!;
       const moving = !!h.anim;
-      if (this.phase === 'decide' || h.jumpT > 0) this.ballPos.copy(this.hand(h, h.jumpT > 0 ? 2.0 : 1.2));
+      const tgt = new Vector3();
+      if (this.shooter || this.phase === 'decide' || h.jumpT > 0) tgt.copy(this.hand(h, h.jumpT > 0 || this.shooter ? 2.0 : 1.2));
       else {
         const w = moving ? 8 : 5;
         const tt = performance.now() / 1000 * w;
         const bounce = Math.abs(Math.sin(tt));
-        this.ballPos.copy(this.hand(h, 0.22 + bounce * 0.85));
+        tgt.copy(this.hand(h, 0.22 + bounce * 0.85));
         // A dribble sound on each floor contact while the handler moves with the ball.
         const ph = Math.floor(tt / Math.PI);
         if (moving && ph !== this.bouncePh && dt > 0) pxsfx.dribble();
         this.bouncePh = ph;
       }
+      const k = dt > 0 ? 1 - Math.exp(-dt * 28) : 0;
+      if (this.ballPos.distanceTo(tgt) > 4) this.ballPos.copy(tgt);
+      else this.ballPos.lerp(tgt, k);
     } else if (this.looseBall) this.ballPos.copy(this.looseBall);
     W.setBall(this.ballPos, this.flight ? 0.25 : 0.05);
     const s = this.poss;
@@ -2608,7 +2855,7 @@ export class Match {
       }
       const open = !!s && e.team === this.offense && s.adv[e.slot] > 0 && this.phase !== 'resolve';
       W.setPlayer(e.i, {
-        x: e.x, y: e.y, face: e.face, moving, fast: e.fast, daze: e.daze > 0, carry: e === carrier,
+        x: e.x, y: e.y, face: e.face, moving, fast: e.fast, run: e.jog, daze: e.daze > 0, carry: e === carrier,
         defending: e.team !== this.offense, deciding: this.phase === 'decide',
         act: e.act ? { tag: e.act.tag, t: e.act.t, ms: e.act.ms } : null,
         open, showNum: this.phase === 'decide',
@@ -2616,6 +2863,15 @@ export class Match {
       }, dt);
     }
     W.setHandler(this.holder && !this.flight ? this.pos3(this.holder) : null);
+    // Who guards whom: a marking line from each defender to his man while the teams set up and decide. On
+    // defense, the human's on-ball defender is "you" (a shield under his feet) and his line is the bold one.
+    if (s && (this.phase === 'intro' || this.phase === 'decide')) {
+      W.setTethers([0, 1, 2].map((j) => {
+        const d = this.def(j), a = this.att(j);
+        return { ax: d.x, ay: d.y, bx: a.x, by: a.y, strong: j === s.ball, mine: !this.userAttacks && j === s.ball };
+      }));
+      W.setMine(!this.userAttacks && this.phase === 'decide' ? this.def(s.ball).i : -1);
+    } else { W.setTethers(null); W.setMine(-1); }
     W.render(dt);
   }
 

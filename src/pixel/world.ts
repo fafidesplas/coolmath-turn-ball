@@ -11,6 +11,7 @@ import { ZONES } from '../rules';
 import { COURT_H, COURT_W, HOOP } from './court';
 import { A, FEET, atlasImage, drawPiece, drawPlayer, hasPiece, pixText, pixTextW, tagFrame, type Look } from './sprites';
 import type { FxStyle } from '../specials';
+import { icon } from './pxicons';
 
 /** Scene size in pixels (both divisible by 2 and 3, so every camera zoom covers it exactly). */
 export const VIEW_W = 264;
@@ -44,6 +45,8 @@ export interface PixelPose {
   face: number;
   moving: boolean;
   fast: boolean;
+  /** A long move: runs (Run / Sprint) even on defense, instead of the short defensive slide. */
+  run?: boolean;
   daze: boolean;
   /** This player holds the ball (drawn in the sprite when the frame has it). */
   carry: boolean;
@@ -66,11 +69,21 @@ const DRIBBLE_L = ['Dribble_1_Left', 'Dribble_2_Left'];
 interface PV { look: PixelLook; flip: boolean; clock: number; s: PixelPose | null; frame: number; ballDrawn: boolean }
 
 type Ring = { x: number; y: number; rx: number; ry: number; color: string; pulse: boolean; style: 'target' | 'danger' | 'plain' };
-type Dots = { curve: Curve<Vector3>; n: number; color: string; size: number; speed: number; phase: number };
+/**
+ * Shape of a preview path, so a path never reads by its color alone: a ball in the air is dots (hollow squares
+ * for a lob), a player who runs is arrowheads pointing where he goes, a danger is crosses, a threat is dashes.
+ */
+export type DotShape = 'dot' | 'ring' | 'chev' | 'x' | 'dash';
+type Dots = { curve: Curve<Vector3>; n: number; color: string; size: number; speed: number; phase: number; shape: DotShape };
+/** A hatched floor area (scene pixels). The hatch pattern carries the meaning, not only the color. */
+export type Hatch = 'cross' | 'lines' | 'diag' | 'dots';
+type Area = { pts: { x: number; y: number }[]; color: string; hatch: Hatch };
+/** Marking line from a defender to his man (court meters). */
+export interface Tether { ax: number; ay: number; bx: number; by: number; strong: boolean; mine: boolean }
 type Wall = { x: number; y: number; w: number; h: number; color: string };
 type Ghost = { x: number; y: number; color: string };
 interface Label { el: HTMLElement; x: number; y: number }
-interface Floater { el: HTMLElement; x: number; y: number; t: number }
+interface Floater { el: HTMLElement; x: number; y: number; t: number; hold?: number; life?: number }
 /** Pixel particle (canvas pixels). */
 interface Part { x: number; y: number; vx: number; vy: number; g: number; t: number; life: number; kind: 'flame' | 'spark' | 'smoke' | 'frost' | 'wind' | 'dust' | 'bolt' | 'ring'; size: number }
 interface Aura { i: number; style: FxStyle; t: number }
@@ -141,8 +154,16 @@ export class PixelWorld {
   private S = 1;
   /** Light frame drawn around the two players of a duel (scene pixels), or null. */
   private duelBox: { x0: number; y0: number; x1: number; y1: number } | null = null;
-  /** Numbered step badges of a combo preview. */
-  private badges: { x: number; y: number; n: number }[] = [];
+  /** Numbered step badges of a combo preview (alt: the other way the play can go, dashed frame). */
+  private badges: { x: number; y: number; n: number; alt: boolean }[] = [];
+  /** Hatched floor areas of a preview (what a defensive move covers, what it leaves open). */
+  private areas: Area[] = [];
+  /** Paths and warnings that previews do not clear (the attack's threat while you choose on defense). */
+  private keepDots: Dots[] = [];
+  private warns: { x: number; y: number }[] = [];
+  /** Who guards whom (marking lines), and the human's own defender on defense (index, or -1). */
+  private tethers: Tether[] | null = null;
+  private mine = -1;
   /** Spectators: pack characters behind the baseline and on the bench (cheer on big plays). */
   private fans: { look: PixelLook; x: number; y: number; flip: boolean; clock: number; cheer: number }[] = [];
   /** Hit-stop: the picture holds for a few frames on a big impact (dunk, block). */
@@ -319,7 +340,7 @@ export class PixelWorld {
   // ---------------------------------------------------------------- previews
   clearPreview() {
     this.rings = []; this.dotPaths = []; this.walls = []; this.ghosts = [];
-    this.badges = [];
+    this.badges = []; this.areas = [];
     this.hand = null;
     for (const l of this.labels) l.el.remove();
     this.labels = [];
@@ -336,7 +357,43 @@ export class PixelWorld {
     this.marks.push(l);
     this.placeLabel(l.el, l.x, l.y);
   }
-  clearMarks() { for (const l of this.marks) l.el.remove(); this.marks = []; }
+  clearMarks() { for (const l of this.marks) l.el.remove(); this.marks = []; this.keepDots = []; this.warns = []; }
+
+  /** Marking lines (defender to his man), or none. */
+  setTethers(t: Tether[] | null) { this.tethers = t; }
+  /** The human's own defender (shield over him), or -1. */
+  setMine(i: number) { this.mine = i; }
+  /** A threat: a path the attack is likely to take, kept until clearMarks, with a warning sign at its end. */
+  threat(curve: Curve<Vector3>, shape: DotShape = 'dash') {
+    const len = curve.getLength();
+    this.keepDots.push({ curve, n: Math.max(4, Math.round(len / 0.34)), color: '#ffb02e', size: 2, speed: 1.1, phase: 0, shape });
+    const e = fromWorld(curve.getPointAt(1));
+    this.warns.push({ x: Math.round(e.x), y: Math.round(e.y) });
+  }
+  /** A warning sign (threat) over a court point, kept until clearMarks. */
+  warnAt(p: Vector3) { const s = fromWorld(p); this.warns.push({ x: Math.round(s.x), y: Math.round(s.y) }); }
+  /** A hatched floor area: a polygon in court meters. */
+  area(poly: { x: number; y: number }[], color: string, hatch: Hatch) {
+    this.areas.push({ pts: poly.map((q) => { const s = project(q.x, q.y); return { x: Math.round(s.x), y: Math.round(s.y) }; }), color, hatch });
+  }
+  /** A hatched disc on the floor (court meters). */
+  disc(x: number, y: number, r: number, color: string, hatch: Hatch) {
+    const pts: { x: number; y: number }[] = [];
+    for (let i = 0; i < 20; i++) { const a = (i / 20) * Math.PI * 2; pts.push({ x: x + Math.cos(a) * r, y: y + Math.sin(a) * r }); }
+    this.area(pts, color, hatch);
+  }
+  /**
+   * Beat 3 of a duel: a big icon (and at most one word) over the player who decided it. It holds still while
+   * the action pauses, then rises and fades.
+   */
+  stamp(pos: Vector3, ic: string, tone: string, word = '') {
+    const el = document.createElement('div');
+    el.className = `callout stamp ${tone}${this.reduce ? ' calm' : ''}`;
+    el.innerHTML = `${icon(ic, 48)}${word ? `<small>${word}</small>` : ''}`;
+    this.labelsEl.appendChild(el);
+    const s = fromWorld(pos);
+    this.floaters.push({ el, x: Math.round(s.x), y: Math.round(s.y), t: 0, hold: 0.9, life: 2.0 });
+  }
 
   /** Point the hand cursor at a court point (meters), or hide it. */
   pointAt(x: number | null, y = 0) { this.hand = x === null ? null : project(x, y); }
@@ -430,7 +487,7 @@ export class PixelWorld {
     this.duelBox = { x0: Math.round(x0 - 6), y0: Math.round(y0 - 4), x1: Math.round(x1 + 6), y1: Math.round(y1 + 6) };
   }
   /** Numbered badge of a combo step at a court point (meters, height in meters). */
-  badge(p: Vector3, n: number) { const s = fromWorld(p); this.badges.push({ x: Math.round(s.x), y: Math.round(s.y), n }); }
+  badge(p: Vector3, n: number, alt = false) { const s = fromWorld(p); this.badges.push({ x: Math.round(s.x), y: Math.round(s.y), n, alt }); }
   /** Hold the picture for a moment (hit-stop on a big impact). */
   hitStop(t = 0.08) { if (!this.reduce) this.hold = Math.max(this.hold, t); }
   /** The picture is holding (the match pauses its clock too). */
@@ -443,9 +500,10 @@ export class PixelWorld {
     this.fans = spots.slice(0, looks.length).map((p, i) => ({ look: looks[i], x: p.x, y: p.y, flip: p.x < 200, clock: Math.random() * 3, cheer: 0 }));
   }
 
-  dots(curve: Curve<Vector3>, color: string, radius = 0.07, spacing = 0.32, speed = 0.9) {
+  dots(curve: Curve<Vector3>, color: string, radius = 0.07, spacing = 0.32, speed = 0.9, shape: DotShape = 'dot') {
     const len = curve.getLength();
-    this.dotPaths.push({ curve, n: Math.max(3, Math.round(len / (spacing * 1.15))), color, size: radius >= 0.075 ? 2 : 1, speed, phase: 0 });
+    const k = shape === 'chev' ? 1.7 : 1.15;
+    this.dotPaths.push({ curve, n: Math.max(3, Math.round(len / (spacing * k))), color, size: radius >= 0.075 ? 2 : 1, speed, phase: 0, shape });
   }
 
   ghostBall(p: Vector3, color = '#ffffff') { const s = fromWorld(p); this.ghosts.push({ x: s.x, y: s.y, color }); }
@@ -559,6 +617,8 @@ export class PixelWorld {
     drawPiece(g, sheet, 'bench2', 110, 4);
 
     if (this.showZones) this.drawZones();
+    for (const a of this.areas) this.drawArea(a);
+    if (this.tethers) for (const t of this.tethers) this.drawTether(t);
 
     // Floor previews.
     const pulse = Math.sin(this.time * 6) > 0 ? 1 : 0;
@@ -608,7 +668,7 @@ export class PixelWorld {
       if (s.act) { tag = s.act.tag; t = s.act.t; loop = false; ms = s.act.ms; }
       else {
         t = pv.clock;
-        if (s.moving) tag = s.carry ? (s.fast ? 'Sprint_Ball' : 'Run_Ball') : s.fast ? 'Sprint' : s.defending ? 'Slide' : 'Run';
+        if (s.moving) tag = s.carry ? (s.fast ? 'Sprint_Ball' : 'Run_Ball') : s.fast ? 'Sprint' : s.defending && !s.run ? 'Slide' : 'Run';
         else if (s.carry) {
           const k = s.style ?? 0;
           if (s.post) tag = s.deciding ? (k % 2 ? 'Back_Idle' : 'Back_Idle_2') : 'Back_Dribble';
@@ -644,14 +704,20 @@ export class PixelWorld {
     if (!ballShown && !nearRim) this.drawBall();
 
     // Air previews.
-    for (const d of this.dotPaths) {
+    for (const d of [...this.dotPaths, ...this.keepDots]) {
       d.phase = (d.phase + dt * d.speed) % 1;
       for (let i = 0; i < d.n; i++) {
         const k = Math.min(1, (i + d.phase) / d.n);
         const q = fromWorld(d.curve.getPointAt(k));
-        const x = Math.round(q.x), y = Math.round(q.y);
-        this.px(x, y + 1, INK, d.size, d.size);
-        this.px(x, y, d.color, d.size, d.size);
+        if (d.shape === 'dot') {
+          const x = Math.round(q.x), y = Math.round(q.y);
+          this.px(x, y + 1, INK, d.size, d.size);
+          this.px(x, y, d.color, d.size, d.size);
+          continue;
+        }
+        const q2 = fromWorld(d.curve.getPointAt(Math.min(1, k + 0.02)));
+        const q0 = fromWorld(d.curve.getPointAt(Math.max(0, k - 0.02)));
+        this.mark2(q.x, q.y, q2.x - q0.x, q2.y - q0.y, d.shape, d.color);
       }
     }
     for (const w of this.walls) {
@@ -672,6 +738,8 @@ export class PixelWorld {
       this.px(b.x - Math.ceil(w / 2) - 1, b.y - 6, INK, w + 2, 11);
       this.px(b.x - Math.ceil(w / 2), b.y - 5, '#fff7ea', w, 9);
       this.px(b.x - Math.ceil(w / 2) + 1, b.y - 4, INK, w - 2, 7);
+      // The other way the play can go: a dashed frame (every other pixel of the light rim is dark).
+      if (b.alt) for (let i = 0; i < w; i += 2) { this.px(b.x - Math.ceil(w / 2) + i, b.y - 5, INK); this.px(b.x - Math.ceil(w / 2) + i, b.y + 3, INK); }
       pixText(g, label, b.x - Math.floor(pixTextW(label) / 2), b.y - 3, '#ffd166');
     }
     // Duel frame: light corner brackets around the two players facing off (the duel stays on the court).
@@ -694,9 +762,15 @@ export class PixelWorld {
       const p = project(s.x, s.y);
       const top = Math.round(p.y) - 34;
       if (s.showNum) {
+        // Home: dark digits on a light plate. Away: light digits on a dark plate with notched corners.
         const label = String(pv.look.num);
         const w = pixTextW(label);
-        pixText(g, label, Math.round(p.x - w / 2), top - 6, pv.look.marker === 'home' ? '#fff7ea' : '#ffd166');
+        const x0 = Math.round(p.x - w / 2) - 2, y0 = top - 8;
+        const home = pv.look.marker === 'home';
+        this.px(x0 - 1, y0 - 1, INK, w + 6, 11);
+        this.px(x0, y0, home ? '#fff7ea' : '#3b2a48', w + 4, 9);
+        if (!home) { this.px(x0, y0, INK); this.px(x0 + w + 3, y0, INK); this.px(x0, y0 + 8, INK); this.px(x0 + w + 3, y0 + 8, INK); }
+        pixText(g, label, x0 + 2, y0 + 2, home ? INK : '#fff7ea');
       }
       if (s.daze) {
         for (let i = 0; i < 3; i++) {
@@ -708,12 +782,14 @@ export class PixelWorld {
     if (this.handler) {
       const h = this.handler;
       const b = Math.sin(this.time * 5) > 0 ? 1 : 0;
-      const y = Math.round(h.y) - 44 + b;
+      const y = Math.round(h.y) - 51 + b;
       // Down-pointing arrow: dark outline, gold fill.
       const cx = Math.round(h.x);
       for (let i = 0; i < 5; i++) this.px(cx - 4 + i, y - 1 + i, INK, 9 - 2 * i, 1);
       for (let i = 0; i < 3; i++) this.px(cx - 2 + i, y + i, '#ffd60a', 5 - 2 * i, 1);
     }
+    if (this.mine >= 0) this.drawMine(this.players[this.mine]);
+    for (const w of this.warns) this.drawWarn(w.x, w.y - 12 + (Math.sin(this.time * 6) > 0 ? 1 : 0));
     if (this.hand) this.drawHand(Math.round(this.hand.x), Math.round(this.hand.y) - 50 + (Math.sin(this.time * 7) > 0 ? 1 : 0));
 
     this.netKick = Math.max(0, this.netKick - dt * 2.5);
@@ -727,11 +803,137 @@ export class PixelWorld {
     // Floating callouts rise in whole canvas pixels.
     this.floaters = this.floaters.filter((f) => {
       f.t += dt;
-      this.placeLabel(f.el, f.x, f.y - Math.floor(f.t * 12));
-      f.el.style.opacity = f.t > 1.1 ? '0.5' : '1';
-      if (f.t > 1.4) { f.el.remove(); return false; }
+      const hold = f.hold ?? 0, life = f.life ?? 1.4;
+      this.placeLabel(f.el, f.x, f.y - Math.floor(Math.max(0, f.t - hold) * 12));
+      f.el.style.opacity = f.t > life - 0.3 ? '0.5' : '1';
+      if (f.t > life) { f.el.remove(); return false; }
       return true;
     });
+  }
+
+  /** The ball is always on screen: if it leaves the view the camera opens to the whole court. */
+  private keepBall() {
+    if (this.reduce || this.camMode === 'off' || this.zoom) return;
+    const g = this.camGoal;
+    if (g.z <= 1) return;
+    const m = 6, w = VIEW_W / g.z, h = VIEW_H / g.z, b = this.ball;
+    if (b.x < g.x + m || b.x > g.x + w - m || b.y < g.y + m || b.y > g.y + h - m) this.overview();
+  }
+
+  /** One mark of a shaped path at (x, y) heading along (dx, dy): arrowhead, hollow square, cross or dash. */
+  private mark2(x: number, y: number, dx: number, dy: number, shape: DotShape, c: string) {
+    const l = Math.hypot(dx, dy) || 1, ux = dx / l, uy = dy / l;
+    const X = Math.round(x), Y = Math.round(y);
+    const both = (f: (col: string, o: number) => void) => { f(INK, 1); f(c, 0); };
+    if (shape === 'ring') both((col, o) => { this.px(X - 1, Y - 1 + o, col, 3, 1); this.px(X - 1, Y + 1 + o, col, 3, 1); this.px(X - 1, Y + o, col); this.px(X + 1, Y + o, col); });
+    else if (shape === 'x') both((col, o) => { for (let i = -1; i <= 1; i++) { this.px(X + i, Y + i + o, col); this.px(X + i, Y - i + o, col); } });
+    else if (shape === 'dash') both((col, o) => { for (let i = -1; i <= 1; i++) this.px(X + ux * i, Y + uy * i + o, col, 2, 2); });
+    else {
+      // Arrowhead: the tip ahead, two arms going back at 45 degrees on each side.
+      both((col, o) => {
+        this.px(X + ux, Y + uy + o, col);
+        for (let i = 1; i <= 2; i++) {
+          this.px(X + ux - ux * i - uy * i, Y + uy - uy * i + ux * i + o, col);
+          this.px(X + ux - ux * i + uy * i, Y + uy - uy * i - ux * i + o, col);
+        }
+      });
+    }
+  }
+
+  /** Hatched polygon on the floor: hatch inside (pattern by meaning) and a dashed outline. */
+  private drawArea(a: Area) {
+    const P = a.pts;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const q of P) { x0 = Math.min(x0, q.x); y0 = Math.min(y0, q.y); x1 = Math.max(x1, q.x); y1 = Math.max(y1, q.y); }
+    x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(VIEW_W - 1, x1); y1 = Math.min(VIEW_H - 1, y1);
+    const W = x1 - x0 + 1, H = y1 - y0 + 1;
+    if (W <= 0 || H <= 0) return;
+    const inside = (x: number, y: number) => {
+      let c = false;
+      for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+        const pi = P[i], pj = P[j];
+        if ((pi.y > y) !== (pj.y > y) && x < ((pj.x - pi.x) * (y - pi.y)) / (pj.y - pi.y) + pi.x) c = !c;
+      }
+      return c;
+    };
+    const m = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) m[y * W + x] = inside(x0 + x + 0.5, y0 + y + 0.5) ? 1 : 0;
+    const on = (x: number, y: number) => x >= 0 && y >= 0 && x < W && y < H && m[y * W + x] === 1;
+    const ph = Math.floor(this.time * 4);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      if (!on(x, y)) continue;
+      const X = x0 + x, Y = y0 + y;
+      const edge = !on(x - 1, y) || !on(x + 1, y) || !on(x, y - 1) || !on(x, y + 1);
+      if (edge) { if ((X + Y + ph) % 4 < 2) this.px(X, Y, a.color); continue; }
+      const hit = a.hatch === 'cross' ? (X + Y) % 4 === 0 || (X - Y + 400) % 4 === 0
+        : a.hatch === 'lines' ? Y % 3 === 0
+        : a.hatch === 'diag' ? (X + Y) % 4 === 0
+        : X % 3 === 0 && Y % 3 === 0;
+      if (hit) this.px(X, Y, a.color);
+    }
+  }
+
+  /** Marking line from a defender to his man: a dotted line on the floor, a small arrowhead at the man. */
+  private drawTether(t: Tether) {
+    const a = project(t.ax, t.ay), b = project(t.bx, t.by);
+    const dx = b.x - a.x, dy = b.y - a.y, l = Math.hypot(dx, dy);
+    if (l < 14) return;
+    const ux = dx / l, uy = dy / l;
+    const step = t.strong ? 3 : 4, sz = t.strong ? 2 : 1;
+    const ph = t.mine ? Math.floor(this.time * 8) % step : 0;
+    const col = t.mine ? '#ffd60a' : '#fff7ea';
+    for (let d = 8 + ph; d < l - 9; d += step) {
+      const x = a.x + ux * d, y = a.y + uy * d;
+      if (t.strong) this.px(x, y + 1, INK, sz, sz);
+      this.px(x, y, col, sz, sz);
+    }
+    if (t.strong) this.mark2(b.x - ux * 9, b.y - uy * 9, dx, dy, 'chev', col);
+  }
+
+  /** The human's own defender: a shield over his head (the handler gets the gold arrow, you get the shield). */
+  private drawMine(pv: PV) {
+    const s = pv.s;
+    if (!s) return;
+    const p = project(s.x, s.y);
+    const x = Math.round(p.x), y = Math.round(p.y) - 52 + (Math.sin(this.time * 5) > 0 ? 1 : 0);
+    // A light shield with a dark emblem: taller and lighter than the handler's gold arrow, so the two never mix up.
+    const rows = [
+      'XXXXXXXXXXX',
+      'XWWWWWWWWWX',
+      'XWWWWXWWWWX',
+      'XWWWXXXWWWX',
+      'XWWWWXWWWWX',
+      'XWWWWXWWWWX',
+      '.XWWWXWWWX.',
+      '.XWWWWWWWX.',
+      '..XWWWWWX..',
+      '...XWWWX...',
+      '....XWX....',
+      '.....X.....',
+    ];
+    for (let j = 0; j < rows.length; j++) for (let i = 0; i < rows[j].length; i++) {
+      const c = rows[j][i];
+      if (c === '.') continue;
+      this.px(x - 5 + i, y - 3 + j, c === 'X' ? INK : '#fff7ea');
+    }
+    // Brackets on the floor around his feet (light, dark shadow).
+    const L = 4;
+    for (const [col, o] of [[INK, 1], ['#fff7ea', 0]] as [string, number][]) for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      const cx = x + sx * 12, cy = Math.round(p.y) + sy * 6 + o;
+      this.px(Math.min(cx, cx - sx * (L - 1)), cy, col, L, 1);
+      this.px(cx, Math.min(cy, cy - sy * (L - 1)), col, 1, L);
+    }
+  }
+
+  /** Warning sign (a threat): a dark triangle with a light rim and an exclamation mark. */
+  private drawWarn(x: number, y: number) {
+    for (let j = 0; j < 8; j++) {
+      const half = Math.floor(j / 1.6) + 1;
+      this.px(x - half - 1, y + j, INK, 2 * half + 3, 1);
+      this.px(x - half, y + j, j === 7 ? INK : '#ffb02e', 2 * half + 1, 1);
+    }
+    this.px(x, y + 2, INK, 1, 3);
+    this.px(x, y + 6, INK);
   }
 
   // ---------------------------------------------------------------- effects (cinematics)
@@ -928,7 +1130,7 @@ export class PixelWorld {
         sx = Math.round((Math.random() - 0.5) * m); sy = Math.round((Math.random() - 0.5) * m);
       }
     }
-    if (dt > 0) this.stepCam(dt);
+    if (dt > 0) { this.stepCam(dt); this.keepBall(); }
     const c = this.view0();
     const k = S * c.z;
     v.imageSmoothingEnabled = false;
