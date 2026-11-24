@@ -172,7 +172,8 @@ function teamScreen(msg = '') {
         </div>
       </div>`;
     }).join('')}</div>
-    <p class="sub center">Tap a technique to equip or unequip it. Only equipped ones are used in matches.</p>`, 'team-screen');
+    <p class="sub center">Tap a technique to equip or unequip it. Only equipped ones are used in matches.</p>
+    <p class="sub center">Everyone already has every shot (dunk, layup, floater, jump shot, three, fadeaway), every dribble move and the seven defenses. Techniques here add passes and team plays.</p>`, 'team-screen');
   if (save.fresh?.length) { save.fresh = []; persist(save); }
   el.querySelectorAll<HTMLElement>('[data-equip]').forEach((b) => b.addEventListener('click', () => {
     const [i, t] = b.dataset.equip!.split(':');
@@ -252,12 +253,12 @@ function howScreen() {
   const card = (ic: string, title: string, body: string) => `<section class="hcard"><div class="hi">${ic}</div><div><h3>${title}</h3><p>${body}</p></div></section>`;
   mount(`${topBar('How to Play')}
     <div class="how">
-      ${card(`${icon('shoot', 26)}${icon('pass', 26)}`, 'Your turn', 'Shoot, pass, drive with the ball, or cut a teammate to a new spot.')}
-      ${card(`${icon('press', 24)}${icon('space', 24)}${icon('deny', 24)}`, 'Their turn', 'The defense picks Press, Give space or Deny pass at the same time. Nobody sees the other choice.')}
-      ${card(`<span class="mini-odds"><i class="good"></i><i class="mid"></i><i class="bad"></i></span>`, 'Exact odds', 'Select an option to see the play and its real odds. Light solid good, dotted grey neutral, dark striped bad. Each one also has its icon and word.')}
-      ${card(`${icon('fire', 30)}`, 'Fire and specials', `Win duels to fill your Fire meter (${FIRE.max} flames: +1 per duel won, +2 per steal, pick or block, +1 per forced miss, -1 per turnover). Full Fire unlocks each player's signature special for one move: a slam, a deep three, an ankle-breaker... Every special has a stance that stops it, shown on its card.`)}
-      ${card(`${icon('t_pnr', 24)}${icon('t_iso', 24)}${icon('t_pop', 24)}`, 'Plays', 'Play opens the team moves: cut, backdoor, screen, pick and roll, pick and pop, clear-out, hand-off, give and go. Each beats some stances and loses to others.')}
-      ${card(`${icon('t_cross', 24)}${icon('t_fade', 24)}${icon('t_floater', 24)}`, 'Techniques', 'Each move has techniques: crossover, fadeaway, pick and roll... Pick the move, then the technique. Players learn new ones by leveling up, training and league wins.')}
+      ${card(`${icon('t_dunk', 26)}${icon('shoot', 26)}`, 'Your turn: shoot', 'Dunk, layup, floater, jump shot, three or fadeaway. The dunk is the best finish: at the post, or from the elbow once you beat your man. A shot blocker can stuff it.')}
+      ${card(`${icon('t_cross', 24)}${icon('t_between', 24)}${icon('t_backdown', 24)}`, 'Your turn: dribble', 'Crossover, between the legs, behind the back, spin, euro step, back down, hesitation, step-back, pump fake. Beat your man and you are open: then dunk or shoot.')}
+      ${card(`${icon('t_rim', 24)}${icon('t_contest', 24)}${icon('t_charge', 24)}`, 'Their turn: defend', 'Press, Steal, Contest, Give space, Block, Take the charge or Deny pass. Each one says what it stops and what beats it. You both pick at the same time.')}
+      ${card(`<span class="pps"><span class="pp rw">${icon('up', 16)}${icon('up', 16)}</span><span class="pp rk">${icon('warn', 16)}</span></span>`, 'Gain and risk', 'Arrows show how much an option can win you, warning triangles how risky it is. After every play a card says whose move won and why.')}
+      ${card(`${icon('fire', 30)}`, 'Fire and specials', `Win duels to fill your Fire meter (${FIRE.max} flames: +1 per duel won, +2 per steal, pick, block or charge, +1 per forced miss, -1 per turnover). Full Fire unlocks each player's signature special for one move. Every special has a defense that stops it.`)}
+      ${card(`${icon('t_pnr', 24)}${icon('t_iso', 24)}${icon('t_pop', 24)}`, 'Plays and passes', 'Players learn passes and team plays (pick and roll, clear-out, hand-off...) by leveling up and training. Shots, dribble moves and defense are the same for everyone.')}
       ${card(`<span class="pips att"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>`, 'Moves', `${TUNE.actions} moves per possession. The last one is a shot.`)}
       ${card(icon('hoop', 32), 'Score', `1 inside the arc, 2 outside. First to ${MATCH_RULES.winScore}, or most after ${MATCH_RULES.maxPoss} possessions each.`)}
       <div class="center menu row"><button class="btn primary" id="tut">${icon('play', 22)} Tutorial</button><button class="btn" data-go="league">${icon('play', 22)} Play</button></div>
@@ -283,6 +284,7 @@ function matchHud(rivalName: string, rivalColor: string) {
       <button class="btn small ghost pausebtn icon-btn" id="pause" aria-label="Pause">${icon('pause', 20)}</button>
     </div>
     <div class="banner" id="banner"></div>
+    <div class="duel" id="duel" aria-live="polite"></div>
     <div class="cutin" id="cutin"></div>`;
 }
 
@@ -291,8 +293,9 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
   const banner = el.querySelector<HTMLElement>('#banner')!;
   const log = el.querySelector<HTMLElement>('#log')!;
   const cutin = el.querySelector<HTMLElement>('#cutin')!;
+  const duel = el.querySelector<HTMLElement>('#duel')!;
   const panel = el.querySelector<HTMLElement>('#mpanel')!;
-  let bannerT = 0, cutT = 0;
+  let bannerT = 0, cutT = 0, duelT = 0;
   dui = new DecisionUI(panel, () => match);
   const team = save.roster.slice(0, 3);
   const foe = rival ? rival : RIVALS[0];
@@ -302,7 +305,7 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
   ], opts, {
     decision: (open) => {
       el.classList.toggle('deciding', open);
-      if (open) save.duelsSeen++;
+      if (open) { save.duelsSeen++; duel.classList.remove('show'); }
       dui?.show(open);
     },
     hud: (h) => {
@@ -332,6 +335,25 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
       line.textContent = text;
       log.prepend(line);
       while (log.children.length > 4) log.lastElementChild!.remove();
+    },
+    duel: (d) => {
+      // Result card: both moves with their icons, who won (check / cross / equals mark plus a word), and why.
+      const mark = d.res === 'win' ? icon('check', 24) : d.res === 'lose' ? icon('cross', 24) : icon('even', 24);
+      const word = d.res === 'win' ? 'YOU WIN' : d.res === 'lose' ? 'THEY WIN' : 'EVEN';
+      duel.className = `duel r-${d.res}`;
+      duel.innerHTML = `<div class="du-row">
+          <span class="du-side"><small>YOU</small>${icon(d.you.icon, 32)}<b>${esc(d.you.name)}</b></span>
+          <span class="du-res">${mark}<small>${word}</small></span>
+          <span class="du-side"><small>THEM</small>${icon(d.them.icon, 32)}<b>${esc(d.them.name)}</b></span></div>
+        <div class="du-head">${esc(d.head)}</div><div class="du-why">${esc(d.why)}</div>`;
+      void duel.offsetWidth;
+      duel.classList.add('show');
+      clearTimeout(duelT);
+      duelT = window.setTimeout(() => duel.classList.remove('show'), 2600);
+    },
+    coached: (side) => {
+      if (side === 'att') save.coachedAtt = true; else save.coachedDef = true;
+      persist(save);
     },
     special: (sp: SpecialDef, pl: Player, team: 0 | 1) => {
       const kit = team === 0 ? HOME_KIT : awayKit(foe);
@@ -381,7 +403,7 @@ function tutorialScreen() {
 function matchScreen(rival: RivalTeam) {
   if (!save.tutorialDone) { tutorialScreen(); return; }
   const el = mount(matchHud(rival.name.slice(0, 3).toUpperCase(), rival.color), 'match-screen');
-  bindMatch(el, rival, { tier: rival.tier, hints: save.duelsSeen < 6, reduceFx: save.reduceFx });
+  bindMatch(el, rival, { tier: rival.tier, hints: save.duelsSeen < 6, reduceFx: save.reduceFx, coach: { att: !save.coachedAtt, def: !save.coachedDef } });
 }
 
 function resultScreen(rival: RivalTeam, r: MatchResult) {

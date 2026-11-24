@@ -101,6 +101,15 @@ export const DEF_MOVES: Partial<Record<TechId, DefMove>> = {
     { strip: 0, help: 0, screen: 0.56, slip: 0.2, pnr: { h: 0.24, r: 0.36, steal: 0.02 }, gng: 0.3, room: 0.3 }),
   switch: D('deny', [0.1, 0.02, -0.05], [0.03, 0.02, 0.01], 0.3, 0.07, 0.1, 0.45,
     { strip: 0, help: 0, screen: 0.22, slip: 0.42, pnr: { h: 0.1, r: 0.12, steal: 0.02 }, gng: 0.28, room: 0.26 }),
+  // Pixel edition defense. Contest: a hand in the shooter's face (jump shots and threes suffer, a drive or a fake gets by).
+  contest: D('press', [-0.05, -0.17, -0.17], [0.05, 0.09, 0.06], 0.56, 0.06, 0.04, 0.5,
+    { strip: 0.02, help: 0, screen: 0.66, slip: 0.2, pnr: { h: 0.36, r: 0.24, steal: 0.03 }, gng: 0.6, room: 0.58 }),
+  // Block: waits at the rim. Dunks and layups get stuffed; floaters go over it, outside shots are open.
+  rim: D('space', [-0.12, 0.07, 0.12], [0.2, 0.03, 0], 0.18, 0.03, 0.03, 0.3,
+    { strip: 0, help: 0.5, screen: 0.32, slip: 0.2, pnr: { h: 0.36, r: 0.08, steal: 0.02 }, gng: 0.24, room: 0.36 }),
+  // Take the charge: plants in the lane. Drives and finishes into it can be offensive fouls; shots are open.
+  charge: D('space', [-0.03, 0.09, 0.12], [0.02, 0, 0], 0.24, 0.02, 0.03, 0.32,
+    { strip: 0, help: 0.3, screen: 0.32, slip: 0.2, pnr: { h: 0.34, r: 0.12, steal: 0.02 }, gng: 0.26, room: 0.16 }),
 };
 export const famOf = (dm: TechId): Stance => DEF_MOVES[dm]!.fam;
 
@@ -127,7 +136,8 @@ export const TUNE = {
     bank: { base: 0, neg: 0.4, pos: 0.5, block: 0.6 },
     fade: { base: -0.05, neg: 0, pos: 0.3, block: 0.2 },
     layup: { base: 0.12, neg: 1.8, pos: 1, block: 2 },
-    floater: { base: -0.02, neg: 0.7, pos: 0.9, block: 0.3 },
+    floater: { base: 0.03, neg: 0.7, pos: 0.9, block: 0.2 },
+    dunk: { base: 0.13, neg: 1.6, pos: 1, block: 2.9 },
   } as Record<string, { base: number; neg: number; pos: number; block: number }>,
   /** Bounce pass: pick multiplier against Deny, pick added against Press. */
   /** Layup: chance that a make comes with a foul and one extra point (contested / open). */
@@ -155,7 +165,9 @@ export const TUNE = {
   /** Euro step: beat multiplier and steal added by family. */
   euro: { beat: { press: 0.8, space: 2.0, deny: 1.15 } as Record<Stance, number>, steal: { press: 0.04, space: 0, deny: 0.02 } as Record<Stance, number> },
   /** Pump fake: multiplier on the defensive move's room chance, by family. */
-  pump: { press: 1.25, space: 1.05, deny: 0.7 } as Record<Stance, number>,
+  pump: { press: 1.4, space: 1.2, deny: 0.7 } as Record<Stance, number>,
+  /** Pump fake against a defender who jumps (Contest, Block): extra multiplier on the room chance. */
+  pumpJumper: 1.3,
   /** Clear-out: chance the handler wins the 1 on 1 (open for `isoTtl` moves) by family, strip chance by family. */
   iso: { press: 0.3, space: 0.26, deny: 0.5 } as Record<Stance, number>,
   isoSteal: { press: 0.05, space: 0.02, deny: 0.02 } as Record<Stance, number>,
@@ -163,11 +175,29 @@ export const TUNE = {
   /** Pick and pop: open chance for the popper by family (Switch halves it). */
   pop: { press: 0.34, space: 0.38, deny: 0.16 } as Record<Stance, number>,
   /** Hand-off: chance the receiver comes off it open, steal chance, by family. */
-  handoff: { press: 0.26, space: 0.08, deny: 0.16 } as Record<Stance, number>,
-  handoffSteal: { press: 0.08, space: 0.03, deny: 0.08 } as Record<Stance, number>,
+  handoff: { press: 0.2, space: 0.06, deny: 0.12 } as Record<Stance, number>,
+  handoffSteal: { press: 0.09, space: 0.04, deny: 0.09 } as Record<Stance, number>,
   /** Hand-off: only to the nearest teammate within this distance (meters). */
   handoffRange: 7.5,
+  // ---- Pixel edition move set (the 3D game never offers these techniques)
+  /** Dunk: and-one chance (contested / open); who can dunk: (str + spd) at least `post` at the post, `run` from the elbow when open. */
+  dunk: { andOne: 0.2, andOneOpen: 0.1, post: 10, run: 11, runPenalty: 0.1 },
+  /** Between the legs: beat and steal multipliers. */
+  between: { beat: 0.9, steal: 0.45 },
+  /** Behind the back: beat multiplier by family, steal multiplier. */
+  behind: { beat: { press: 1.05, space: 0.7, deny: 1.45 } as Record<Stance, number>, steal: 0.7 },
+  /** Back down (into the post): beat by family plus strength edge, steal by family. */
+  backdown: { beat: { press: 0.3, space: 0.5, deny: 0.42 } as Record<Stance, number>, steal: { press: 0.09, space: 0.02, deny: 0.03 } as Record<Stance, number>, str: 0.05 },
+  /** Take the charge: chance a drive into the paint / a finish at the rim is an offensive foul. */
+  charge: { drive: 0.2, finish: 0.16, backdown: 1.5, euro: 0.5, spin: 0.7 },
 };
+
+/** Pixel edition: every player has these shots and dribble moves, every team these defensive moves. */
+export const PIXEL_MOVES: TechId[] = ['dunk', 'layup', 'floater', 'fade', 'cross', 'between', 'behind', 'spin', 'euro', 'backdown', 'hesi', 'stepback', 'pumpfake'];
+export const PIXEL_DEF: TechId[] = ['hawk', 'contest', 'rim', 'charge'];
+/** Can this player dunk from zone z (open = beat their defender)? */
+export const canDunk = (st: Stats, z: Zone, open: boolean) =>
+  ZONES[z].kind === 'close' ? st.str + st.spd >= TUNE.dunk.post : ZONES[z].kind === 'mid' && open && st.str + st.spd >= TUNE.dunk.run;
 
 /** Match format: first to `winScore`, or the leader once both teams had `maxPoss` possessions. */
 export const MATCH_RULES = { winScore: 9, maxPoss: 9 };
@@ -211,7 +241,9 @@ export type Ev =
   | 'make' | 'and1' | 'miss' | 'oreb' | 'block'
   | 'catch' | 'feed' | 'pick'
   | 'beat' | 'room' | 'held' | 'stopped' | 'help' | 'steal'
-  | 'open' | 'slip' | 'covered';
+  | 'open' | 'slip' | 'covered'
+  /** Offensive foul drawn by Take the charge: the ball changes hands. */
+  | 'charge';
 
 export interface Branch {
   p: number;
@@ -336,6 +368,7 @@ export function legalActs(s: Poss, m?: Matchup): Act[] {
   const out: Act[] = [];
   for (const t of techsFor(m, i, 'shoot')) {
     if (t === 'layup' && ZONES[hz].kind !== 'close') continue;
+    if (t === 'dunk' && !(m && canDunk(m.att[i], hz, s.adv[i] > 0))) continue;
     if (t === 'floater' && ZONES[hz].kind === 'three') continue;
     if (t === 'bank' && !TUNE.bankZones.includes(hz)) continue;
     out.push({ k: 'shoot', t });
@@ -360,6 +393,7 @@ export function legalActs(s: Poss, m?: Matchup): Act[] {
     for (const z of ROUTES[hz]) {
       if (taken.has(z)) continue;
       if (t === 'euro' && ZONES[z].kind === 'three') continue;
+      if (t === 'backdown' && (ZONES[z].kind !== 'close' || ZONES[hz].kind === 'three')) continue;
       out.push({ k: 'drive', z, t });
     }
   }
@@ -397,12 +431,15 @@ export function legalActs(s: Poss, m?: Matchup): Act[] {
 // ---------------------------------------------------------------- odds of a single action
 
 export function shotChance(m: Matchup, s: Poss, who: number, dm: TechId | null, t: TechId = 'jumper', sp?: SpecialId): { make: number; block: number } {
-  const z = ZONES[s.zones[who]];
+  const z0 = ZONES[s.zones[who]];
+  // A dunk always finishes at the rim (from the elbow it is a running dunk, a bit harder).
+  const z = t === 'dunk' ? { ...z0, kind: 'close' as ZoneKind } : z0;
   const a = m.att[who], d = m.def[who];
   const tt = TUNE.shotTech[t] ?? TUNE.shotTech.jumper;
   const sd = sp ? SPECIALS[sp] : null;
-  const skill = z.kind === 'close' ? (a.sho + a.str) / 2 : a.sho;
+  const skill = t === 'dunk' ? (a.str * 2 + a.spd) / 3 : z.kind === 'close' ? (a.sho + a.str) / 2 : a.sho;
   let p = TUNE.shotBase[z.kind] + (skill - 5) * TUNE.shotSkill[z.kind] + tt.base;
+  if (t === 'dunk' && z0.kind !== 'close') p -= TUNE.dunk.runPenalty;
   if (z.id === 'cornerL' || z.id === 'cornerR') p += TUNE.cornerBonus;
   if (s.adv[who] > 0) return { make: clamp(p + TUNE.openBonus + (sd?.openMake ?? 0), 0.05, 0.92), block: 0 };
   p -= (d.def - 5) * TUNE.defSkill;
@@ -436,12 +473,19 @@ export function driveChance(m: Matchup, s: Poss, dm: TechId, t: TechId = 'drive'
     return { beat, steal };
   }
   if (t === 'pumpfake') {
-    const beat = clamp(row.room * TUNE.pump[fam] + (a.sho - d.def) * 0.02, 0.02, 0.9);
+    const jumper = dm === 'contest' || dm === 'rim' ? TUNE.pumpJumper : 1;
+    const beat = clamp(row.room * TUNE.pump[fam] * jumper + (a.sho - d.def) * 0.02, 0.02, 0.9);
     const steal = clamp(0.03 - diff * 0.2, 0.01, 0.3);
     return { beat, steal };
   }
+  if (t === 'backdown') {
+    const edge = (a.str - d.def) * TUNE.backdown.str;
+    return { beat: clamp(TUNE.backdown.beat[fam] + edge + (dm === 'rim' ? -0.1 : 0), 0.02, 0.9), steal: clamp(TUNE.backdown.steal[fam] * (dm === 'hawk' ? 1.5 : 1) - edge * 0.3, 0.01, 0.4) };
+  }
   let beat = row.drive.beat + (fam === 'space' ? diff * 0.5 : diff);
   let steal = row.drive.steal - diff * 0.5;
+  if (t === 'between') { beat *= TUNE.between.beat; steal *= TUNE.between.steal; }
+  if (t === 'behind') { beat *= TUNE.behind.beat[fam]; steal *= TUNE.behind.steal; }
   if (t === 'cross') { if (fam === 'press') beat *= TUNE.cross.pressBeat; else steal += TUNE.cross.steal; }
   if (t === 'hesi') { beat += TUNE.hesi[fam]; if (fam === 'press') steal += TUNE.hesi.pressSteal; }
   if (t === 'spin') { beat *= TUNE.spin[fam][0]; steal *= TUNE.spin[fam][1]; }
@@ -505,14 +549,19 @@ function branchesRaw(m: Matchup, s: Poss, act: Act, dm: TechId): Branch[] {
       const pts = zonePts(s.zones[s.ball]);
       const ob = s.rebs >= 2 || sd?.noOreb ? 0 : orebChance(m);
       const open = s.adv[s.ball] > 0;
-      out.push({ p: block, ev: 'block', pts: 0, next: null, shotP: make, open });
-      const and1 = sd?.and1 !== undefined ? (open ? sd.and1 * 0.6 : sd.and1) : act.t === 'layup' ? (open ? TUNE.andOne.open : TUNE.andOne.contested) : 0;
-      if (and1 > 0) out.push({ p: (1 - block) * make * and1, ev: 'and1', pts: pts + 1, next: null, shotP: make, open });
-      out.push({ p: (1 - block) * make * (1 - and1), ev: 'make', pts, next: null, shotP: make, open });
+      // Take the charge: a layup or a dunk can crash into the planted defender (not when open).
+      const ch = dm === 'charge' && !open && (act.t === 'layup' || act.t === 'dunk' || sd?.tech === 'layup') ? TUNE.charge.finish : 0;
+      if (ch > 0) out.push({ p: ch, ev: 'charge', pts: 0, next: null, shotP: make, open });
+      const go = 1 - ch;
+      out.push({ p: block * go, ev: 'block', pts: 0, next: null, shotP: make, open });
+      const and1 = sd?.and1 !== undefined ? (open ? sd.and1 * 0.6 : sd.and1) : act.t === 'layup' ? (open ? TUNE.andOne.open : TUNE.andOne.contested)
+        : act.t === 'dunk' ? (open ? TUNE.dunk.andOneOpen : TUNE.dunk.andOne) : 0;
+      if (and1 > 0) out.push({ p: go * (1 - block) * make * and1, ev: 'and1', pts: pts + 1, next: null, shotP: make, open });
+      out.push({ p: go * (1 - block) * make * (1 - and1), ev: 'make', pts, next: null, shotP: make, open });
       const r = rebounder(s, m);
       const next: Poss = { zones: [...s.zones], adv: [0, 0, 0], ball: r, left: TUNE.orebActions, rebs: s.rebs + 1, ...(s.fire ? { fire: true } : {}) };
-      out.push({ p: (1 - block) * (1 - make) * ob, ev: 'oreb', pts: 0, next, shotP: make, open });
-      out.push({ p: (1 - block) * (1 - make) * (1 - ob), ev: 'miss', pts: 0, next: null, shotP: make, open });
+      out.push({ p: go * (1 - block) * (1 - make) * ob, ev: 'oreb', pts: 0, next, shotP: make, open });
+      out.push({ p: go * (1 - block) * (1 - make) * (1 - ob), ev: 'miss', pts: 0, next: null, shotP: make, open });
       break;
     }
     case 'pass': {
@@ -548,10 +597,18 @@ function branchesRaw(m: Matchup, s: Poss, act: Act, dm: TechId): Branch[] {
       const nb = tick(s);
       nb.zones[s.ball] = act.z;
       nb.adv[s.ball] = ttl;
-      out.push({ p: beat, ev: 'beat', pts: 0, next: nb });
+      // Take the charge: a drive into the paint can run over the planted defender.
+      const ch = dm === 'charge' && ZONES[act.z].kind !== 'three'
+        ? clamp(TUNE.charge.drive * ((TUNE.charge as Record<string, number>)[act.t] ?? 1), 0, 0.5) : 0;
+      out.push({ p: beat * (1 - ch), ev: 'beat', pts: 0, next: nb });
       out.push({ p: steal, ev: 'steal', pts: 0, next: null });
+      if (ch > 0) out.push({ p: ch * (beat + rest), ev: 'charge', pts: 0, next: null });
       if (row.fam === 'press') {
         out.push({ p: rest, ev: 'stopped', pts: 0, next: tick(s) });
+      } else if (ch > 0) {
+        const nh = tick(s);
+        nh.zones[s.ball] = act.z;
+        out.push({ p: rest * (1 - ch), ev: 'held', pts: 0, next: nh });
       } else {
         const nh = tick(s);
         nh.zones[s.ball] = act.z;
@@ -981,7 +1038,7 @@ export function rng(seed: number): () => number {
 // ---------------------------------------------------------------- causal explanation
 
 const pc = (p: number) => `${Math.round(p * 100)}%`;
-const DEF_GOOD: Ev[] = ['block', 'pick', 'steal', 'stopped', 'held', 'covered', 'miss'];
+const DEF_GOOD: Ev[] = ['block', 'pick', 'steal', 'stopped', 'held', 'covered', 'miss', 'charge'];
 
 /**
  * One short sentence that says what caused the result, in attacker or defender voice.
@@ -1013,6 +1070,8 @@ function explainBase(act: Act, dm: TechId, b: Branch, you: boolean): string {
       return `${st} ${pc(p)} look. ${res}${reb}`;
     }
     case 'block':
+      if (dm === 'rim') return you ? 'They were waiting at the rim: stuffed.' : 'You waited at the rim and stuffed it.';
+      if (dm === 'contest') return you ? 'The hand was up in your face: blocked.' : 'Your hand was up in their face: blocked.';
       return stance === 'press' ? (you ? 'Tight pressure: blocked.' : 'Your pressure got the block.') : (you ? 'Help in the paint blocked it.' : 'Your help blocked it.');
     case 'catch':
       if (act.t === 'handoff') return you ? 'Hand-off taken, still guarded.' : 'You stayed with the hand-off.';
@@ -1046,6 +1105,8 @@ function explainBase(act: Act, dm: TechId, b: Branch, you: boolean): string {
       if (act.t === 'giveandgo') return you ? 'Back open near the rim.' : 'They got it back open.';
       if (act.t === 'pop') return you ? 'The screener popped out wide open.' : 'The screener popped out open.';
       return stance === 'deny' ? (you ? 'The defender overplayed the pass: wide open.' : 'Overplaying the lane: open man.') : (you ? 'The cut lost the defender.' : 'The cut lost your defender.');
+    case 'charge':
+      return you ? 'They planted in the lane: you ran them over. Offensive foul, their ball.' : 'You planted in the lane and took the hit: offensive foul, your ball.';
     case 'covered':
       return stance === 'space' ? (you ? 'Sagging help saw it coming.' : 'Your help saw it coming.') : stance === 'deny' && dm === 'switch' ? (you ? 'They switched it.' : 'You switched it.') : (you ? 'The defender stayed with it.' : 'You stayed with it.');
   }

@@ -7,10 +7,12 @@ export type TechId =
   | 'jumper' | 'bank' | 'fade' | 'layup' | 'floater'
   | 'chest' | 'bounce' | 'lob' | 'nolook' | 'skip'
   | 'drive' | 'cross' | 'hesi' | 'spin' | 'stepback' | 'euro' | 'pumpfake'
+  | 'dunk' | 'between' | 'behind' | 'backdown'
   | 'cut' | 'backdoor' | 'screen' | 'pnr' | 'giveandgo' | 'iso' | 'pop' | 'handoff'
   | 'press' | 'hawk'
   | 'space' | 'float' | 'recover'
-  | 'deny' | 'jump' | 'switch';
+  | 'deny' | 'jump' | 'switch'
+  | 'contest' | 'rim' | 'charge';
 
 export interface TechInfo {
   id: TechId;
@@ -35,7 +37,9 @@ export const TECHS: Record<TechId, TechInfo> = {
   bank: T('bank', 'shoot', 'Bank shot', 't_bank', 'Steady vs Press and Deny. Needs an angle.', { where: 'Wing, elbow, post' }),
   fade: T('fade', 'shoot', 'Fadeaway', 't_fade', 'Ignores Press and blocks. Lower base.'),
   layup: T('layup', 'shoot', 'Layup', 't_layup', 'Post only. Can draw a foul: +1. Help blocks it.', { where: 'Post' }),
-  floater: T('floater', 'shoot', 'Floater', 't_floater', 'Soft and high: few blocks, beats help. Press still hurts.', { where: 'Elbow, post' }),
+  floater: T('floater', 'shoot', 'Floater', 't_floater', 'Soft and high over the big: almost never blocked. Press still hurts.', { where: 'Elbow, post' }),
+  // Pixel edition move set (every player has them; the 3D game does not use them).
+  dunk: T('dunk', 'shoot', 'Dunk', 't_dunk', 'Best finish and an and-one chance. A shot blocker can stuff it.', { where: 'Post, or the elbow when open' }),
   // Passes (the passer's repertoire)
   chest: T('chest', 'pass', 'Chest pass', 'pass', 'Plain pass. Deny picks it.', { base: true }),
   bounce: T('bounce', 'pass', 'Bounce pass', 't_bounce', 'Slips under Deny. Press tips it. Short only.', { where: 'Short passes' }),
@@ -49,7 +53,10 @@ export const TECHS: Record<TechId, TechInfo> = {
   spin: T('spin', 'drive', 'Spin move', 't_spin', 'Hard to steal. A bit slower.'),
   stepback: T('stepback', 'drive', 'Step-back', 't_stepback', 'Stay and make room: open shot next. Kills Press.', { where: 'Outside the post' }),
   euro: T('euro', 'drive', 'Euro step', 't_euro', 'Two steps around help: best vs Give space. Press reaches.', { where: 'Into elbow or post' }),
-  pumpfake: T('pumpfake', 'drive', 'Pump fake', 't_pump', 'Fake the shot, the defender flies: room. Deny does not bite.', { where: 'Elbow, post' }),
+  pumpfake: T('pumpfake', 'drive', 'Pump fake', 't_pump', 'Fake the shot: a defender who jumps (Contest, Block) flies by. Deny does not bite.', { where: 'Elbow, post' }),
+  between: T('between', 'drive', 'Between the legs', 't_between', 'Safe handle: hard to steal. Smaller gain.'),
+  behind: T('behind', 'drive', 'Behind the back', 't_behind', 'Beats Deny and Steal. Space waits for it.'),
+  backdown: T('backdown', 'drive', 'Back down', 't_backdown', 'Strength into the post. Beats Space. Press and Steal strip it.', { where: 'Into the post' }),
   // Plays (the player who moves knows them: cutter, screener who rolls, handler on a give and go)
   cut: T('cut', 'cut', 'Cut', 'cut', 'A mate moves. Deny opens it.', { base: true }),
   backdoor: T('backdoor', 'cut', 'Backdoor', 't_backdoor', 'Behind Deny: wide open. Help sees it.', { where: 'Cuts toward the rim' }),
@@ -68,6 +75,10 @@ export const TECHS: Record<TechId, TechInfo> = {
   deny: T('deny', 'deny', 'Deny pass', 'deny', 'Close the lanes.', { base: true }),
   jump: T('jump', 'deny', 'Jump lanes', 't_jump', 'Picks more passes. Backdoors open up.'),
   switch: T('switch', 'deny', 'Switch', 't_switch', 'Stops screens and cuts. Mismatch inside.'),
+  // Pixel edition defense (every team has them).
+  contest: T('contest', 'press', 'Contest', 't_contest', 'Hand in the face: hurts jump shots and threes. Drives and fakes beat it.'),
+  rim: T('rim', 'space', 'Block', 't_rim', 'Wait at the rim to block dunks and layups. Floaters and outside shots are open.'),
+  charge: T('charge', 'space', 'Take the charge', 't_charge', 'Plant in the lane: a drive or a finish can run you over (foul on them). Shots are open.'),
 };
 
 export const TECH_IDS = Object.keys(TECHS) as TechId[];

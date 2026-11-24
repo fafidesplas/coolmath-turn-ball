@@ -72,7 +72,12 @@ TAGS = ['Idle', 'Idle_2', 'Idle_Ball_1', 'Dribble_1', 'Run', 'Run_Ball', 'Sprint
         'Layup', 'Dunk_1', 'Double_Clutch', 'Jump', 'Jump_TwoFeet_Ball', 'Steal', 'Block_1', 'Rebound_1', 'Free_Throw',
         # Arcade edition: signature specials and the newer techniques reuse these pack animations.
         'Dunk_3', 'Dunk_5', 'Dunk_7', 'Floater', 'Jumpshot_3', 'Fake_Fadeaway_Right', 'Back_Down', 'Switch_Dribble_1',
-        'Pocket_Dribble', 'Sprint', 'Block_3', 'Jump_OneFeet_Ball']
+        'Pocket_Dribble', 'Sprint', 'Block_3', 'Jump_OneFeet_Ball',
+        # Move-set update: every dunk, the left-hand and back-to-the-basket dribbles, idle variants,
+        # the second block (contest) and the other rebounds (see docs/animaciones-pack.md).
+        'Dunk_2', 'Dunk_4', 'Dunk_6', 'Block_2', 'Rebound_2', 'Rebound_3', 'Idle_Ball_2', 'Idle_Ball_3', 'Idle_Ball_4',
+        'Dribble_2', 'Switch_Dribble_2', 'Dribble_1_Left', 'Dribble_2_Left', 'Dribbble_3_Left', 'Back_Idle', 'Back_Idle_2',
+        'Back_Dribble']
 HAIRS = ['Hair1', 'Hair2', 'Hair4', 'Hair5', 'Hair7']
 # Groups drawn in this order. Colors are nudged so every recolorable role has a unique key color.
 GROUPS = {

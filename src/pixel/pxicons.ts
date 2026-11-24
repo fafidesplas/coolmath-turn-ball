@@ -6,7 +6,7 @@ import { TECHS } from '../techs';
 const NAMES = [
   'shoot', 'pass', 'dribble', 'protect', 'steal', 'block', 'press', 'wait', 'star', 'act', 'pause', 'play', 'back', 'coin',
   'team', 'scout', 'help', 'soundOn', 'soundOff', 'lock', 'check', 'cross', 'trophy', 'up', 'ball', 'hoop', 'energy',
-  'move', 'space', 'deny', 'cut', 'even', 'beaten', 'slot', 'train', 'next', 'fire',
+  'move', 'space', 'deny', 'cut', 'even', 'beaten', 'slot', 'train', 'next', 'fire', 'warn', 't_three',
   ...Object.values(TECHS).map((t) => t.icon),
 ];
 const G = 16;

@@ -25,6 +25,9 @@ export interface Save {
   fresh?: string[];
   /** Pixel edition: reduced motion (no slow motion, zoom, shake or particle bursts). */
   reduceFx?: boolean;
+  /** Pixel edition: the in-match coach already walked through an attack / a defense possession. */
+  coachedAtt?: boolean;
+  coachedDef?: boolean;
 }
 
 export function newSave(): Save {

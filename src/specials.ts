@@ -86,13 +86,13 @@ export const SPECIALS: Record<SpecialId, SpecialDef> = {
     make: S(0.14, 0.02, 0.1), block: S(0.5, 0.5, 0.5), openMake: 0.04 }),
   noodle: D({ id: 'noodle', name: 'Noodle Spin', kind: 'drive', tech: 'spin', counter: 'press', anim: 'Behind_Back', fx: 'wind',
     line: 'Behind the back into a spin, open for 3 moves. Press stays attached.',
-    beat: S(1.4, 3.0, 1.9), steal: S(0.03, 0, 0), ttl: 3 }),
+    beat: S(1.6, 5.0, 3.4), steal: S(0.02, 0, 0), ttl: 3 }),
   skywalk: D({ id: 'skywalk', name: 'Skywalk', kind: 'shoot', tech: 'layup', zones: ['close', 'mid'], counter: 'press', anim: 'Dunk_5', fx: 'fire',
     line: 'Takes off from the elbow and flies to the rim. Press meets it in the air.',
-    make: S(-0.02, 0.16, 0.18), block: S(1.6, 1, 0.7), and1: 0.2, openMake: 0.1 }),
+    make: S(0.02, 0.22, 0.24), block: S(1.3, 0.7, 0.5), and1: 0.26, openMake: 0.14 }),
   breeze: D({ id: 'breeze', name: 'Breeze Step', kind: 'drive', tech: 'euro', zones: ['close', 'mid'], counter: 'deny', anim: 'Side_Step', fx: 'wind',
     line: 'Floating euro step: open for 3 moves. Deny clogs the lane.',
-    beat: S(2.0, 1.8, 0.85), steal: S(0.02, 0, 0.05), ttl: 3 }),
+    beat: S(2.7, 2.9, 1.0), steal: S(0.01, 0, 0.04), ttl: 3 }),
   blaze: D({ id: 'blaze', name: 'Street Blaze', kind: 'drive', tech: 'cross', counter: 'space', anim: 'Switch_Dribble_1', fx: 'fire',
     line: 'Street handles: the defender is left behind. Space waits for it.',
     beat: S(1.5, 0.9, 1.3), steal: S(0.03, 0.05, 0.03), ttl: 3 }),
@@ -128,7 +128,7 @@ export const FIRE = {
 };
 
 const ATT_WIN = new Set(['beat', 'room', 'open', 'slip', 'feed', 'help', 'make', 'and1']);
-const TAKEAWAY = new Set(['steal', 'pick', 'block']);
+const TAKEAWAY = new Set(['steal', 'pick', 'block', 'charge']);
 /** Fire change for the attacking and the defending team after one outcome. */
 export function fireDelta(ev: string): { att: number; def: number } {
   if (ATT_WIN.has(ev)) return { att: FIRE.attWin, def: 0 };

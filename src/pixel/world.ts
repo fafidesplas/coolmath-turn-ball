@@ -40,7 +40,15 @@ export interface PixelPose {
   act: { tag: string; t: number; ms?: number } | null;
   open: boolean;
   showNum: boolean;
+  /** Per-player animation style (which idle and dribble variants of the pack they use). */
+  style?: number;
+  /** Holding the ball at the post: back to the basket. */
+  post?: boolean;
 }
+
+const IDLE_BALL = ['Idle_Ball_1', 'Idle_Ball_2', 'Idle_Ball_3', 'Idle_Ball_4', 'Switch_Dribble_2'];
+const DRIBBLE_R = ['Dribble_1', 'Dribble_2'];
+const DRIBBLE_L = ['Dribble_1_Left', 'Dribble_2_Left'];
 
 interface PV { look: PixelLook; flip: boolean; clock: number; s: PixelPose | null; frame: number; ballDrawn: boolean }
 
@@ -411,7 +419,12 @@ export class PixelWorld {
       else {
         t = pv.clock;
         if (s.moving) tag = s.carry ? (s.fast ? 'Sprint_Ball' : 'Run_Ball') : s.defending ? 'Slide' : 'Run';
-        else if (s.carry) tag = s.deciding ? 'Idle_Ball_1' : 'Dribble_1';
+        else if (s.carry) {
+          const k = s.style ?? 0;
+          if (s.post) tag = s.deciding ? (k % 2 ? 'Back_Idle' : 'Back_Idle_2') : 'Back_Dribble';
+          else if (s.deciding) tag = IDLE_BALL[k % IDLE_BALL.length];
+          else tag = ((k >>> 5) % 3 === 0 ? DRIBBLE_L : DRIBBLE_R)[(k >>> 2) % 2];
+        }
         else tag = s.defending ? 'Idle_2' : 'Idle';
       }
       const f = tagFrame(tag, t, loop, ms);

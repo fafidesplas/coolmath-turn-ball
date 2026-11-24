@@ -64,6 +64,16 @@ const P: Record<string, string> = {
   slot: '<rect x="4" y="4" width="16" height="16" rx="4" stroke-dasharray="3 2.5"/>',
   train: '<path d="M3 9v6M21 9v6M6 6v12M18 6v12M6 12h12"/>',
   next: '<path d="M5 12h12M13 7l5 5-5 5"/>',
+  // Pixel edition move set and the risk pip.
+  warn: '<path d="M12 3 22 20H2z"/><path d="M12 9v5" stroke-width="2.6"/><circle cx="12" cy="17" r=".8" fill="currentColor"/>',
+  t_dunk: '<path d="M6 4h12M8 4v3h8V4"/><path d="M9 7l1 5h4l1-5"/><circle cx="12" cy="15.5" r="2.5" fill="currentColor"/><path d="M12 21v-3M7 13l-3 3M17 13l3 3"/>',
+  t_three: '<circle cx="12" cy="18" r="2.4"/><path d="M3 21C3 11 21 11 21 21" stroke-dasharray="2 2"/><path d="M12 15V4M8.5 7.5 12 4l3.5 3.5"/>',
+  t_between: '<path d="M7 3l-3 18M17 3l3 18"/><circle cx="12" cy="17" r="2.6" fill="currentColor"/><path d="M5 12c3 3 11 3 14 0" stroke-dasharray="2 2"/>',
+  t_behind: '<circle cx="12" cy="5" r="2.4"/><path d="M12 8v8M9 21l3-5 3 5"/><path d="M5 13c0 4 14 4 14 0" stroke-dasharray="2 2"/><circle cx="19.5" cy="11" r="1.8" fill="currentColor"/>',
+  t_backdown: '<path d="M3 21h18"/><rect x="4" y="8" width="6" height="10" rx="2"/><path d="M11 13h7M15 10l3 3-3 3"/><circle cx="7" cy="5" r="2"/>',
+  t_contest: '<path d="M8 21V9a1.5 1.5 0 0 1 3 0V5a1.5 1.5 0 0 1 3 0v4a1.5 1.5 0 0 1 3 0v6c0 3-2 6-5 6z"/><circle cx="4.5" cy="5" r="2" fill="currentColor"/>',
+  t_rim: '<rect x="6" y="2.5" width="12" height="6" rx="1"/><path d="M8 11h8l-1.5 6h-5z"/><path d="M4 21l4-4M20 21l-4-4M12 21v-3"/>',
+  t_charge: '<path d="M10 3v18M14 3v18" stroke-dasharray="2.5 2"/><circle cx="5" cy="12" r="2.4"/><path d="M7.5 12H10"/><path d="M14 8l5 4-5 4"/><path d="M19 5v14" stroke-width="2.8"/>',
 };
 
 export function icon(name: string, size = 24, cls = ''): string {
