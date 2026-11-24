@@ -6,6 +6,7 @@ import { Vector3, type Curve } from 'three';
 import { ZONES } from '../rules';
 import { COURT_H, COURT_W, HOOP } from './court';
 import { A, FEET, atlasImage, drawPiece, drawPlayer, hasPiece, pixText, pixTextW, tagFrame, type Look } from './sprites';
+import type { FxStyle } from '../specials';
 
 export const VIEW_W = 262;
 export const VIEW_H = 230;
@@ -49,6 +50,31 @@ type Wall = { x: number; y: number; w: number; h: number; color: string };
 type Ghost = { x: number; y: number; color: string };
 interface Label { el: HTMLElement; x: number; y: number }
 interface Floater { el: HTMLElement; x: number; y: number; t: number }
+/** Pixel particle (canvas pixels). */
+interface Part { x: number; y: number; vx: number; vy: number; g: number; t: number; life: number; kind: 'flame' | 'spark' | 'smoke' | 'frost' | 'wind' | 'dust' | 'bolt' | 'ring'; size: number }
+interface Aura { i: number; style: FxStyle; t: number }
+interface Ghost2 { i: number; x: number; y: number; frame: number; flip: boolean; t: number; color: string }
+
+/** Flame ramp by remaining life (light to dark): luminance carries the age, not only the hue. */
+const FLAME = ['#fffbe0', '#ffe066', '#ffb02e', '#ff6a1a', '#d62f1f', '#7a1d2e', '#3b1630'];
+const FX_COL: Record<FxStyle, string[]> = {
+  fire: FLAME,
+  bolt: ['#ffffff', '#fff3a0', '#ffd60a', '#b8a23a', '#4a4030'],
+  frost: ['#ffffff', '#d8f6ff', '#8fe3ff', '#4aa8d8', '#24527a'],
+  wind: ['#ffffff', '#eef7ff', '#bcd4e6', '#7f96ad', '#3e4c5e'],
+  spark: ['#ffffff', '#ffd6f5', '#ff8fd8', '#c04ab0', '#5a2160'],
+  quake: ['#fff1d6', '#d9b48a', '#a87c55', '#6e4b33', '#3a271c'],
+};
+const rampAt = (ramp: string[], k: number) => ramp[Math.min(ramp.length - 1, Math.max(0, Math.floor(k * ramp.length)))];
+
+/** Screen layout computed from the window: court and panel side by side (landscape) or stacked (portrait). */
+export interface Layout {
+  side: boolean;
+  court: { l: number; t: number; w: number; h: number };
+  panel: { l: number; t: number; w: number; h: number };
+  hud: { l: number; t: number; w: number };
+  scale: number;
+}
 
 const GOOD = '#3ddc97', BAD = '#ff4d6d';
 const INK = '#1b1029';
@@ -79,13 +105,35 @@ export class PixelWorld {
   private vw = VIEW_W;
   shake = 0;
   showZones = true;
+  /** Reduced motion: no shake, zoom, flashes or letterbox; few particles. */
+  reduce = false;
+  layout: Layout | null = null;
+  onLayout: ((l: Layout) => void) | null = null;
+  private view: HTMLCanvasElement;
+  private vg: CanvasRenderingContext2D;
+  private parts: Part[] = [];
+  private auras: Aura[] = [];
+  private ghosts2: Ghost2[] = [];
+  private trail: { style: FxStyle; pts: { x: number; y: number; t: number }[] } | null = null;
+  private flash = 0;
+  private flashCol = '#ffffff';
+  /** Integer zoom on a canvas point (cinematics); `bars` = letterbox. */
+  private zoom: { x: number; y: number; t: number; dur: number } | null = null;
+  private bars = 0;
+  private speedLines = 0;
 
   constructor(private container: HTMLElement, looks: PixelLook[]) {
     this.canvas = document.createElement('canvas');
     this.canvas.className = 'px-canvas';
     this.canvas.width = VIEW_W;
     this.canvas.height = VIEW_H;
-    this.g = this.canvas.getContext('2d')!;
+    this.vg = this.canvas.getContext('2d')!;
+    this.vg.imageSmoothingEnabled = false;
+    // The scene is drawn into an offscreen buffer, then copied (or zoomed by a whole number) to the screen.
+    this.view = document.createElement('canvas');
+    this.view.width = VIEW_W;
+    this.view.height = VIEW_H;
+    this.g = this.view.getContext('2d')!;
     this.g.imageSmoothingEnabled = false;
     this.labelsEl = document.createElement('div');
     this.labelsEl.className = 'px-labels';
@@ -101,44 +149,73 @@ export class PixelWorld {
     this.container.innerHTML = '';
   }
 
-  /** Whole-number scale in device pixels; landscape screens put the decision panel beside the court. */
+  /**
+   * Whole-number scale in device pixels. Landscape: the court and the panel form one centered block that fills
+   * the height (the panel takes the rest of the width, between a readable minimum and a maximum). Portrait: the
+   * HUD on top, the court (side margins cropped when that buys a bigger scale), the panel below.
+   */
   resize() {
-    const W = this.container.clientWidth || 1, H = this.container.clientHeight || 1;
-    const dpr = window.devicePixelRatio || 1;
     const screen = this.container.parentElement;
-    const hud = 46;
-    const sideW = Math.round(Math.min(430, Math.max(300, W * 0.36)));
-    const sSide = Math.floor(Math.min(((W - sideW - 8) * dpr) / VIEW_W, ((H - 8) * dpr) / VIEW_H));
-    const reserve = Math.min(H * 0.44, 360);
-    const stackScale = (vw: number) => Math.floor(Math.min(((W - 4) * dpr) / vw, ((H - hud - reserve) * dpr) / VIEW_H));
-    const sStack = stackScale(VIEW_W), sCrop = stackScale(CROP_W);
-    const side = W > H * 1.15 && sSide >= sStack;
-    const crop = !side && sCrop > sStack;
+    const W = (screen?.clientWidth || this.container.clientWidth) || 1, H = (screen?.clientHeight || this.container.clientHeight) || 1;
+    const dpr = window.devicePixelRatio || 1;
+    const pad = W < 600 || H < 500 ? 4 : 10;
+    const gap = W < 900 ? 6 : 12;
+    const minPanel = W < 700 ? 280 : 330, maxPanel = 560;
+    const fit = (vw: number, availW: number, availH: number) => Math.max(1, Math.floor(Math.min((availW * dpr) / vw, (availH * dpr) / VIEW_H)));
+    // Landscape candidate (full width or cropped scene, whichever is bigger).
+    const sideFor = (vw: number) => fit(vw, W - 2 * pad - gap - minPanel, H - 2 * pad);
+    const sSideFull = sideFor(VIEW_W), sSideCrop = sideFor(CROP_W);
+    // Portrait candidate: HUD on top, the panel keeps at least ~40% of the height.
+    const hudH = 50;
+    const minPanelH = Math.max(250, Math.round(H * 0.4));
+    const stackFor = (vw: number) => fit(vw, W - 2 * pad, H - hudH - minPanelH - pad);
+    const sStackFull = stackFor(VIEW_W), sStackCrop = stackFor(CROP_W);
+    const landscape = W > H * 1.1;
+    const side = landscape && W - Math.min(sSideFull, sSideCrop) >= minPanel;
+    let crop: boolean, s: number;
+    if (side) { crop = sSideCrop > sSideFull; s = crop ? sSideCrop : sSideFull; }
+    else { crop = sStackCrop > sStackFull; s = crop ? sStackCrop : sStackFull; }
     this.x0 = crop ? CROP_X0 : 0;
     this.vw = crop ? CROP_W : VIEW_W;
     if (this.canvas.width !== this.vw) this.canvas.width = this.vw;
-    this.g.imageSmoothingEnabled = false;
-    const s = Math.max(1, side ? sSide : crop ? sCrop : sStack);
+    this.vg.imageSmoothingEnabled = false;
     const cw = (this.vw * s) / dpr, ch = (VIEW_H * s) / dpr;
     const snap = (v: number) => Math.round(v * dpr) / dpr;
-    const left = snap(side ? Math.max(4, (W - sideW - cw) / 2) : (W - cw) / 2);
-    const top = snap(side ? Math.max(4, (H - ch) / 2) : hud);
+    let L: Layout;
+    if (side) {
+      const pw = Math.round(Math.min(maxPanel, Math.max(minPanel, W - 2 * pad - gap - cw)));
+      const groupW = cw + gap + pw;
+      const left = snap(Math.max(pad, (W - groupW) / 2));
+      const top = snap((H - ch) / 2);
+      const ph = H - 2 * pad;
+      const pt = pad;
+      L = { side, scale: s / dpr, court: { l: left, t: top, w: cw, h: ch }, panel: { l: Math.round(left + cw + gap), t: pt, w: pw, h: ph }, hud: { l: Math.round(left + cw + gap), t: pt, w: pw } };
+    } else {
+      const left = snap((W - cw) / 2);
+      const top = snap(hudH + 2);
+      const pt = Math.round(top + ch + gap / 2);
+      const pw = Math.min(W - 2 * pad, 640);
+      L = { side, scale: s / dpr, court: { l: left, t: top, w: cw, h: ch }, panel: { l: Math.round((W - pw) / 2), t: pt, w: pw, h: Math.max(0, H - pt - pad) }, hud: { l: pad, t: 4, w: W - 2 * pad } };
+    }
     for (const el of [this.canvas, this.labelsEl]) {
-      el.style.width = `${cw}px`;
-      el.style.height = `${ch}px`;
-      el.style.left = `${left}px`;
-      el.style.top = `${top}px`;
+      el.style.width = `${L.court.w}px`;
+      el.style.height = `${L.court.h}px`;
+      el.style.left = `${L.court.l}px`;
+      el.style.top = `${L.court.t}px`;
     }
     this.k = s / dpr;
+    this.layout = L;
     if (screen) {
       screen.classList.toggle('side', side);
-      screen.style.setProperty('--panel-w', `${sideW}px`);
-      screen.style.setProperty('--court-l', `${left}px`);
-      screen.style.setProperty('--court-w', `${cw}px`);
-      screen.style.setProperty('--court-top', `${top}px`);
-      screen.style.setProperty('--court-bottom', `${top + ch}px`);
+      screen.classList.toggle('stack', !side);
+      const v = (k: string, n: number) => screen.style.setProperty(k, `${Math.round(n * 100) / 100}px`);
+      v('--court-l', L.court.l); v('--court-w', L.court.w); v('--court-top', L.court.t); v('--court-h', L.court.h);
+      v('--court-bottom', L.court.t + L.court.h);
+      v('--panel-l', L.panel.l); v('--panel-t', L.panel.t); v('--panel-w', L.panel.w); v('--panel-h', L.panel.h);
+      v('--hud-l', L.hud.l); v('--hud-t', L.hud.t); v('--hud-w', L.hud.w);
       screen.style.setProperty('--px', `${Math.max(2, Math.round(this.k))}px`);
     }
+    this.onLayout?.(L);
     this.placeLabels();
   }
 
@@ -267,15 +344,9 @@ export class PixelWorld {
     this.time += dt;
     const g = this.g;
     g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalAlpha = 1;
     g.fillStyle = '#2a1b3d';
-    g.fillRect(0, 0, this.vw, VIEW_H);
-    let sx = 0, sy = 0;
-    if (this.shake > 0) {
-      this.shake = Math.max(0, this.shake - dt);
-      const s = Math.ceil(this.shake * 6);
-      sx = Math.round((Math.random() - 0.5) * s); sy = Math.round((Math.random() - 0.5) * s);
-    }
-    g.setTransform(1, 0, 0, 1, sx - this.x0, sy);
+    g.fillRect(0, 0, VIEW_W, VIEW_H);
     const sheet = atlasImage();
     // Ground: grass strip behind the baseline, the court, props.
     for (let y = 0; y < VIEW_H; y += 16) for (let x = 238; x < VIEW_W; x += 48) drawPiece(g, sheet, 'grass', x, y);
@@ -423,6 +494,9 @@ export class PixelWorld {
     this.netKick = Math.max(0, this.netKick - dt * 2.5);
     this.rimKick = Math.max(0, this.rimKick - dt * 4);
 
+    this.drawFx(dt);
+    this.blit(dt);
+
     // Floating callouts rise in whole canvas pixels.
     this.floaters = this.floaters.filter((f) => {
       f.t += dt;
@@ -431,6 +505,194 @@ export class PixelWorld {
       if (f.t > 1.4) { f.el.remove(); return false; }
       return true;
     });
+  }
+
+  // ---------------------------------------------------------------- effects (cinematics)
+  /** Clear every running effect (new possession, destroy). */
+  fxClear() {
+    this.parts = []; this.auras = []; this.ghosts2 = []; this.trail = null;
+    this.zoom = null; this.bars = 0; this.flash = 0; this.speedLines = 0;
+    this.labelsEl.classList.remove('hide');
+  }
+
+  private spawn(kind: Part['kind'], x: number, y: number, vx: number, vy: number, life: number, size = 1, gr = 0) {
+    if (this.parts.length > (this.reduce ? 80 : 420)) return;
+    this.parts.push({ x, y, vx, vy, g: gr, t: 0, life, kind, size });
+  }
+
+  /** A burst of particles at a court point (meters, height in meters). */
+  burst(x: number, y: number, h: number, style: FxStyle, power = 1) {
+    const p = project(x, y, h);
+    const n = Math.round((this.reduce ? 6 : 26) * power);
+    const R = () => Math.random() - 0.5;
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, v = 30 + Math.random() * 60 * power;
+      // Every special burns: flames rise from every burst, then the style's own shape.
+      this.spawn('flame', p.x + R() * 6, p.y + R() * 4, Math.cos(a) * v * 0.4, -20 - Math.random() * 40, 0.5 + Math.random() * 0.5, Math.random() < 0.5 ? 2 : 1, -30);
+      const kind: Part['kind'] = style === 'bolt' ? 'spark' : style === 'frost' ? 'frost' : style === 'wind' ? 'wind' : style === 'quake' ? 'dust' : style === 'spark' ? 'spark' : 'flame';
+      if (i % 2 === 0) this.spawn(kind, p.x, p.y, Math.cos(a) * v, Math.sin(a) * v * 0.6, 0.35 + Math.random() * 0.4, 1, kind === 'dust' ? 80 : 0);
+    }
+    if (style === 'bolt') for (let i = 0; i < (this.reduce ? 1 : 4); i++) this.spawn('bolt', p.x, p.y, R() * 2, -1, 0.22, 1);
+    if (style === 'quake' || style === 'fire') this.spawn('ring', project(x, y, 0).x, project(x, y, 0).y, 0, 0, 0.45, 1);
+    if (!this.reduce) for (let i = 0; i < 6; i++) this.spawn('smoke', p.x + R() * 10, p.y + R() * 4, R() * 8, -12 - Math.random() * 10, 0.9 + Math.random() * 0.5, 2);
+  }
+
+  /** Player `i` burns while the special plays (flames at the feet, afterimages when moving). */
+  aura(i: number, style: FxStyle, dur: number) { this.auras = this.auras.filter((a) => a.i !== i); this.auras.push({ i, style, t: dur }); }
+  /** The ball leaves a burning trail while it flies. */
+  ballTrail(style: FxStyle | null) { this.trail = style ? { style, pts: [] } : null; }
+  flashNow(color = '#ffffff', k = 0.7) { if (this.reduce) return; this.flash = k; this.flashCol = color; }
+  /** Snap a 2x zoom (whole number: pixels stay square) on a court point, with letterbox bars. */
+  cinematic(x: number | null, y = 0, h = 1, dur = 1.2) {
+    if (x === null) { this.zoom = null; this.labelsEl.classList.remove('hide'); return; }
+    this.bars = 1;
+    if (this.reduce) return;
+    const p = project(x, y, h);
+    this.zoom = { x: p.x, y: p.y, t: 0, dur };
+    this.labelsEl.classList.add('hide');
+  }
+  cutInLines(dur = 0.8) { if (!this.reduce) this.speedLines = dur; }
+  endCinematic() { this.zoom = null; this.bars = 0; this.labelsEl.classList.remove('hide'); }
+
+  private drawFx(dt: number) {
+    const g = this.g;
+    // Auras: flames at the feet and afterimages of the moving player.
+    for (const a of this.auras) {
+      a.t -= dt;
+      const pv = this.players[a.i];
+      const s = pv?.s;
+      if (!s) continue;
+      const p = project(s.x, s.y);
+      const k = this.reduce ? 0.25 : 1;
+      if (Math.random() < 0.9 * k) this.spawn('flame', p.x + (Math.random() - 0.5) * 12, p.y - Math.random() * 6, (Math.random() - 0.5) * 8, -25 - Math.random() * 30, 0.45 + Math.random() * 0.4, Math.random() < 0.4 ? 2 : 1, -20);
+      if (Math.random() < 0.35 * k) {
+        const kind: Part['kind'] = a.style === 'frost' ? 'frost' : a.style === 'wind' ? 'wind' : a.style === 'quake' ? 'dust' : 'spark';
+        this.spawn(kind, p.x + (Math.random() - 0.5) * 14, p.y - 8 - Math.random() * 22, (Math.random() - 0.5) * 20, -10 - Math.random() * 20, 0.4, 1);
+      }
+      if (!this.reduce && s.moving && Math.floor(this.time * 20) !== Math.floor((this.time - dt) * 20)) {
+        this.ghosts2.push({ i: a.i, x: Math.round(p.x) - FEET.x, y: Math.round(p.y) - FEET.y, frame: pv.frame, flip: pv.flip, t: 0.3, color: FX_COL[a.style][2] });
+      }
+    }
+    this.auras = this.auras.filter((a) => a.t > 0);
+    // Afterimages: a flat silhouette in the style's color, fading in steps.
+    for (const gh of this.ghosts2) {
+      gh.t -= dt;
+      if (gh.t <= 0) continue;
+      this.silhouette(gh, gh.t > 0.15 ? 0.55 : 0.28);
+    }
+    this.ghosts2 = this.ghosts2.filter((x) => x.t > 0);
+    // Ball trail.
+    if (this.trail) {
+      const tr = this.trail;
+      tr.pts.push({ x: this.ball.x, y: this.ball.y, t: 0 });
+      for (const q of tr.pts) q.t += dt;
+      tr.pts = tr.pts.filter((q) => q.t < 0.35);
+      for (let i = 0; i < tr.pts.length; i++) {
+        const q = tr.pts[i];
+        const k = q.t / 0.35;
+        const sz = k < 0.3 ? 3 : k < 0.65 ? 2 : 1;
+        this.px(q.x - 1, q.y - 1, rampAt(FX_COL[tr.style], k * 0.9), sz, sz);
+      }
+      if (!this.reduce && Math.random() < 0.8) this.spawn('flame', this.ball.x, this.ball.y, (Math.random() - 0.5) * 10, -10, 0.35, 1, -10);
+    }
+    // Particles.
+    for (const q of this.parts) {
+      q.t += dt;
+      q.vy += q.g * dt;
+      q.x += q.vx * dt; q.y += q.vy * dt;
+      const k = q.t / q.life;
+      if (k >= 1) continue;
+      const x = Math.round(q.x), y = Math.round(q.y);
+      switch (q.kind) {
+        case 'flame': {
+          const c = rampAt(FLAME, k);
+          this.px(x, y, c, q.size, q.size + (k < 0.4 ? 1 : 0));
+          break;
+        }
+        case 'smoke': g.globalAlpha = 0.5 * (1 - k); this.px(x, y, '#3b2a48', q.size, q.size); g.globalAlpha = 1; break;
+        case 'spark': {
+          const c = k < 0.5 ? '#ffffff' : '#ffd166';
+          this.px(x, y, c); if (k < 0.6) { this.px(x - 1, y, c); this.px(x + 1, y, c); this.px(x, y - 1, c); this.px(x, y + 1, c); }
+          break;
+        }
+        case 'frost': { const c = rampAt(FX_COL.frost, k); this.px(x, y - 1, c); this.px(x - 1, y, c); this.px(x + 1, y, c); this.px(x, y + 1, c); break; }
+        case 'wind': { const c = rampAt(FX_COL.wind, k); this.px(x - 3, y, c, 6, 1); break; }
+        case 'dust': this.px(x, y, rampAt(FX_COL.quake, k), 2, 2); break;
+        case 'bolt': {
+          // A jagged bolt from above down to the point.
+          let bx = x, by = y - 40;
+          const c = k < 0.5 ? '#ffffff' : '#ffd60a';
+          while (by < y) { const nx = bx + Math.round((Math.random() - 0.5) * 6), ny = by + 4; for (let j = 0; j <= 4; j++) this.px(Math.round(bx + ((nx - bx) * j) / 4), by + j, c); bx = nx; by = ny; }
+          break;
+        }
+        case 'ring': this.ellipse(x, y, 4 + k * 26, 2 + k * 11, k < 0.5 ? '#ffe066' : '#ff6a1a', 10, this.time * 4); break;
+      }
+    }
+    this.parts = this.parts.filter((q) => q.t < q.life);
+  }
+
+  private tint: HTMLCanvasElement | null = null;
+  private silhouette(gh: Ghost2, alpha: number) {
+    const pv = this.players[gh.i];
+    if (!this.tint) { this.tint = document.createElement('canvas'); this.tint.width = 64; this.tint.height = 64; }
+    const t = this.tint.getContext('2d')!;
+    t.globalCompositeOperation = 'source-over';
+    t.clearRect(0, 0, 64, 64);
+    drawPlayer(t, pv.look, gh.frame, 0, 0, gh.flip, false);
+    t.globalCompositeOperation = 'source-in';
+    t.fillStyle = gh.color;
+    t.fillRect(0, 0, 64, 64);
+    this.g.globalAlpha = alpha;
+    this.g.drawImage(this.tint, gh.x, gh.y);
+    this.g.globalAlpha = 1;
+  }
+
+  /** Copy the scene to the screen: shake, 2x zoom, letterbox, cut-in speed lines, flash. */
+  private blit(dt: number) {
+    const v = this.vg;
+    v.setTransform(1, 0, 0, 1, 0, 0);
+    v.fillStyle = '#1b1029';
+    v.fillRect(0, 0, this.vw, VIEW_H);
+    let sx = 0, sy = 0;
+    if (this.shake > 0) {
+      this.shake = Math.max(0, this.shake - dt);
+      if (!this.reduce) {
+        const m = Math.ceil(this.shake * 8);
+        sx = Math.round((Math.random() - 0.5) * m); sy = Math.round((Math.random() - 0.5) * m);
+      }
+    }
+    if (this.zoom) {
+      const z = this.zoom;
+      z.t += dt;
+      const w = Math.floor(this.vw / 2), h = Math.floor(VIEW_H / 2);
+      const x = Math.round(Math.min(this.x0 + this.vw - w, Math.max(this.x0, z.x - w / 2)));
+      const y = Math.round(Math.min(VIEW_H - h, Math.max(0, z.y - h * 0.62)));
+      v.drawImage(this.view, x, y, w, h, sx, sy, w * 2, h * 2);
+      if (z.t >= z.dur) { this.zoom = null; this.labelsEl.classList.remove('hide'); }
+    } else v.drawImage(this.view, this.x0, 0, this.vw, VIEW_H, sx, sy, this.vw, VIEW_H);
+    if (this.speedLines > 0) {
+      this.speedLines -= dt;
+      const cx = this.vw / 2, cy = VIEW_H / 2;
+      v.fillStyle = '#fff7ea';
+      for (let i = 0; i < 26; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const r0 = 70 + Math.random() * 40, r1 = r0 + 30 + Math.random() * 40;
+        for (let r = r0; r < r1; r += 2) v.fillRect(Math.round(cx + Math.cos(a) * r), Math.round(cy + Math.sin(a) * r * 0.8), 1, 1);
+      }
+    }
+    if (this.bars > 0 && !this.reduce) {
+      const bh = 14;
+      v.fillStyle = '#0a0612';
+      v.fillRect(0, 0, this.vw, bh);
+      v.fillRect(0, VIEW_H - bh, this.vw, bh);
+    }
+    if (this.flash > 0) {
+      v.globalAlpha = Math.min(0.7, this.flash);
+      v.fillStyle = this.flashCol;
+      v.fillRect(0, 0, this.vw, VIEW_H);
+      v.globalAlpha = 1;
+      this.flash = Math.max(0, this.flash - dt * 4);
+    }
   }
 
   private netSlice(y: number, h: number): [number, number, number, number] {

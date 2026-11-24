@@ -2,11 +2,12 @@
 // Uses the exact same rules module as the game. Every run with the same seed prints the same numbers.
 import { ROLE_KITS, TEMPLATES, STARTER_IDS, type Stats } from './data.ts';
 import {
-  actOdds, branches, defMovesFor, OpponentModel, legalActs, Planner, pickBranch, quickQ, readDefense, rng, sampleStance,
+  actOdds, branches, defMovesFor, OpponentModel, legalActs, Planner, pickBranch, quickQ, readDefense, rng, sampleStance, planOf, BASE_V,
   MATCH_RULES, setupPoss, SETUPS, shotChance, STANCES, TUNE, ZONES, ROUTES, zoneDist,
   type Act, type ActKind, type DefPlan, type Ev, type Matchup, type Poss, type Stance, type StanceDist,
 } from './rules.ts';
 import { TECHS, VARIANTS, isDefTech, type TechId } from './techs.ts';
+import { FIRE, SIGNATURE, SPECIALS, fireDelta, type SpecialId } from './specials.ts';
 
 declare const process: { argv: string[] };
 const arg = (name: string, def: number) => {
@@ -142,7 +143,7 @@ const DEFS: Record<string, DefPolicy> = {
 
 // ---------------------------------------------------------------- calibration
 
-const MAIN_EV: Record<ActKind, Ev[]> = { shoot: ['make', 'and1', 'block'], pass: ['catch', 'feed', 'pick'], drive: ['beat', 'room', 'steal'], cut: ['open', 'slip', 'beat'] };
+const MAIN_EV: Record<ActKind, Ev[]> = { shoot: ['make', 'and1', 'block'], pass: ['catch', 'feed', 'pick'], drive: ['beat', 'room', 'steal'], cut: ['open', 'slip', 'beat', 'room'] };
 type Cal = { n: number; p: number; hit: number };
 const calib = { bins: Array.from({ length: 10 }, (): Cal => ({ n: 0, p: 0, hit: 0 })), byEv: new Map<string, Cal>() };
 function recordCalib(m: Matchup, s: Poss, a: Act, plan: DefPlan, happened: Ev) {
@@ -481,7 +482,105 @@ if (!QUICK) {
 
 }
 
-// 5. Calibration (all kits used above, every technique).
+// 5. Signature specials (Fire meter).
+{
+  const ONE = (st: Stance): StanceDist => ({ press: 0, space: 0, deny: 0, [st]: 1 });
+  const lineups: Record<string, string[]> = { starters: ['pip', 'mo', 'luz'], signings: ['kiki', 'benny', 'nova'], vets: ['taro', 'jax', 'ruby'], stars: ['zed', 'fern', 'ola'] };
+  const spMatch = (kit: string, sp: (SpecialId | null)[]): Matchup => ({ ...mk(kit, kit), sp });
+  out.push('## Signature specials (Fire meter)');
+  out.push('');
+  out.push(`Fire: +${FIRE.attWin} per duel won on attack, +${FIRE.takeaway} per takeaway and +${FIRE.miss} per forced miss on defense, ${FIRE.turnover} per turnover; a special costs ${FIRE.cost} of ${FIRE.max}. Exact expected points of a possession (expectimax, kit "learned" both sides, average over formations and handlers) without and with a full meter:`);
+  out.push('');
+  out.push('| lineup | specials | no fire | with fire | gain (pts) |');
+  out.push('|---|---|---|---|---|');
+  for (const [name, ids] of Object.entries(lineups)) {
+    const sp = ids.map((t) => SIGNATURE[t]);
+    const m = spMatch('learned', sp);
+    const pl = new Planner(m, (s) => readDefense(m, s));
+    let v0 = 0, v1 = 0, n = 0;
+    for (const su of SETUPS) for (let h = 0; h < 3; h++) { const s = setupPoss(su, h); v0 += pl.value(s); v1 += pl.value({ ...s, fire: true }); n++; }
+    out.push(`| ${name} | ${sp.map((x) => SPECIALS[x].name).join(', ')} | ${(v0 / n).toFixed(3)} | ${(v1 / n).toFixed(3)} | +${((v1 - v0) / n).toFixed(3)} |`);
+  }
+  out.push('');
+  out.push('Risk and reward per special: exact value (expectimax over the rest of the possession) of the special minus the same action done with its plain technique, against each pure stance, averaged over the states where it is legal (expert possessions with a full meter). The counter column must be the lowest; a negative value means the plain technique is better there.');
+  out.push('');
+  out.push('| special | kind | counter | samples | vs press | vs space | vs deny | counter is lowest |');
+  out.push('|---|---|---|---|---|---|---|---|');
+  let allCounters = true;
+  for (const id of Object.keys(SPECIALS) as SpecialId[]) {
+    const d = SPECIALS[id];
+    const m = spMatch('learned', [id, id, id]);
+    const pl = new Planner(m, (s) => readDefense(m, s));
+    const sum: Record<Stance, number> = { press: 0, space: 0, deny: 0 };
+    let n = 0;
+    for (let i = 0; i < Math.min(POSS, 400); i++) {
+      let s: Poss | null = { ...randomStart(r), fire: true };
+      while (s) {
+        const acts = legalActs(s, m);
+        for (const a of acts) {
+          if (!a.sp) continue;
+          const plain = { ...a, sp: undefined } as Act;
+          for (const st of STANCES) sum[st] += pl.qPlan(s, a, planOf(ONE(st), BASE_V)) - pl.qPlan(s, plain, planOf(ONE(st), BASE_V));
+          n++;
+        }
+        const plan: DefPlan = { dist: readDefense(m, s), v: pl.plan(s).v };
+        const best = bestBy(acts, (a) => pl.qPlan(s!, a, plan));
+        s = pickBranch(branches(m, s, best, plan.v[sampleStance(plan.dist, r())]), r()).next;
+      }
+    }
+    const avg = (st: Stance) => (n ? sum[st] / n : 0);
+    const lowest = STANCES.every((st) => avg(d.counter) <= avg(st) + 1e-9);
+    if (!lowest) allCounters = false;
+    out.push(`| ${d.name} | ${d.kind} | ${d.counter} | ${n} | ${STANCES.map((st) => `${avg(st) >= 0 ? '+' : ''}${avg(st).toFixed(3)}`).join(' | ')} | ${lowest ? 'yes' : 'NO'} |`);
+  }
+  out.push('');
+  out.push(`Every special is weakest against its counter: ${allCounters ? 'yes' : 'NO'}.`);
+  out.push('');
+  // Full matches with the Fire economy: expert attack, court-reading defense; one team may use specials.
+  const fireMatch = (spA: boolean, spB: boolean, ids: string[]) => {
+    const sp = ids.map((t) => SIGNATURE[t]);
+    const ms = [spMatch('learned', spA ? sp : [null, null, null]), spMatch('learned', spB ? sp : [null, null, null])];
+    const pls = ms.map((m) => plannerFor(m, `fire:${ids.join()}:${m.sp!.join()}`));
+    const score = [0, 0], possN = [0, 0], heat = [0, 0];
+    let used = 0;
+    let off = r() < 0.5 ? 0 : 1;
+    for (let guard = 0; guard < 200; guard++) {
+      const m = ms[off], pl = pls[off];
+      let s: Poss | null = randomStart(r);
+      let spent = false;
+      while (s) {
+        s = { ...s, fire: heat[off] >= FIRE.cost && !spent };
+        const plan: DefPlan = { dist: readDefense(m, s), v: pl.plan(s).v };
+        const a = bestBy(legalActs(s, m), (x) => pl.qPlan(s!, x, plan));
+        const b = pickBranch(branches(m, s, a, plan.v[sampleStance(plan.dist, r())]), r());
+        if (a.sp) { heat[off] -= FIRE.cost; used++; spent = true; }
+        const fd = fireDelta(b.ev);
+        heat[off] = Math.max(0, Math.min(FIRE.max, heat[off] + fd.att));
+        heat[1 - off] = Math.max(0, Math.min(FIRE.max, heat[1 - off] + fd.def));
+        score[off] += b.pts;
+        s = b.next;
+      }
+      possN[off]++;
+      if (score[off] >= MATCH_RULES.winScore) break;
+      if (possN[0] === possN[1] && possN[0] >= MATCH_RULES.maxPoss && score[0] !== score[1]) break;
+      off = 1 - off;
+    }
+    return { win: score[0] > score[1], used, poss: possN[0] + possN[1] };
+  };
+  out.push('Full matches with the Fire meter (expert attack, court-reading defense, kit "learned", equal stats): win % of a team that uses its specials against one that never does, and how often specials are used.');
+  out.push('');
+  out.push('| lineup | win % with specials | specials per match (team using them) | possessions per match |');
+  out.push('|---|---|---|---|');
+  for (const [name, ids] of Object.entries(lineups)) {
+    let w = 0, used = 0, poss = 0;
+    const nM = MATCHES * 2;
+    for (let k = 0; k < nM; k++) { const o = fireMatch(true, false, ids); if (o.win) w++; used += o.used; poss += o.poss; }
+    out.push(`| ${name} | ${pct(w / nM)} | ${(used / nM).toFixed(2)} | ${(poss / nM).toFixed(1)} |`);
+  }
+  out.push('');
+}
+
+// 6. Calibration (all kits used above, every technique).
 out.push('## Calibration (announced probability vs observed frequency, every technique)');
 out.push('');
 out.push('| announced bin | samples | mean announced | observed | gap (pts) | std. error (pts) |');

@@ -69,7 +69,10 @@ def remap(im, table):
 # ---------------------------------------------------------------- what the game uses
 TAGS = ['Idle', 'Idle_2', 'Idle_Ball_1', 'Dribble_1', 'Run', 'Run_Ball', 'Sprint_Ball', 'Slide', 'Jab',
         'Crossover', 'Hesi', 'Behind_Back', 'Side_Step', 'Between', 'Jumpshot', 'Jumpshot_2', 'Fadeaway_Left',
-        'Layup', 'Dunk_1', 'Double_Clutch', 'Jump', 'Jump_TwoFeet_Ball', 'Steal', 'Block_1', 'Rebound_1', 'Free_Throw']
+        'Layup', 'Dunk_1', 'Double_Clutch', 'Jump', 'Jump_TwoFeet_Ball', 'Steal', 'Block_1', 'Rebound_1', 'Free_Throw',
+        # Arcade edition: signature specials and the newer techniques reuse these pack animations.
+        'Dunk_3', 'Dunk_5', 'Dunk_7', 'Floater', 'Jumpshot_3', 'Fake_Fadeaway_Right', 'Back_Down', 'Switch_Dribble_1',
+        'Pocket_Dribble', 'Sprint', 'Block_3', 'Jump_OneFeet_Ball']
 HAIRS = ['Hair1', 'Hair2', 'Hair4', 'Hair5', 'Hair7']
 # Groups drawn in this order. Colors are nudged so every recolorable role has a unique key color.
 GROUPS = {

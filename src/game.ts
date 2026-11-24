@@ -23,6 +23,8 @@ export interface Save {
   tutorialDone?: boolean;
   /** Techniques learned since the team screen was last opened (uid:tech), shown as NEW. */
   fresh?: string[];
+  /** Pixel edition: reduced motion (no slow motion, zoom, shake or particle bursts). */
+  reduceFx?: boolean;
 }
 
 export function newSave(): Save {
@@ -43,9 +45,10 @@ function migratePlayer(p: Player) {
   p.gear = p.known.slice(0, slotsFor(p.level));
 }
 
-export function loadSave(): Save {
+/** `key`: the pixel edition keeps its own save (its techniques and signatures do not exist in the 3D game). */
+export function loadSave(key = KEY): Save {
   try {
-    const raw = localStorage.getItem(KEY);
+    const raw = localStorage.getItem(key);
     if (raw) {
       const s = JSON.parse(raw) as Save;
       if (s.v === 1 && Array.isArray(s.roster) && s.roster.length >= 3) {
@@ -58,8 +61,8 @@ export function loadSave(): Save {
   return newSave();
 }
 
-export function persist(s: Save) {
-  try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* private mode */ }
+export function persist(s: Save, key = KEY) {
+  try { localStorage.setItem(key, JSON.stringify(s)); } catch { /* private mode */ }
 }
 
 export function rollScout(s: Save) {

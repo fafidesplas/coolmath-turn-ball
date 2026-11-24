@@ -31,11 +31,20 @@ The first match starts with a short guided tutorial (three lessons and one free 
 
 ## Pixel edition
 
-`/pixel/` is the same game drawn in pixel art with sprites from *Basketball Asset Pack - Hoops in Pixel* by Josee (n3cloud on itch.io): top-down court, side-view players animated from the pack (idle, dribble, run, slide, jump shot, fadeaway, layup, dunk, double clutch, crossover, hesitation, behind the back, side step, pass, lob, steal, block, rebound), hoop, net and spinning ball. The canvas is drawn at its native size and scaled by a whole number of device pixels (`image-rendering: pixelated`); landscape screens put the decision panel beside the court.
+`/pixel/` is the same game drawn in pixel art with sprites from *Basketball Asset Pack - Hoops in Pixel* by Josee (n3cloud on itch.io): top-down court, side-view players animated from the pack (idle, dribble, run, slide, jump shot, fadeaway, floater, layup, several dunks, double clutch, crossover, hesitation, behind the back, between the legs, side step, back down, pass, lob, steal, block, rebound), hoop, net and spinning ball. The canvas is drawn at its native size and scaled by a whole number of device pixels (`image-rendering: pixelated`); see Layout below.
 
 Teams never depend on color alone: home plays in a light striped kit over a hollow ring, away in a dark kit with headbands over a solid diamond, and the HUD shows the same shapes. Odds use light solid, dotted grey and dark striped fills plus their icons and words; danger rings are dashed with a cross. Two-point spots are light squares, one-point spots dark dots.
 
-Code: `src/pixel/` (renderer `world.ts`, sprites `sprites.ts`, a presentation fork of the match and screens). It imports `rules.ts`, `techs.ts`, `data.ts` and `game.ts` unchanged, so odds and the simulator are the same; progress is shared with the 3D version.
+**Layout.** The court and the decision panel form one block: the court takes the biggest whole-number scale that leaves the panel a readable width (landscape: panel beside the court with the score on top, full height; portrait: score on top, court, panel below). Panel buttons are at least 44 px.
+
+**Arcade layer (pixel edition only).**
+
+- *Fire meter:* each team fills up to 4 flames by winning duels (+1 per duel won on attack, +2 per steal, pick or block, +1 per forced miss, -1 per turnover). A full meter unlocks one signature special for that possession. Flames are solid when lit and dotted when empty, with the word READY when full.
+- *Signature specials:* every player has one (`src/specials.ts`): Rocket Cross (Pip), Tower Slam (Mo), Sunset Splash (Luz), Zoom Thread (Kiki), Bulldozer (Benny), Blueprint Cut (Nova), Wall Hook (Taro), Pepper Dash (Jax), Ruby Fade (Ruby), Noodle Spin (Zed), Skywalk (Fern), Breeze Step (Ola); rivals have Street Blaze, Rim Quake and Comet Three. Each is a stronger, riskier version of a move with exact odds and one counter stance (the simulator checks that the counter is its weakest matchup). On defense the panel lists the specials the attack can throw and which stance stops each.
+- *Cinematics:* cut-in card with the pixel portrait, speed lines, a 2x whole-number zoom with letterbox bars, slow motion, fire aura and afterimages, burning ball trail, bursts, flash and screen shake, reusing pack animations (Dunk_3, Dunk_5, Dunk_7, Floater, Jumpshot_3, Fake_Fadeaway_Right, Back_Down, Between, Switch_Dribble_1...). "FX low" on the title screen or the pause menu (default when the system asks for reduced motion) removes slow motion, zoom, shake, flashes and most particles.
+- *More techniques:* Floater, Skip pass, Euro step, Pump fake and the plays Clear-out, Pick and pop and Hand-off, with longer technique paths per player (the starters bring one play each).
+
+Code: `src/pixel/` (renderer `world.ts`, sprites `sprites.ts`, a presentation fork of the match and screens, `arcade.ts` for the save, paths and rival kits). Odds come from the shared `rules.ts`; the new techniques and specials there only appear when a kit or a full Fire meter enables them, so the 3D game plays exactly as before. The pixel edition keeps its own save (`turnball-pixel-save-v1`), seeded once from the 3D save.
 
 The art is licensed and may not be redistributed, so the repo only holds it encrypted; the Pages build unseals it with a repository secret. Details and commands: [tools/pixel-art/README.md](tools/pixel-art/README.md).
 

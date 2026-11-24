@@ -1,27 +1,32 @@
-// Pixel fork of src/decisionui.ts (same flow; pixel icons). Decision bar. Attack: Shoot / Pass / Drive / Play. A base action opens the techniques the player
-// knows for it (one line each: icon, name, when it is good, best odds), then its targets (also
-// tappable as rings on the court). Defense: three stance families, each opening the team's
-// defensive techniques. Selecting an option previews it on the court and shows a three-line card
-// (gain / risk / change); selecting it again or pressing GO confirms.
-// Desktop: hover previews, click confirms. Keys: S P D C actions, Q W E R techniques, digits for
+// Pixel decision panel. Attack: Shoot / Pass / Drive / Play. A move opens its groups (the techniques
+// the player knows for it, plus the signature special when the Fire meter is full: one line each with
+// icon, name, when it is good and best odds), then its targets (also tappable as rings on the court).
+// Defense: three stance families, each opening the team's defensive techniques; when the attack's Fire is
+// full, the specials it can throw are listed with the stance that counters each. Selecting an option
+// previews it on the court and shows a three-line card (gain / risk / change); selecting it again or
+// pressing GO confirms.
+// Desktop: hover previews, click confirms. Keys: S P D C moves, Q W E R T Y techniques, digits for
 // targets (or stances), Enter, Esc.
 import { sfx } from '../audio';
 import { icon } from './pxicons';
 import type { ActKind, Stance } from '../rules';
 import { KIND_LABEL, STANCE_LABEL, type Match, type OptionInfo } from './match';
-import { TECHS, type TechId } from '../techs';
+import { TECHS } from '../techs';
+import { SPECIALS, type SpecialId } from '../specials';
 
 const KINDS: ActKind[] = ['shoot', 'pass', 'drive', 'cut'];
 const FAMS: Stance[] = ['press', 'space', 'deny'];
 const KEY_KIND: Record<string, ActKind> = { s: 'shoot', p: 'pass', d: 'drive', c: 'cut' };
-const VAR_KEYS = ['q', 'w', 'e', 'r'];
+const VAR_KEYS = ['q', 'w', 'e', 'r', 't', 'y'];
 const KIND_ICON: Record<ActKind, string> = { shoot: 'shoot', pass: 'pass', drive: 'dribble', cut: 'cut' };
+const grp = (o: OptionInfo) => o.group ?? o.tech;
 
 export class DecisionUI {
   el: HTMLElement;
   private opts: OptionInfo[] = [];
   private cat: ActKind | Stance | null = null;
-  private tech: TechId | null = null;
+  /** Selected group inside the category (a technique id or a special id). */
+  private tech: string | null = null;
   private sel: string | null = null;
   private open = false;
 
@@ -51,11 +56,12 @@ export class DecisionUI {
     if (on) this.render();
   }
 
-  /** Techniques available in a category, in a stable order (base first). */
-  private techsIn(cat: ActKind | Stance): TechId[] {
-    const out: TechId[] = [];
-    for (const o of this.opts) if (o.kind === cat && !out.includes(o.tech)) out.push(o.tech);
-    return out.sort((a, b) => Number(!TECHS[a].base) - Number(!TECHS[b].base));
+  /** Groups available in a category, in a stable order: base technique, others, the special last. */
+  private groupsIn(cat: ActKind | Stance): string[] {
+    const out: string[] = [];
+    for (const o of this.opts) if (o.kind === cat && !out.includes(grp(o))) out.push(grp(o));
+    const rank = (g: string) => (g in SPECIALS ? 2 : TECHS[g as keyof typeof TECHS]?.base ? 0 : 1);
+    return out.sort((a, b) => rank(a) - rank(b));
   }
 
   private render() {
@@ -72,46 +78,52 @@ export class DecisionUI {
       }).join('')}</span>`
       : '';
     const sel = this.opts.find((o) => o.id === this.sel);
-    const card = sel ? `<div class="d-card">
+    const card = sel ? `<div class="d-card ${sel.sp ? 'special' : ''}">
         <div class="lines"><span class="g"><b>+</b>${sel.card.gain}</span><span class="r"><b>!</b>${sel.card.risk}</span><span class="c"><b>&gt;</b>${sel.card.change}</span></div>
-        <button class="go" data-confirm>GO</button></div>` : '';
-    let main = '';
+        <button class="go" data-confirm>${sel.sp ? `${icon('fire', 16)} GO` : 'GO'}</button></div>` : '';
     let vars = '';
     let subs = '';
     const live = (l: OptionInfo[]) => l.filter((o) => !o.disabled);
     if (this.cat) {
-      const techs = this.techsIn(this.cat);
-      // One line per technique. Shots and defensive techniques are options themselves; the rest
-      // pick the technique and then a target below.
+      const groups = this.groupsIn(this.cat);
+      // One line per group. Shots and defensive techniques are options themselves; the rest pick the
+      // group and then a target below.
       const direct = this.cat === 'shoot' || info.side === 'def';
-      if (techs.length > 1 || direct) {
-        vars = `<div class="d-vars">${techs.map((t, i) => {
-          const list = this.opts.filter((o) => o.kind === this.cat && o.tech === t);
+      if (groups.length > 1 || direct) {
+        vars = `<div class="d-vars">${groups.map((g, i) => {
+          const list = this.opts.filter((o) => o.kind === this.cat && grp(o) === g);
           const l = live(list);
           const best = l.reduce((a, o) => Math.max(a, o.main), 0);
           const opt = direct ? list[0] : undefined;
-          const isSel = direct ? this.sel === opt?.id : this.tech === t;
-          const T = TECHS[t];
-          return `<button class="var ${isSel ? 'sel' : ''} ${list.some((o) => o.hint) ? 'hint' : ''}" ${direct ? `data-opt="${opt?.id}"` : `data-tech="${t}"`} ${l.length ? '' : 'disabled'}>
-            <span class="vi">${icon(T.icon, 20)}</span><b class="vn">${T.name}</b><span class="vl">${T.line}</span>
+          const isSel = direct ? this.sel === opt?.id : this.tech === g;
+          const sp = g in SPECIALS ? SPECIALS[g as SpecialId] : null;
+          const T = sp ? null : TECHS[g as keyof typeof TECHS];
+          const name = sp ? sp.name : T!.name;
+          const line = sp ? sp.line : T!.line;
+          const ic = sp ? icon('fire', 20) : icon(T!.icon, 20);
+          return `<button class="var ${sp ? 'special' : ''} ${isSel ? 'sel' : ''} ${list.some((o) => o.hint) ? 'hint' : ''}" ${direct ? `data-opt="${opt?.id}"` : `data-tech="${g}"`} ${l.length ? '' : 'disabled'}>
+            <span class="vi">${ic}</span><b class="vn">${name}${sp ? '<em class="firetag">FIRE</em>' : ''}</b><span class="vl">${line}</span>
             <b class="vp">${l.length ? `${best}%` : '-'}</b>${opt ? bar(opt) : ''}<kbd>${VAR_KEYS[i]?.toUpperCase() ?? ''}</kbd></button>`;
         }).join('')}</div>`;
       }
       if (!direct && this.tech) {
-        const list = this.opts.filter((o) => o.kind === this.cat && o.tech === this.tech);
+        const list = this.opts.filter((o) => o.kind === this.cat && grp(o) === this.tech);
         subs = `<div class="d-subs">${list.map((o, i) => `
-          <button class="sub ${o.id === this.sel ? 'sel' : ''} ${o.hint ? 'hint' : ''}" data-opt="${o.id}" ${o.disabled ? 'disabled' : ''}>
+          <button class="sub ${o.sp ? 'special' : ''} ${o.id === this.sel ? 'sel' : ''} ${o.hint ? 'hint' : ''}" data-opt="${o.id}" ${o.disabled ? 'disabled' : ''}>
             <span class="st">${o.tag ?? ''}</span><b>${o.main}%</b>${bar(o)}<kbd>${i + 1}</kbd></button>`).join('')}</div>`;
       }
     }
+    let main: string;
     if (info.side === 'att') {
       main = KINDS.map((k) => {
         const list = this.opts.filter((o) => o.kind === k);
         const l = live(list);
-        const best = l.reduce((a, o) => Math.max(a, o.main), 0);
-        const n = this.techsIn(k).length;
-        return `<button class="opt ${k} ${this.cat === k ? 'sel' : ''} ${list.some((o) => o.hint) ? 'hint' : ''}" data-kind="${k}" ${l.length ? '' : 'disabled'}>
-          <span class="oi">${icon(KIND_ICON[k], 28)}</span>
+        const best = l.filter((o) => !o.sp).reduce((a, o) => Math.max(a, o.main), 0);
+        const n = this.groupsIn(k).filter((g) => !(g in SPECIALS)).length;
+        const hasSp = l.some((o) => o.sp);
+        return `<button class="opt ${k} ${this.cat === k ? 'sel' : ''} ${list.some((o) => o.hint) ? 'hint' : ''} ${hasSp ? 'has-sp' : ''}" data-kind="${k}" ${l.length ? '' : 'disabled'}>
+          ${hasSp ? `<span class="spb" title="Special available">${icon('fire', 16)}</span>` : ''}
+          <span class="oi">${icon(KIND_ICON[k], 32)}</span>
           <b class="pct">${l.length ? `${best}%` : '-'}</b>
           <span class="vdots">${n > 1 ? Array.from({ length: n }, () => '<i></i>').join('') : ''}</span>
           <small>${KIND_LABEL[k]}</small><kbd>${k[0].toUpperCase()}</kbd>
@@ -122,25 +134,32 @@ export class DecisionUI {
         const list = this.opts.filter((o) => o.kind === st);
         const base = list.find((o) => o.tech === st) ?? list[0];
         const n = list.length;
-        return `<button class="opt stance ${st} ${this.cat === st ? 'sel' : ''}" data-fam="${st}">
-          <span class="oi">${icon(st, 28)}</span>
+        const counters = (info.threats ?? []).filter((t) => t.counter === st).length;
+        return `<button class="opt stance ${st} ${this.cat === st ? 'sel' : ''} ${counters ? 'counter' : ''}" data-fam="${st}">
+          ${counters ? `<span class="spb ctr" title="Counters their special">${icon('block', 16)}</span>` : ''}
+          <span class="oi">${icon(st, 32)}</span>
           <b class="pct">${base.main}%</b>${bar(base)}
           <span class="vdots">${n > 1 ? Array.from({ length: n }, () => '<i></i>').join('') : ''}</span>
           <small>${STANCE_LABEL[st]}</small><kbd>${i + 1}</kbd>
         </button>`;
       }).join('');
     }
+    const threats = info.threats?.length
+      ? `<div class="d-threat">${icon('fire', 16)}<b>Their Fire is full.</b>${info.threats.map((t) =>
+        `<span>#${t.num} ${t.name} ${t.pct}%: ${icon(t.counter, 16)}${STANCE_LABEL[t.counter]} stops it</span>`).join('')}</div>`
+      : '';
     this.el.innerHTML = `
       <div class="d-top">
         <span class="pips ${info.side}" title="Moves left this possession">${pips}</span>
+        ${info.fire ? `<span class="fire-on">${icon('fire', 16)} FIRE</span>` : ''}
         ${lean}
         ${info.attLean ? `<span class="lean" title="What the attack tends to do here">${KINDS.map((k) =>
           `<span class="ln ${k}">${icon(KIND_ICON[k], 16)}<b>${Math.round(info.attLean![k] * 100)}</b></span>`).join('')}</span>` : ''}
       </div>
       ${info.hint ? `<div class="d-hint">${info.hint}</div>` : ''}
+      ${threats}
+      <div class="d-mid">${vars}${subs}</div>
       ${card}
-      ${subs}
-      ${vars}
       <div class="d-opts n${info.side === 'att' ? 4 : 3}">${main}</div>`;
   }
 
@@ -152,12 +171,13 @@ export class DecisionUI {
     if (id) sfx.tick();
   }
 
-  /** Default technique when a category opens: the hinted one, else the base one, else the first live one. */
-  private defaultTech(cat: ActKind | Stance): TechId | null {
+  /** Default group when a category opens: the hinted one, else the base technique, else the first live one. */
+  private defaultGroup(cat: ActKind | Stance): string | null {
     const list = this.opts.filter((o) => o.kind === cat && !o.disabled);
     // Tutorial: when the lesson is about picking a technique, let the player tap it.
-    if (cat !== 'shoot' && list.some((o) => o.hint) && this.techsIn(cat).length > 1) return null;
-    return (list.find((o) => TECHS[o.tech].base) ?? list[0])?.tech ?? null;
+    if (cat !== 'shoot' && list.some((o) => o.hint) && this.groupsIn(cat).length > 1) return null;
+    const o = list.find((x) => TECHS[x.tech].base && !x.sp) ?? list.find((x) => !x.sp) ?? list[0];
+    return o ? grp(o) : null;
   }
 
   private openCat(k: ActKind | Stance) {
@@ -165,36 +185,36 @@ export class DecisionUI {
     const info = m?.decisionInfo();
     if (!m || !info) return;
     if (this.cat === k && this.sel) {
-      // Second tap on the same action confirms the selected option.
+      // Second tap on the same move confirms the selected option.
       const o = this.opts.find((x) => x.id === this.sel);
       if (o && (o.kind === 'shoot' || info.side === 'def')) { this.confirm(this.sel); return; }
     }
     this.cat = k;
-    const t = this.defaultTech(k);
+    const g = this.defaultGroup(k);
     if (k === 'shoot' || info.side === 'def') {
-      const o = this.opts.find((x) => x.kind === k && x.tech === t);
-      this.tech = t;
+      const o = this.opts.find((x) => x.kind === k && grp(x) === g);
+      this.tech = g;
       this.sel = null;
       this.select(o?.id ?? null);
       if (!o) this.render();
       return;
     }
-    this.pickTech(t);
+    this.pickGroup(g);
   }
 
-  private pickTech(t: TechId | null) {
+  private pickGroup(g: string | null) {
     if (!this.cat) return;
     const m = this.match();
     if (this.cat === 'shoot' || FAMS.includes(this.cat as Stance)) {
-      const o = this.opts.find((x) => x.kind === this.cat && x.tech === t && !x.disabled);
+      const o = this.opts.find((x) => x.kind === this.cat && grp(x) === g && !x.disabled);
       if (o) { if (this.sel === o.id) this.confirm(o.id); else this.select(o.id); }
       return;
     }
-    this.tech = t;
+    this.tech = g;
     this.sel = null;
     m?.preview(null);
-    m?.showCategory(this.cat as ActKind, t ?? undefined);
-    const live = this.opts.filter((o) => o.kind === this.cat && o.tech === t && !o.disabled);
+    m?.showCategory(this.cat as ActKind, g ?? undefined);
+    const live = this.opts.filter((o) => o.kind === this.cat && grp(o) === g && !o.disabled);
     if (live.length === 1) { this.select(live[0].id); return; }
     this.render();
     sfx.tick();
@@ -211,7 +231,7 @@ export class DecisionUI {
     if (!o || o.disabled) return;
     if (this.sel === id) { this.confirm(id); return; }
     this.cat = o.kind;
-    this.tech = o.tech;
+    this.tech = grp(o);
     this.select(id);
   }
 
@@ -231,12 +251,12 @@ export class DecisionUI {
     const fam = t.closest<HTMLElement>('[data-fam]')?.dataset.fam as Stance | undefined;
     if (fam) { this.openCat(fam); return; }
     const tech = t.closest<HTMLButtonElement>('[data-tech]');
-    if (tech && !tech.disabled) { this.pickTech(tech.dataset.tech as TechId); return; }
+    if (tech && !tech.disabled) { this.pickGroup(tech.dataset.tech!); return; }
     const id = t.closest<HTMLElement>('[data-opt]')?.dataset.opt;
     if (!id) return;
     const o = this.opts.find((x) => x.id === id);
     if (!o || o.disabled) return;
-    if (this.sel === id) this.confirm(id); else { this.tech = o.tech; this.select(id); }
+    if (this.sel === id) this.confirm(id); else { this.tech = grp(o); this.select(id); }
   };
 
   private onOver = (e: PointerEvent) => {
@@ -245,7 +265,7 @@ export class DecisionUI {
     const id = t.closest<HTMLElement>('[data-opt]')?.dataset.opt;
     if (id) {
       const o = this.opts.find((x) => x.id === id);
-      if (o && !o.disabled) { this.tech = o.tech; this.select(id); }
+      if (o && !o.disabled) { this.tech = grp(o); this.select(id); }
     }
   };
 
@@ -268,8 +288,8 @@ export class DecisionUI {
     }
     const vi = VAR_KEYS.indexOf(k);
     if (vi >= 0 && this.cat) {
-      const t = this.techsIn(this.cat)[vi];
-      if (t && this.opts.some((o) => o.kind === this.cat && o.tech === t && !o.disabled)) this.pickTech(t);
+      const g = this.groupsIn(this.cat)[vi];
+      if (g && this.opts.some((o) => o.kind === this.cat && grp(o) === g && !o.disabled)) this.pickGroup(g);
       return;
     }
     if (n >= 1) {
@@ -278,7 +298,7 @@ export class DecisionUI {
         if (fam) { this.openCat(fam); e.preventDefault(); }
         return;
       }
-      const list = this.opts.filter((o) => o.kind === this.cat && this.cat !== 'shoot' && o.tech === this.tech);
+      const list = this.opts.filter((o) => o.kind === this.cat && this.cat !== 'shoot' && grp(o) === this.tech);
       const o = list[n - 1];
       if (!o || o.disabled) return;
       if (this.sel === o.id) this.confirm(o.id); else this.select(o.id);
