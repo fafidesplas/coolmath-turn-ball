@@ -1,348 +1,379 @@
-// Pixel decision panel, built so every turn reads in plain words.
-// Top line: what is going on (who has the ball, where, who is open; on defense, what they like to do).
-// Attack: four move types (Shoot / Dribble / Pass / Play). A type opens one row per move: icon, name,
-// what it does, reward and risk as icon pips (arrows and warning triangles, never color alone) and the
-// main chance. Dribbles, passes and plays then pick a target (also tappable on the court). The dunk is
-// always listed on Shoot: when it is out of reach the row says why.
-// Defense: the seven defensive moves are the buttons themselves; the selected one explains what it
-// stops, what beats it and how it does against the attack's most likely move.
-// Selecting an option previews it on the court and shows a card; selecting it again or GO confirms.
-// The first attack and the first defense possession have a step-by-step coach.
-// Keys: S P D C move types, Q W E R T Y rows, digits for targets (defense: 1-7), Enter, Esc.
+// Battle command window (JRPG style). One bordered window below the stage with a hand cursor:
+//   Attack:  Shoot / Dribble / Pass / Play  ->  the moves of that kind  ->  the target, when there is more than one.
+//   Defense: Press / Steal / Contest / Give space / More  ->  Block / Charge / Deny.
+// The info box shows one big number (the chance of the move under the cursor) and one badge: whether the move
+// beats the opponent's tell (the icon over their player), loses to it, or neither. Shape and color both change.
+// Moving the cursor (hover, arrows, a tap) previews the move on the court and the camera frames it; activating
+// it (click, a second tap, OK, Enter) goes one level down or plays it. The window never changes size: every box
+// has a fixed size and only its content changes.
 import { sfx } from '../audio';
 import { icon } from './pxicons';
 import type { ActKind } from '../rules';
-import { KIND_LABEL, type DecisionInfo, type Match, type OptionInfo } from './match';
-import { TECHS } from '../techs';
+import { DEF_ORDER, KIND_ICON, KIND_LABEL, defName, type DecisionInfo, type DuelInfo, type Match, type OptionInfo } from './match';
+import { TECHS, type TechId } from '../techs';
 import { SPECIALS, type SpecialId } from '../specials';
 
 const KINDS: ActKind[] = ['shoot', 'drive', 'pass', 'cut'];
-const KEY_KIND: Record<string, ActKind> = { s: 'shoot', p: 'pass', d: 'drive', c: 'cut' };
-const VAR_KEYS = ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o'];
-const KIND_ICON: Record<ActKind, string> = { shoot: 'shoot', pass: 'pass', drive: 'dribble', cut: 'cut' };
-const KIND_KEY: Record<ActKind, string> = { shoot: 'S', pass: 'P', drive: 'D', cut: 'C' };
 /** Shots in menu order: the dunk first, then closest to farthest. */
 const SHOT_ORDER = ['dunk', 'layup', 'floater', 'jumper', 'bank', 'fade'];
+/** Defense: four main moves on the first page, the rest under More. */
+const DEF_MAIN: TechId[] = ['press', 'hawk', 'contest', 'space'];
 const grp = (o: OptionInfo) => o.group ?? o.tech;
+/** Short menu names (the list is read at a glance). */
+const SHORT: Partial<Record<TechId, string>> = {
+  jumper: 'Jump shot', fade: 'Fadeaway', chest: 'Chest pass', bounce: 'Bounce', nolook: 'No-look', skip: 'Skip pass',
+  hesi: 'Hesitate', spin: 'Spin', stepback: 'Step-back', euro: 'Euro step', pumpfake: 'Pump fake', between: 'Between',
+  behind: 'Behind back', backdown: 'Back down', screen: 'Screen cut', pnr: 'Pick & roll', giveandgo: 'Give & go',
+  iso: 'Clear-out', pop: 'Pick & pop', handoff: 'Hand-off', space: 'Give space', charge: 'Charge', deny: 'Deny',
+};
 
-/** Reward (arrows) and risk (warning triangles) as three icon slots each, with a word. */
-function pips(o: OptionInfo) {
-  if (!o.reward) return '';
-  const row = (n: number, ic: string, cls: string, word: string) =>
-    `<span class="pp ${cls}" title="${word}"><small>${word}</small>${[1, 2, 3].map((k) => `<i class="${k <= n ? 'on' : ''}">${icon(ic, 16)}</i>`).join('')}</span>`;
-  return `<span class="pps">${row(o.reward, 'up', 'rw', 'GAIN')}${row(o.risk ?? 1, 'warn', 'rk', 'RISK')}</span>`;
+type Level =
+  | { k: 'root' }
+  | { k: 'kind'; kind: ActKind }
+  | { k: 'target'; kind: ActKind; group: string }
+  | { k: 'more' };
+
+interface Row {
+  key: string;
+  name: string;
+  ic: string;
+  /** Option previewed and shown in the info box. */
+  opt?: OptionInfo;
+  /** Big number for the info box. */
+  pct?: number;
+  edge?: -1 | 0 | 1;
+  disabled?: boolean;
+  special?: boolean;
+  hint?: boolean;
+  /** One short line for the info box (a locked dunk, the tutorial step). */
+  line?: string;
+  /** What activating it does. */
+  go: () => void;
+  /** What moving the cursor onto it previews. */
+  show: () => void;
 }
+
+/** Pixel bitmap to a crisp SVG (X = outline, W = fill). */
+function bitmap(rows: string[], cls: string) {
+  const path = (ch: string) => {
+    let d = '';
+    rows.forEach((r, y) => { for (let x = 0; x < r.length; x++) if (r[x] === ch) { const x0 = x; while (r[x + 1] === ch) x++; d += `M${x0} ${y}h${x - x0 + 1}v1h-${x - x0 + 1}z`; } });
+    return d;
+  };
+  const w = rows[0].length, h = rows.length;
+  return `<svg class="${cls}" viewBox="0 0 ${w} ${h}" width="${w * 2}" height="${h * 2}" shape-rendering="crispEdges" aria-hidden="true"><path fill="#1b1029" d="${path('X')}"/><path fill="#fff7ea" d="${path('W')}"/></svg>`;
+}
+/** The pointing glove of the command cursor. */
+const HAND = bitmap([
+  '..XXXX......',
+  '.XWWWWXXXXX.',
+  'XWWWWWWWWWWX',
+  'XWWWWWXXXXX.',
+  'XWWWWWWX....',
+  'XWWWWWX.....',
+  '.XWWWWWX....',
+  '..XXXXX.....',
+], 'hand');
 
 export class DecisionUI {
   el: HTMLElement;
   private opts: OptionInfo[] = [];
-  private cat: string | null = null;
-  /** Selected group inside the category (a technique id or a special id). */
-  private tech: string | null = null;
-  private sel: string | null = null;
+  private info: DecisionInfo | null = null;
+  private level: Level = { k: 'root' };
+  private rows: Row[] = [];
+  private cur = 0;
   private open = false;
-  /** Coach step (first attack / first defense possession). */
-  private coachStep = 0;
+  private listEl: HTMLElement;
+  private titleEl: HTMLElement;
+  private infoEl: HTMLElement;
+  private lastPointer = 'mouse';
 
   constructor(root: HTMLElement, private match: () => Match | null) {
-    this.el = document.createElement('div');
-    this.el.className = 'decision';
-    this.el.hidden = true;
-    root.appendChild(this.el);
+    this.el = root;
+    root.innerHTML = `
+      <div class="w-list"><div class="w-title"></div><div class="w-rows" role="menu"></div></div>
+      <div class="w-info"></div>`;
+    this.listEl = root.querySelector('.w-rows')!;
+    this.titleEl = root.querySelector('.w-title')!;
+    this.infoEl = root.querySelector('.w-info')!;
     window.addEventListener('keydown', this.onKey);
-    this.el.addEventListener('click', this.onClick);
-    this.el.addEventListener('pointerover', this.onOver);
+    root.addEventListener('pointerdown', (e) => { this.lastPointer = e.pointerType; }, { capture: true });
+    root.addEventListener('click', this.onClick);
+    root.addEventListener('pointerover', this.onOver);
+    this.idle('');
   }
 
   destroy() {
     window.removeEventListener('keydown', this.onKey);
-    this.el.remove();
   }
 
   show(on: boolean) {
     this.open = on;
-    this.sel = null;
-    this.cat = null;
-    this.tech = null;
-    this.coachStep = 0;
-    this.el.hidden = !on;
     const m = this.match();
     if (m) m.onPick = (x, y) => this.pickFromWorld(x, y);
-    if (on) this.render();
+    this.el.classList.toggle('live', on);
+    if (!on) return;
+    this.info = m?.decisionInfo() ?? null;
+    this.opts = m?.options() ?? [];
+    this.level = { k: 'root' };
+    this.build(true);
   }
 
-  /** Groups available in a category, in a stable order. */
-  private groupsIn(cat: string): string[] {
+  /** Between duels: the window says whose turn it is. */
+  idle(side: 'att' | 'def' | '') {
+    if (this.open) return;
+    this.titleEl.innerHTML = side ? `${icon(side === 'att' ? 'ball' : 'protect', 16)}<span>${side === 'att' ? 'ATTACK' : 'DEFENSE'}</span>` : '';
+    this.listEl.innerHTML = '';
+    this.infoEl.innerHTML = this.infoHTML(null);
+  }
+
+  /** After a duel: both moves and who won, then the result word (shown big over the stage too). */
+  duel(d: DuelInfo) {
+    if (this.open) return;
+    const mark = d.res === 'win' ? 'check' : d.res === 'lose' ? 'cross' : 'even';
+    this.titleEl.innerHTML = `${icon(mark, 16)}<span>${d.word}</span>`;
+    this.listEl.innerHTML = `
+      <div class="w-vs you ${d.res === 'win' ? 'won' : ''}"><i class="mark home"></i>${icon(d.you.icon, 32)}<b>${d.you.name}</b></div>
+      <div class="w-vs them ${d.res === 'lose' ? 'won' : ''}"><i class="mark away"></i>${icon(d.them.icon, 32)}<b>${d.them.name}</b></div>`;
+    this.infoEl.innerHTML = `<div class="wi-res r-${d.res}">${icon(mark, 32)}</div>${this.buttonsHTML(false, false)}`;
+  }
+
+  // ---------------------------------------------------------------- levels
+  private build(fresh = false) {
+    const m = this.match();
+    const info = this.info;
+    if (!m || !info) return;
+    const live = (l: OptionInfo[]) => l.filter((o) => !o.disabled);
+    const best = (l: OptionInfo[]) => live(l).slice().sort((a, b) => b.main - a.main)[0];
+    const rows: Row[] = [];
+    const L = this.level;
+    let title = '';
+    if (info.side === 'att') {
+      if (L.k === 'root') {
+        title = `${icon('ball', 16)}<span>ATTACK</span>`;
+        for (const k of KINDS) {
+          const list = this.opts.filter((o) => o.kind === k);
+          const b = best(list);
+          rows.push({
+            key: k, name: KIND_LABEL[k], ic: KIND_ICON[k], pct: b?.main, edge: b?.edge, disabled: !b,
+            special: live(list).some((o) => o.sp), hint: list.some((o) => o.hint),
+            go: () => this.enter({ k: 'kind', kind: k }),
+            show: () => { m.preview(null); if (k === 'pass' || k === 'cut') m.showCategory(k); },
+          });
+        }
+      } else if (L.k === 'kind') {
+        title = `${icon(KIND_ICON[L.kind], 16)}<span>${KIND_LABEL[L.kind].toUpperCase()}</span>`;
+        for (const g of this.groupsIn(L.kind)) {
+          const list = this.opts.filter((o) => o.kind === L.kind && grp(o) === g);
+          const lock = list.find((o) => o.locked);
+          const b = best(list);
+          const sp = g in SPECIALS ? SPECIALS[g as SpecialId] : null;
+          const first = list[0];
+          const three = first?.label === 'Three';
+          const name = sp ? sp.name : three ? 'Three' : g === 'dunk' && first?.label ? first.label : SHORT[g as TechId] ?? TECHS[g as TechId].name;
+          const many = live(list).length > 1;
+          rows.push({
+            key: g, name, ic: lock ? 'lock' : sp ? 'fire' : three ? 't_three' : TECHS[g as TechId].icon,
+            opt: b, pct: b?.main, edge: b?.edge, disabled: !b, special: !!sp, hint: list.some((o) => o.hint),
+            line: lock ? lock.locked : undefined,
+            go: () => { if (!b) return; if (many) this.enter({ k: 'target', kind: L.kind, group: g }); else this.confirm(b); },
+            show: () => { if (b) m.preview(b.id); else { m.preview(null); } },
+          });
+        }
+      } else if (L.k === 'target') {
+        const list = this.opts.filter((o) => o.kind === L.kind && grp(o) === L.group);
+        const sp = L.group in SPECIALS ? SPECIALS[L.group as SpecialId] : null;
+        title = `${icon(sp ? 'fire' : TECHS[L.group as TechId]?.icon ?? 'next', 16)}<span>${(sp ? sp.name : SHORT[L.group as TechId] ?? TECHS[L.group as TechId].name).toUpperCase()}</span>`;
+        for (const o of list) {
+          rows.push({
+            key: o.id, name: o.short ?? o.tag ?? o.label, ic: L.kind === 'pass' ? 'pass' : L.kind === 'drive' ? 'next' : 'cut',
+            opt: o, pct: o.main, edge: o.edge, disabled: o.disabled, special: !!o.sp, hint: o.hint,
+            go: () => this.confirm(o),
+            show: () => m.preview(o.id),
+          });
+        }
+      }
+    } else {
+      const defRow = (o: OptionInfo): Row => ({
+        key: o.id, name: SHORT[o.tech] ?? defName(o.tech), ic: TECHS[o.tech].icon, opt: o, pct: o.main, edge: o.edge,
+        go: () => this.confirm(o), show: () => m.preview(o.id),
+      });
+      const byId = (id: TechId) => this.opts.find((o) => o.id === id);
+      if (L.k === 'more') {
+        title = `${icon('protect', 16)}<span>MORE</span>`;
+        for (const id of DEF_ORDER.filter((d) => !DEF_MAIN.includes(d))) { const o = byId(id); if (o) rows.push(defRow(o)); }
+      } else {
+        title = `${icon('protect', 16)}<span>DEFENSE</span>`;
+        for (const id of DEF_MAIN) { const o = byId(id); if (o) rows.push(defRow(o)); }
+        const rest = DEF_ORDER.filter((d) => !DEF_MAIN.includes(d)).map(byId).filter((o): o is OptionInfo => !!o);
+        const top = rest.slice().sort((a, b) => (b.edge ?? 0) - (a.edge ?? 0))[0];
+        rows.push({
+          key: 'more', name: 'More', ic: 'next', edge: rest.some((o) => o.edge === 1) ? 1 : undefined, pct: undefined,
+          go: () => this.enter({ k: 'more' }), show: () => { m.preview(null); },
+        });
+        void top;
+      }
+    }
+    this.rows = rows;
+    this.titleEl.innerHTML = title;
+    this.listEl.innerHTML = rows.map((r, i) => `
+      <button class="row ${r.disabled ? 'dis' : ''} ${r.special ? 'sp' : ''} ${r.hint ? 'hint' : ''}" data-i="${i}" role="menuitem" ${r.disabled && !r.line ? 'aria-disabled="true"' : ''}>
+        ${HAND}<span class="ri">${icon(r.ic, 32)}</span><span class="rn">${r.name}</span>${this.edgeHTML(r.edge, true)}
+      </button>`).join('');
+    // Cursor: the hinted row, else the first live one (keeps the slot when coming back up).
+    if (fresh || this.cur >= rows.length || rows[this.cur]?.disabled) {
+      const h = rows.findIndex((r) => r.hint && !r.disabled);
+      this.cur = h >= 0 ? h : Math.max(0, rows.findIndex((r) => !r.disabled));
+    }
+    this.moveTo(this.cur, true);
+  }
+
+  private groupsIn(kind: ActKind): string[] {
     const out: string[] = [];
-    for (const o of this.opts) if (o.kind === cat && !out.includes(grp(o))) out.push(grp(o));
+    for (const o of this.opts) if (o.kind === kind && !out.includes(grp(o))) out.push(grp(o));
     const rank = (g: string) => {
-      if (g in SPECIALS) return 100;
-      if (cat === 'shoot') { const i = SHOT_ORDER.indexOf(g); return i < 0 ? 50 : i; }
-      return TECHS[g as keyof typeof TECHS]?.base ? 0 : 1;
+      if (g in SPECIALS) return -1;
+      if (kind === 'shoot') { const i = SHOT_ORDER.indexOf(g); return i < 0 ? 50 : i; }
+      return TECHS[g as TechId]?.base ? 0 : 1;
     };
     return out.sort((a, b) => rank(a) - rank(b));
   }
 
-  private coachHTML(info: DecisionInfo): string {
-    if (!info.coach) return '';
-    const att = info.side === 'att';
-    const steps = att
-      ? [
-        ['1/3', 'Your turn on attack. The player in the yellow ring has the ball. Pick a move type below: SHOOT, DRIBBLE, PASS or PLAY.', 'opts'],
-        ['2/3', 'Each row says what the move does. Arrows = how much you gain, triangles = how risky it is. Tap a row to see it on the court.', 'mid'],
-        ['3/3', 'Like it? Tap GO (or the same row again). The defense picks its move at the same time, without seeing yours.', 'go'],
-      ]
-      : [
-        ['1/3', 'Now you defend. The top line says who has the ball and what they like to do.', 'sit'],
-        ['2/3', 'Pick one of the 7 defensive moves below. Each one stops some moves and loses to others.', 'opts'],
-        ['3/3', 'The card says what it stops, what beats it, and how it does against their likely move. Tap GO.', 'go'],
-      ];
-    const [n, text, where] = steps[Math.min(this.coachStep, steps.length - 1)];
-    this.el.dataset.coach = where;
-    const next = !att && this.coachStep === 0 ? `<button class="btn small" data-coach-next>${icon('check', 16)} Got it</button>` : '';
-    return `<div class="d-coach"><b>${icon('help', 16)} COACH ${n}</b><span>${text}</span>${next}</div>`;
-  }
-
-  private render() {
-    const m = this.match();
-    const info = m?.decisionInfo();
-    if (!m || !info) return;
-    this.opts = m.options();
-    delete this.el.dataset.coach;
-    const leftPips = Array.from({ length: info.maxLeft }, (_, i) => `<i class="${i < info.left ? 'on' : ''}"></i>`).join('');
-    const sel = this.opts.find((o) => o.id === this.sel);
-    const live = (l: OptionInfo[]) => l.filter((o) => !o.disabled);
-    let card = '';
-    if (sel) {
-      const lines = info.side === 'def'
-        ? `<span class="w">${icon(TECHS[sel.tech].icon, 16)}<b>${sel.label}:</b> ${sel.what ?? ''}</span>
-           <span class="g">${icon('check', 16)}${sel.card.gain}</span>
-           <span class="r">${icon('cross', 16)}${sel.card.risk}</span>
-           ${sel.vsTop ? `<span class="c">${icon('scout', 16)}${sel.vsTop}</span>` : ''}`
-        : `<span class="w">${icon(sel.sp ? 'fire' : TECHS[sel.tech].icon, 16)}<b>${sel.label}${sel.tag ? ` - ${sel.tag}` : ''}</b></span>
-           <span class="g">${icon('up', 16)}${sel.card.gain}</span>
-           <span class="r">${icon('warn', 16)}${sel.card.risk}</span>
-           <span class="c">${icon('next', 16)}${sel.card.change}</span>`;
-      card = `<div class="d-card ${sel.sp ? 'special' : ''}"><div class="lines">${lines}</div>
-        <button class="go" data-confirm>${sel.sp ? `${icon('fire', 16)} GO` : 'GO'}</button></div>`;
-    }
-    let vars = '';
-    let subs = '';
-    if (info.side === 'att' && this.cat) {
-      const groups = this.groupsIn(this.cat);
-      const direct = this.cat === 'shoot';
-      vars = `<div class="d-vars">${groups.map((g, i) => {
-        const list = this.opts.filter((o) => o.kind === this.cat && grp(o) === g);
-        const l = live(list);
-        const lock = list.find((o) => o.locked);
-        const best = l.reduce((a, o) => Math.max(a, o.main), 0);
-        const top = l.slice().sort((a, b) => b.main - a.main)[0] ?? list[0];
-        const opt = direct ? list[0] : undefined;
-        const isSel = direct ? this.sel === opt?.id : this.tech === g;
-        const sp = g in SPECIALS ? SPECIALS[g as SpecialId] : null;
-        const T = sp ? null : TECHS[g as keyof typeof TECHS];
-        const name = sp ? sp.name : direct && opt ? opt.label : T!.name;
-        const line = lock ? lock.locked! : sp ? sp.line : top?.what ?? T!.line;
-        const ic = lock ? icon('lock', 20) : sp ? icon('fire', 20) : icon(g === 'jumper' && opt?.label === 'Three' ? 't_three' : T!.icon, 20);
-        const dunk = g === 'dunk' && !lock;
-        return `<button class="var ${sp ? 'special' : ''} ${dunk ? 'dunk' : ''} ${lock ? 'locked' : ''} ${isSel ? 'sel' : ''} ${list.some((o) => o.hint) ? 'hint' : ''}" ${direct ? `data-opt="${opt?.id}"` : `data-tech="${g}"`} ${l.length ? '' : 'disabled'}>
-          <span class="vi">${ic}</span><b class="vn">${name}${sp ? '<em class="firetag">FIRE</em>' : ''}${dunk ? '<em class="firetag">SLAM</em>' : ''}</b><span class="vl">${line}</span>
-          ${l.length ? `${pips(top)}<b class="vp">${direct ? `${best}%` : `${best}%`}</b>` : ''}<kbd>${VAR_KEYS[i]?.toUpperCase() ?? ''}</kbd></button>`;
-      }).join('')}</div>`;
-      if (!direct && this.tech) {
-        const list = this.opts.filter((o) => o.kind === this.cat && grp(o) === this.tech);
-        subs = `<div class="d-subs"><small class="d-pick">${icon('next', 16)} Where? Tap a target (or the ring on the court):</small>${list.map((o, i) => `
-          <button class="sub ${o.sp ? 'special' : ''} ${o.id === this.sel ? 'sel' : ''} ${o.hint ? 'hint' : ''}" data-opt="${o.id}" ${o.disabled ? 'disabled' : ''}>
-            <span class="st">${o.tag ?? ''}</span><b>${o.main}%</b><kbd>${i + 1}</kbd></button>`).join('')}</div>`;
-      }
-    }
-    let main: string;
-    if (info.side === 'att') {
-      main = KINDS.map((k) => {
-        const list = this.opts.filter((o) => o.kind === k);
-        const l = live(list);
-        const hasSp = l.some((o) => o.sp);
-        const dunk = k === 'shoot' && l.some((o) => o.tech === 'dunk');
-        const what = k === 'shoot' ? 'End it: score' : k === 'drive' ? 'Beat your man' : k === 'pass' ? 'Move the ball' : 'Run a play';
-        return `<button class="opt ${k} ${this.cat === k ? 'sel' : ''} ${list.some((o) => o.hint) ? 'hint' : ''} ${hasSp ? 'has-sp' : ''} ${dunk ? 'has-dunk' : ''}" data-kind="${k}" ${l.length ? '' : 'disabled'}>
-          ${hasSp ? `<span class="spb" title="Special available">${icon('fire', 16)}</span>` : ''}
-          ${dunk ? '<span class="dkb">DUNK</span>' : ''}
-          <span class="oi">${icon(KIND_ICON[k], 32)}</span>
-          <b class="kn">${KIND_LABEL[k]}</b><small>${what}</small><kbd>${KIND_KEY[k]}</kbd>
-        </button>`;
-      }).join('');
-    } else {
-      main = this.opts.map((o, i) => {
-        const counters = (info.threats ?? []).filter((t) => t.counter === o.kind && o.tech === t.counter).length;
-        return `<button class="opt defm ${o.kind} ${this.sel === o.id ? 'sel' : ''} ${counters ? 'counter' : ''}" data-opt="${o.id}">
-          <span class="oi">${icon(TECHS[o.tech].icon, 32)}</span>
-          <b class="kn">${o.label}</b>${pips(o)}<kbd>${i + 1}</kbd>
-        </button>`;
-      }).join('');
-    }
-    const threats = info.threats?.length
-      ? `<div class="d-threat">${icon('fire', 16)}<b>Their Fire is full.</b>${info.threats.map((t) =>
-        `<span>#${t.num} ${t.name} ${t.pct}%</span>`).join('')}</div>`
-      : '';
-    this.el.innerHTML = `
-      <div class="d-sit ${info.side}">
-        <span class="pips ${info.side}" title="Moves left this possession">${leftPips}</span>
-        ${info.fire ? `<span class="fire-on">${icon('fire', 16)} FIRE</span>` : ''}
-        <span class="sit">${info.situation}</span>
-        ${info.threat ? `<span class="thr">${icon('scout', 16)}<b>They like:</b> ${info.threat}</span>` : ''}
-      </div>
-      ${this.coachHTML(info)}
-      ${info.hint ? `<div class="d-hint">${info.hint}</div>` : ''}
-      ${threats}
-      <div class="d-mid">${vars}${subs}</div>
-      ${card}
-      <div class="d-opts ${info.side === 'att' ? 'n4' : 'n7'}">${main}</div>`;
-    // Keep the GO card in view on small screens (the panel can scroll).
-    // With a choice made, show the GO card and the buttons (bottom); otherwise the situation and coach (top).
-    this.el.scrollTop = sel ? this.el.scrollHeight : 0;
-  }
-
-  private select(id: string | null) {
-    if (this.sel === id) return;
-    this.sel = id;
-    this.match()?.preview(id);
-    if (id) this.advanceCoach(this.match()?.decisionInfo()?.side === 'def' ? 2 : 2);
-    this.render();
-    if (id) sfx.tick();
-  }
-
-  private advanceCoach(to: number) { if (this.coachStep < to) this.coachStep = to; }
-
-  /** Default group when a category opens: the hinted one, else the dunk or base technique, else the first live one. */
-  private defaultGroup(cat: string): string | null {
-    const list = this.opts.filter((o) => o.kind === cat && !o.disabled);
-    if (cat !== 'shoot' && list.some((o) => o.hint) && this.groupsIn(cat).length > 1) return null;
-    if (cat === 'shoot') return null;
-    const o = list.find((x) => TECHS[x.tech].base && !x.sp) ?? list.find((x) => !x.sp) ?? list[0];
-    return o ? grp(o) : null;
-  }
-
-  private openCat(k: ActKind) {
-    const m = this.match();
-    const info = m?.decisionInfo();
-    if (!m || !info) return;
-    this.advanceCoach(1);
-    this.cat = k;
-    this.sel = null;
-    m.preview(null);
-    if (k === 'shoot') {
-      // Shots: the list itself is the choice (nothing preselected, so the dunk row is read first).
-      this.tech = null;
-      this.render();
-      sfx.tick();
-      return;
-    }
-    this.pickGroup(this.defaultGroup(k));
-  }
-
-  private pickGroup(g: string | null) {
-    if (!this.cat) return;
-    const m = this.match();
-    if (this.cat === 'shoot') {
-      const o = this.opts.find((x) => x.kind === this.cat && grp(x) === g && !x.disabled);
-      if (o) { if (this.sel === o.id) this.confirm(o.id); else this.select(o.id); }
-      return;
-    }
-    this.tech = g;
-    this.sel = null;
-    m?.preview(null);
-    m?.showCategory(this.cat as ActKind, g ?? undefined);
-    const live = this.opts.filter((o) => o.kind === this.cat && grp(o) === g && !o.disabled);
-    if (live.length === 1) { this.select(live[0].id); return; }
-    this.render();
-    sfx.tick();
-  }
-
-  private pickFromWorld(x: number, y: number) {
-    if (!this.open) return;
-    const m = this.match();
-    if (!m) return;
-    const kind = this.cat && KINDS.includes(this.cat as ActKind) && this.cat !== 'shoot' ? (this.cat as ActKind) : null;
-    const id = m.optionAt(x, y, kind, kind ? this.tech ?? undefined : undefined) ?? m.optionAt(x, y, null);
-    if (!id) return;
-    const o = this.opts.find((q) => q.id === id);
-    if (!o || o.disabled) return;
-    if (this.sel === id) { this.confirm(id); return; }
-    this.cat = o.kind;
-    this.tech = grp(o);
-    this.select(id);
-  }
-
-  private confirm(id: string) {
-    if (!this.open) return;
-    const o = this.opts.find((x) => x.id === id);
-    if (!o || o.disabled) return;
+  private stack: { level: Level; cur: number }[] = [];
+  private enter(l: Level) {
     sfx.tap();
+    this.stack.push({ level: this.level, cur: this.cur });
+    this.level = l;
+    this.cur = 0;
+    this.build(true);
+  }
+  private back() {
+    const prev = this.stack.pop();
+    if (!prev) return;
+    sfx.tick();
+    this.level = prev.level;
+    this.cur = prev.cur;
+    this.match()?.preview(null);
+    this.build(false);
+  }
+
+  private moveTo(i: number, force = false) {
+    if (i < 0 || i >= this.rows.length) return;
+    if (i === this.cur && !force) return;
+    this.cur = i;
+    this.listEl.querySelectorAll('.row').forEach((b, k) => b.classList.toggle('cur', k === i));
+    const el = this.listEl.querySelector<HTMLElement>(`.row[data-i="${i}"]`);
+    if (el) {
+      // Keep the cursor row in view without moving anything else.
+      const top = el.offsetTop - this.listEl.offsetTop, bot = top + el.offsetHeight;
+      if (top < this.listEl.scrollTop) this.listEl.scrollTop = top;
+      else if (bot > this.listEl.scrollTop + this.listEl.clientHeight) this.listEl.scrollTop = bot - this.listEl.clientHeight;
+    }
+    const r = this.rows[i];
+    this.infoEl.innerHTML = this.infoHTML(r);
+    r.show();
+    if (!force) sfx.tick();
+  }
+
+  private activate(i = this.cur) {
+    const r = this.rows[i];
+    if (!r || r.disabled) { if (r) sfx.bad(); return; }
+    r.go();
+  }
+
+  private confirm(o: OptionInfo) {
+    if (!this.open || o.disabled) return;
+    sfx.tap();
+    this.stack = [];
     const m = this.match();
     const info = m?.decisionInfo();
     if (info?.coach) m?.coachDone(info.side);
-    m?.confirm(id);
+    m?.confirm(o.id);
+  }
+
+  // ---------------------------------------------------------------- info box
+  private edgeHTML(e: -1 | 0 | 1 | undefined, small = false) {
+    if (e === undefined || (small && e === 0)) return `<span class="edge none"></span>`;
+    const cls = e === 1 ? 'good' : e === -1 ? 'bad' : 'even';
+    const ic = e === 1 ? 'up' : e === -1 ? 'cross' : 'even';
+    return `<span class="edge ${cls}" title="${e === 1 ? 'Beats their move' : e === -1 ? 'Loses to their move' : 'Even'}">${icon(ic, small ? 16 : 32)}</span>`;
+  }
+
+  private buttonsHTML(back: boolean, ok: boolean) {
+    return `<div class="wi-btns">
+      <button class="wbtn back" data-back ${back ? '' : 'disabled'} aria-label="Back">${icon('back', 16)}</button>
+      <button class="wbtn ok" data-ok ${ok ? '' : 'disabled'} aria-label="OK">OK</button></div>`;
+  }
+
+  private infoHTML(r: Row | null) {
+    const info = this.info;
+    const tell = info?.tell;
+    const back = !!r && this.stack.length > 0;
+    if (!r) return `<div class="wi-num"></div><div class="wi-edge"></div><div class="wi-line"></div>${this.buttonsHTML(false, false)}`;
+    const kindIc = info?.side === 'def' ? 'protect' : r.opt ? KIND_ICON[r.opt.kind as ActKind] ?? 'ball' : r.ic;
+    const num = r.pct !== undefined && !r.disabled ? `<span class="wi-ic">${icon(r.special ? 'fire' : kindIc, 32)}</span><b>${r.pct}<small>%</small></b>` : r.line ? `<span class="wi-ic">${icon('lock', 32)}</span>` : '';
+    const vs = tell && r.edge !== undefined && !r.disabled ? `${this.edgeHTML(r.edge)}<span class="wi-vs">vs</span><span class="wi-tell">${icon(tell.icon, 32)}</span>` : '';
+    const line = r.line ?? (r.hint ? info?.hint ?? '' : r.special ? 'FIRE' : '');
+    return `<div class="wi-num">${num}</div><div class="wi-edge">${vs}</div><div class="wi-line ${r.special ? 'fire' : ''}">${line}</div>${this.buttonsHTML(back, !r.disabled)}`;
+  }
+
+  // ---------------------------------------------------------------- input
+  private pickFromWorld(x: number, y: number) {
+    if (!this.open || this.info?.side !== 'att') return;
+    const m = this.match();
+    if (!m) return;
+    const L = this.level;
+    const kind = L.k === 'kind' || L.k === 'target' ? L.kind : null;
+    const group = L.k === 'target' ? L.group : undefined;
+    const id = m.optionAt(x, y, kind === 'shoot' ? null : kind, group) ?? m.optionAt(x, y, null);
+    if (!id) return;
+    const o = this.opts.find((q) => q.id === id);
+    if (!o || o.disabled) return;
+    const g = grp(o);
+    const live = this.opts.filter((q) => q.kind === o.kind && grp(q) === g && !q.disabled);
+    if (!(L.k === 'target' && L.group === g)) {
+      this.stack = [{ level: { k: 'root' }, cur: KINDS.indexOf(o.kind as ActKind) }];
+      if (live.length > 1) {
+        this.stack.push({ level: { k: 'kind', kind: o.kind as ActKind }, cur: this.groupsIn(o.kind as ActKind).indexOf(g) });
+        this.level = { k: 'target', kind: o.kind as ActKind, group: g };
+      } else this.level = { k: 'kind', kind: o.kind as ActKind };
+      this.build(true);
+    }
+    const i = this.rows.findIndex((r) => r.opt?.id === id || r.key === g);
+    if (i < 0) return;
+    if (i === this.cur && this.rows[i].opt?.id === id) { this.activate(i); return; }
+    this.moveTo(i, true);
+    sfx.tick();
   }
 
   private onClick = (e: MouseEvent) => {
+    if (!this.open) return;
     const t = e.target as HTMLElement;
-    if (t.closest('[data-coach-next]')) { this.advanceCoach(1); this.render(); return; }
-    if (t.closest('[data-confirm]')) { if (this.sel) this.confirm(this.sel); return; }
-    const kind = t.closest<HTMLElement>('[data-kind]')?.dataset.kind as ActKind | undefined;
-    if (kind) { if (this.cat === kind && this.sel && kind === 'shoot') { this.confirm(this.sel); return; } this.openCat(kind); return; }
-    const tech = t.closest<HTMLButtonElement>('[data-tech]');
-    if (tech && !tech.disabled) { this.pickGroup(tech.dataset.tech!); return; }
-    const id = t.closest<HTMLElement>('[data-opt]')?.dataset.opt;
-    if (!id) return;
-    const o = this.opts.find((x) => x.id === id);
-    if (!o || o.disabled) return;
-    if (this.sel === id) this.confirm(id); else { this.tech = grp(o); this.select(id); }
+    if (t.closest('[data-back]')) { this.back(); return; }
+    if (t.closest('[data-ok]')) { this.activate(); return; }
+    const row = t.closest<HTMLElement>('.row');
+    if (!row) return;
+    const i = +row.dataset.i!;
+    // Touch: the first tap moves the hand (and previews), the second plays it. Mouse: hovering already moved it.
+    if (i !== this.cur) { this.moveTo(i); if (this.lastPointer === 'mouse') this.activate(i); return; }
+    this.activate(i);
   };
 
   private onOver = (e: PointerEvent) => {
-    if (e.pointerType !== 'mouse') return;
-    const t = e.target as HTMLElement;
-    const id = t.closest<HTMLElement>('.d-subs [data-opt]')?.dataset.opt;
-    if (id) {
-      const o = this.opts.find((x) => x.id === id);
-      if (o && !o.disabled) { this.tech = grp(o); this.select(id); }
-    }
+    if (!this.open || e.pointerType !== 'mouse') return;
+    const row = (e.target as HTMLElement).closest<HTMLElement>('.row');
+    if (row) this.moveTo(+row.dataset.i!);
   };
 
   private onKey = (e: KeyboardEvent) => {
     if (!this.open) return;
-    const k = e.key.toLowerCase();
-    const info = this.match()?.decisionInfo();
-    if (!info) return;
-    const n = parseInt(k, 10);
-    if (k === 'enter' || k === ' ') {
-      e.preventDefault();
-      if (this.sel) this.confirm(this.sel);
-      return;
-    }
-    if (k === 'escape') { this.cat = null; this.tech = null; this.select(null); this.match()?.preview(null); this.render(); return; }
-    if (info.side === 'att' && KEY_KIND[k]) {
-      const kind = KEY_KIND[k];
-      if (this.opts.some((o) => o.kind === kind && !o.disabled)) this.openCat(kind);
-      return;
-    }
-    const vi = VAR_KEYS.indexOf(k);
-    if (vi >= 0 && this.cat && info.side === 'att') {
-      const g = this.groupsIn(this.cat)[vi];
-      if (g && this.opts.some((o) => o.kind === this.cat && grp(o) === g && !o.disabled)) this.pickGroup(g);
-      return;
-    }
-    if (n >= 1) {
-      if (info.side === 'def') {
-        const o = this.opts[n - 1];
-        if (o) { if (this.sel === o.id) this.confirm(o.id); else this.select(o.id); e.preventDefault(); }
-        return;
-      }
-      const list = this.opts.filter((o) => o.kind === this.cat && this.cat !== 'shoot' && grp(o) === this.tech);
-      const o = list[n - 1];
-      if (!o || o.disabled) return;
-      if (this.sel === o.id) this.confirm(o.id); else this.select(o.id);
-      e.preventDefault();
-    }
+    const k = e.key;
+    const n = this.rows.length;
+    if (k === 'ArrowDown' || k === 'ArrowRight') { e.preventDefault(); let i = this.cur; for (let s = 0; s < n; s++) { i = (i + 1) % n; if (!this.rows[i].disabled) break; } this.moveTo(i); return; }
+    if (k === 'ArrowUp' || k === 'ArrowLeft') { e.preventDefault(); let i = this.cur; for (let s = 0; s < n; s++) { i = (i - 1 + n) % n; if (!this.rows[i].disabled) break; } this.moveTo(i); return; }
+    if (k === 'Enter' || k === ' ' || k === 'z' || k === 'Z') { e.preventDefault(); this.activate(); return; }
+    if (k === 'Escape' || k === 'Backspace' || k === 'x' || k === 'X') { e.preventDefault(); this.back(); return; }
+    const d = parseInt(k, 10);
+    if (d >= 1 && d <= n) { e.preventDefault(); if (this.cur === d - 1) this.activate(); else this.moveTo(d - 1); }
   };
 }

@@ -1,7 +1,6 @@
 // Turn Ball Pixel: screens and boot. Fork of src/main.ts with pixel-art avatars, team shape marks and
 // the sprite renderer; saves, league, rules and techniques are the shared modules of the main game.
-import '@fontsource/pixelify-sans/400.css';
-import '@fontsource/pixelify-sans/700.css';
+import '@fontsource/press-start-2p/400.css';
 import './style.css';
 import { setSound, sfx, unlockAudio } from '../audio';
 import {
@@ -256,7 +255,7 @@ function howScreen() {
       ${card(`${icon('t_dunk', 26)}${icon('shoot', 26)}`, 'Your turn: shoot', 'Dunk, layup, floater, jump shot, three or fadeaway. The dunk is the best finish: at the post, or from the elbow once you beat your man. A shot blocker can stuff it.')}
       ${card(`${icon('t_cross', 24)}${icon('t_between', 24)}${icon('t_backdown', 24)}`, 'Your turn: dribble', 'Crossover, between the legs, behind the back, spin, euro step, back down, hesitation, step-back, pump fake. Beat your man and you are open: then dunk or shoot.')}
       ${card(`${icon('t_rim', 24)}${icon('t_contest', 24)}${icon('t_charge', 24)}`, 'Their turn: defend', 'Press, Steal, Contest, Give space, Block, Take the charge or Deny pass. Each one says what it stops and what beats it. You both pick at the same time.')}
-      ${card(`<span class="pps"><span class="pp rw">${icon('up', 16)}${icon('up', 16)}</span><span class="pp rk">${icon('warn', 16)}</span></span>`, 'Gain and risk', 'Arrows show how much an option can win you, warning triangles how risky it is. After every play a card says whose move won and why.')}
+      ${card(`${icon('up', 24)}${icon('cross', 24)}`, 'Beat their move', 'The icon over their player is what they will likely do. Up arrow: your move beats it. Cross: it loses to it.')}
       ${card(`${icon('fire', 30)}`, 'Fire and specials', `Win duels to fill your Fire meter (${FIRE.max} flames: +1 per duel won, +2 per steal, pick, block or charge, +1 per forced miss, -1 per turnover). Full Fire unlocks each player's signature special for one move. Every special has a defense that stops it.`)}
       ${card(`${icon('t_pnr', 24)}${icon('t_iso', 24)}${icon('t_pop', 24)}`, 'Plays and passes', 'Players learn passes and team plays (pick and roll, clear-out, hand-off...) by leveling up and training. Shots, dribble moves and defense are the same for everyone.')}
       ${card(`<span class="pips att"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></span>`, 'Moves', `${TUNE.actions} moves per possession. The last one is a shot.`)}
@@ -266,60 +265,58 @@ function howScreen() {
   app.querySelector('#tut')!.addEventListener('click', () => { sfx.tap(); tutorialScreen(); });
 }
 
-/** Fire meter: flame pips (filled solid, empty dotted), plus the word READY when full. */
-const fireHTML = (t: 0 | 1, short: string) => `<div class="fire t${t}" id="fire${t}">${markHTML(t === 0 ? 'home' : 'away')}<span class="fn">${esc(short)}</span>
-  <span class="fpips">${Array.from({ length: FIRE.max }, () => `<i>${icon('fire', 16)}</i>`).join('')}</span><b class="fready">READY</b></div>`;
+/** Fire meter: flame pips (lit: bright and solid; empty: dim and dotted). */
+const firePips = () => `<span class="fpips">${Array.from({ length: FIRE.max }, () => `<i>${icon('fire', 16)}</i>`).join('')}</span>`;
 
 function matchHud(rivalName: string, rivalColor: string) {
   return `
     <div class="stage" id="stage"></div>
-    <div class="mpanel" id="mpanel">
-      <div class="fires">${fireHTML(0, USER_TEAM.short)}${fireHTML(1, rivalName)}</div>
-      <div class="log" id="log"></div>
+    <div class="hud" id="hud">
+      <div class="hteam home" id="t0">${markHTML('home')}<span class="hn">${USER_TEAM.short}</span>${firePips()}<b class="hs" id="s0">0</b></div>
+      <div class="hmid"><span id="possn"></span><span class="moves" id="moves"></span></div>
+      <div class="hteam away" id="t1" style="--c:${mix(rivalColor, '#000000', 0.5)}"><b class="hs" id="s1">0</b>${firePips()}<span class="hn">${esc(rivalName)}</span>${markHTML('away')}</div>
+      <button class="btn small ghost pausebtn icon-btn" id="pause" aria-label="Pause">${icon('pause', 16)}</button>
     </div>
-    <div class="hud">
-      <div class="hteam home">${markHTML('home')}<span class="hn">${USER_TEAM.short}</span><span class="hs" id="s0">0</span></div>
-      <div class="hclock"><span id="possn"></span></div>
-      <div class="hteam away" style="--c:${mix(rivalColor, '#000000', 0.5)}"><span class="hs" id="s1">0</span><span class="hn">${esc(rivalName)}</span>${markHTML('away')}</div>
-      <button class="btn small ghost pausebtn icon-btn" id="pause" aria-label="Pause">${icon('pause', 20)}</button>
-    </div>
+    <div class="win" id="win"></div>
     <div class="banner" id="banner"></div>
-    <div class="duel" id="duel" aria-live="polite"></div>
+    <div class="bigres" id="bigres" aria-live="polite"></div>
     <div class="cutin" id="cutin"></div>`;
 }
 
 function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions) {
   const stage = el.querySelector<HTMLElement>('#stage')!;
   const banner = el.querySelector<HTMLElement>('#banner')!;
-  const log = el.querySelector<HTMLElement>('#log')!;
   const cutin = el.querySelector<HTMLElement>('#cutin')!;
-  const duel = el.querySelector<HTMLElement>('#duel')!;
-  const panel = el.querySelector<HTMLElement>('#mpanel')!;
-  let bannerT = 0, cutT = 0, duelT = 0;
-  dui = new DecisionUI(panel, () => match);
+  const bigres = el.querySelector<HTMLElement>('#bigres')!;
+  const win = el.querySelector<HTMLElement>('#win')!;
+  let bannerT = 0, cutT = 0, resT = 0;
+  dui = new DecisionUI(win, () => match);
   const team = save.roster.slice(0, 3);
   const foe = rival ? rival : RIVALS[0];
   const m = new Match(stage, [
     { name: USER_TEAM.name, short: USER_TEAM.short, color: USER_TEAM.color, accent: USER_TEAM.accent, shorts: '#ffffff', kit: HOME_KIT, marker: 'home', players: team },
     { name: foe.name, short: foe.name.slice(0, 3).toUpperCase(), color: foe.color, accent: foe.accent, shorts: '#1d1a2b', kit: awayKit(foe), marker: 'away', players: mirrorPlayers(foe, team) },
-  ], opts, {
+  ], { ...opts, coach: undefined }, {
     decision: (open) => {
       el.classList.toggle('deciding', open);
-      if (open) { save.duelsSeen++; duel.classList.remove('show'); }
+      if (open) { save.duelsSeen++; bigres.classList.remove('show'); }
       dui?.show(open);
     },
     hud: (h) => {
       el.querySelector('#s0')!.textContent = String(h.score[0]);
       el.querySelector('#s1')!.textContent = String(h.score[1]);
       const n = Math.min(h.maxPoss, Math.max(h.poss[0], h.poss[1]) + (h.poss[0] === h.poss[1] ? 1 : 0));
-      el.querySelector('#possn')!.innerHTML = opts.tutorial ? `${icon('help', 16)}` : h.golden ? 'GOLDEN' : `${icon('ball', 16)} ${n}/${h.maxPoss}`;
-      el.querySelector('.hteam.home')!.classList.toggle('poss', h.offense === 0);
-      el.querySelector('.hteam.away')!.classList.toggle('poss', h.offense === 1);
+      el.querySelector('#possn')!.innerHTML = opts.tutorial ? `${icon('help', 16)}<b>${'TUTORIAL'.slice(0, 3)}</b>` : h.golden ? `${icon('fire', 16)}<b>GOLD</b>` : `${icon('ball', 16)}<b>${n}/${h.maxPoss}</b>`;
+      // Moves left this possession: filled squares (used: hollow).
+      el.querySelector('#moves')!.innerHTML = Array.from({ length: h.maxLeft }, (_, i) => `<i class="${i < h.left ? 'on' : ''}"></i>`).join('');
+      el.querySelector('#t0')!.classList.toggle('poss', h.offense === 0);
+      el.querySelector('#t1')!.classList.toggle('poss', h.offense === 1);
       for (const t of [0, 1] as const) {
-        const f = el.querySelector<HTMLElement>(`#fire${t}`)!;
+        const f = el.querySelector<HTMLElement>(`#t${t}`)!;
         f.querySelectorAll('.fpips i').forEach((p, k) => p.classList.toggle('on', k < h.heat[t]));
         f.classList.toggle('full', h.heat[t] >= FIRE.cost);
       }
+      if (!el.classList.contains('deciding')) dui?.idle(h.offense === 0 ? 'att' : 'def');
     },
     banner: (text, color, sub) => {
       banner.innerHTML = `<div class="bn-main" style="--c:${color}">${esc(text)}</div>${sub ? `<div class="bn-sub">${esc(sub)}</div>` : ''}`;
@@ -329,27 +326,17 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
       clearTimeout(bannerT);
       bannerT = window.setTimeout(() => banner.classList.remove('show'), 1500);
     },
-    explain: (text, tone) => {
-      const line = document.createElement('p');
-      line.className = `explain ${tone}`;
-      line.textContent = text;
-      log.prepend(line);
-      while (log.children.length > 4) log.lastElementChild!.remove();
-    },
+    explain: () => {},
     duel: (d) => {
-      // Result card: both moves with their icons, who won (check / cross / equals mark plus a word), and why.
-      const mark = d.res === 'win' ? icon('check', 24) : d.res === 'lose' ? icon('cross', 24) : icon('even', 24);
-      const word = d.res === 'win' ? 'YOU WIN' : d.res === 'lose' ? 'THEY WIN' : 'EVEN';
-      duel.className = `duel r-${d.res}`;
-      duel.innerHTML = `<div class="du-row">
-          <span class="du-side"><small>YOU</small>${icon(d.you.icon, 32)}<b>${esc(d.you.name)}</b></span>
-          <span class="du-res">${mark}<small>${word}</small></span>
-          <span class="du-side"><small>THEM</small>${icon(d.them.icon, 32)}<b>${esc(d.them.name)}</b></span></div>
-        <div class="du-head">${esc(d.head)}</div><div class="du-why">${esc(d.why)}</div>`;
-      void duel.offsetWidth;
-      duel.classList.add('show');
-      clearTimeout(duelT);
-      duelT = window.setTimeout(() => duel.classList.remove('show'), 2600);
+      // The result, big over the stage: a word, its icon and the tone's shape (solid, double, dashed).
+      const mark = d.res === 'win' ? 'check' : d.res === 'lose' ? 'cross' : 'even';
+      bigres.className = `bigres r-${d.res}`;
+      bigres.innerHTML = `<div class="br-in">${icon(mark, 32)}<b>${esc(d.word)}</b>${d.pts ? `<em>+${d.pts}</em>` : ''}</div>`;
+      void bigres.offsetWidth;
+      bigres.classList.add('show');
+      clearTimeout(resT);
+      resT = window.setTimeout(() => bigres.classList.remove('show'), 1500);
+      dui?.duel(d);
     },
     coached: (side) => {
       if (side === 'att') save.coachedAtt = true; else save.coachedDef = true;
@@ -359,7 +346,7 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
       const kit = team === 0 ? HOME_KIT : awayKit(foe);
       cutin.className = `cutin fx-${sp.fx} t${team} ${save.reduceFx ? 'calm' : ''}`;
       cutin.innerHTML = `<div class="ci-band"><img src="${avatarURL(lookOf(pl, kit))}" alt="" width="80" height="80">
-        <div><small>${team === 0 ? markHTML('home') : markHTML('away')} #${pl.num} ${esc(pl.name.toUpperCase())}</small><b>${icon('fire', 24)} ${esc(sp.name.toUpperCase())}</b><em>${esc(sp.line)}</em></div></div>`;
+        <div><small>${team === 0 ? markHTML('home') : markHTML('away')} #${pl.num}</small><b>${icon('fire', 24)} ${esc(sp.name.toUpperCase())}</b></div></div>`;
       void cutin.offsetWidth;
       cutin.classList.add('show');
       clearTimeout(cutT);
@@ -378,14 +365,14 @@ function bindMatch(el: HTMLElement, rival: RivalTeam | null, opts: MatchOptions)
     ov.className = 'pause-overlay';
     ov.innerHTML = `<div class="panel"><h2>Paused</h2>
       <button class="btn primary" id="resume">${icon('play', 22)} Resume</button>
-      <button class="btn" id="pfx">${icon(save.reduceFx ? 'even' : 'fire', 20)} Effects: ${save.reduceFx ? 'reduced' : 'full'}</button>
+      <button class="btn" id="pfx">${icon(save.reduceFx ? 'even' : 'fire', 20)} FX ${save.reduceFx ? 'low' : 'full'}</button>
       <button class="btn ghost" id="quit">${icon('cross', 20)} Quit</button></div>`;
     el.appendChild(ov);
     ov.querySelector('#resume')!.addEventListener('click', () => { m.paused = false; ov.remove(); });
     ov.querySelector('#pfx')!.addEventListener('click', (e) => {
       save.reduceFx = !save.reduceFx; persist(save);
       m.setReduceFx(!!save.reduceFx);
-      (e.currentTarget as HTMLElement).innerHTML = `${icon(save.reduceFx ? 'even' : 'fire', 20)} Effects: ${save.reduceFx ? 'reduced' : 'full'}`;
+      (e.currentTarget as HTMLElement).innerHTML = `${icon(save.reduceFx ? 'even' : 'fire', 20)} FX ${save.reduceFx ? 'low' : 'full'}`;
     });
     ov.querySelector('#quit')!.addEventListener('click', () => {
       if (opts.tutorial) { save.tutorialDone = true; }
@@ -485,7 +472,7 @@ function titleSprites(c: HTMLCanvasElement, rival: RivalTeam) {
 };
 
 app.innerHTML = '<div class="screen boot"><p>LOADING...</p></div>';
-Promise.all([loadAtlas(), initIcons(), document.fonts?.load('700 16px "Pixelify Sans"').catch(() => null)])
+Promise.all([loadAtlas(), initIcons(), document.fonts?.load('16px "Press Start 2P"').catch(() => null)])
   .then(() => titleScreen())
   .catch((err) => {
     app.innerHTML = '<div class="screen boot"><p>Could not load the game art. Reload to try again.</p></div>';

@@ -19,7 +19,7 @@ import { TECHS, isDefTech, type TechId } from '../techs';
 import { FIRE, SPECIALS, fireDelta, specialFor, type SpecialDef, type SpecialId } from '../specials';
 import { ArcCurve, COURT_H, COURT_W, HOOP, RIM, RIM_H, w3 } from './court';
 import { hairStyleFor, releaseIndex, tagLen, type Kit } from './sprites';
-import { PixelWorld, type PixelLook } from './world';
+import { PixelWorld, type PixelLook, type ScenePt } from './world';
 
 export { COURT_W, COURT_H, HOOP };
 
@@ -109,6 +109,10 @@ export interface OptionInfo {
   locked?: string;
   /** Defense: how this move does against the attack's most likely action. */
   vsTop?: string;
+  /** Against the opponent's tell: 1 this move beats it, -1 it loses to it, 0 neither. */
+  edge?: -1 | 0 | 1;
+  /** Short label for a target (receiver, destination) in the target list. */
+  short?: string;
 }
 
 export interface DecisionInfo {
@@ -132,6 +136,8 @@ export interface DecisionInfo {
   threat?: string;
   /** Coach: first attack / first defense possession of the player's first real matches. */
   coach?: boolean;
+  /** The opponent's tell: on attack the defense's most likely move, on defense the attack's most likely kind. */
+  tell?: { icon: string; name: string };
 }
 
 /** What one duel came to, for the result card. */
@@ -142,6 +148,10 @@ export interface DuelInfo {
   res: 'win' | 'lose' | 'even';
   head: string;
   why: string;
+  /** Big result word ("SCORE!", "BLOCKED!", "STEAL!") and the points scored, if any. */
+  word: string;
+  pts: number;
+  icon: string;
 }
 
 export interface MatchHooks {
@@ -197,6 +207,15 @@ const ONE = (st: Stance) => ({ press: 0, space: 0, deny: 0, [st]: 1 });
 
 export const STANCE_LABEL: Record<Stance, string> = { press: 'Press', space: 'Give space', deny: 'Deny pass' };
 export const KIND_LABEL: Record<ActKind, string> = { shoot: 'Shoot', pass: 'Pass', drive: 'Dribble', cut: 'Play' };
+export const KIND_ICON: Record<ActKind, string> = { shoot: 'shoot', pass: 'pass', drive: 'dribble', cut: 'cut' };
+/** The big word shown when a duel resolves, and its icon. */
+const RESULT_WORD: Record<Ev, { w: string; i: string }> = {
+  make: { w: 'SCORE!', i: 'hoop' }, and1: { w: 'AND ONE!', i: 'hoop' }, miss: { w: 'MISS', i: 'cross' }, oreb: { w: 'REBOUND!', i: 'ball' },
+  block: { w: 'BLOCKED!', i: 'block' }, catch: { w: 'CAUGHT', i: 'check' }, feed: { w: 'OPEN!', i: 'up' }, pick: { w: 'PICKED!', i: 'steal' },
+  beat: { w: 'PAST HIM!', i: 'dribble' }, room: { w: 'SPACE!', i: 'up' }, held: { w: 'HELD', i: 'even' }, stopped: { w: 'STOPPED', i: 'even' },
+  help: { w: 'MAN FREE!', i: 'pass' }, steal: { w: 'STEAL!', i: 'steal' }, open: { w: 'OPEN!', i: 'check' }, slip: { w: 'SLIP!', i: 'pass' },
+  covered: { w: 'COVERED', i: 'even' }, charge: { w: 'CHARGE!', i: 't_charge' },
+};
 
 /** Plain-language defense guide: what each defensive move stops and what beats it (pixel edition set). */
 export const DEF_GUIDE: Partial<Record<TechId, { does: string; stops: string; weak: string }>> = {
@@ -450,6 +469,8 @@ export class Match {
     this.spent = false;
     this.cine = null;
     this.world.fxClear();
+    this.world.clearMarks();
+    this.world.overview();
     if (tut && this.tutIdx === tut.length - 1) this.heat[0] = FIRE.max;
     this.freed = null;
     this.holder = this.att(s.ball);
@@ -480,8 +501,70 @@ export class Match {
     }
     this.opts = this.buildOptions();
     for (let i = 0; i < 3; i++) { this.faceTo(this.att(i), HOOP.x, HOOP.y); this.faceTo(this.def(i), this.att(i).x, this.att(i).y); }
+    // Battle camera: close on the two players facing off; the opponent's tell floats over their player.
+    this.camDuel();
+    this.world.clearMarks();
+    const tell = this.tell();
+    if (tell) {
+      const who = this.userAttacks ? this.def(s.ball) : this.att(s.ball);
+      this.world.mark(this.pos3(who, 3.2), icon(tell.icon, 16), `tell ${this.userAttacks ? 'def' : 'att'}`);
+    }
     this.hooks.decision(true);
     this.pushHud();
+  }
+
+  // ---------------------------------------------------------------- camera
+  /** Scene points of a player (feet and head), for camera framing. */
+  private pts(e: Ent | { x: number; y: number }): ScenePt[] {
+    const f = this.world.screenOf(e.x, e.y);
+    return [f, { x: f.x - 10, y: f.y - 44 }, { x: f.x + 10, y: f.y - 44 }];
+  }
+  private rimPts(): ScenePt[] { const r = this.world.screenOf(HOOP.x, HOOP.y, RIM_H); return [r, { x: r.x, y: r.y - 10 }]; }
+  /** Close on the ball handler and their defender. */
+  camDuel() {
+    const s = this.poss;
+    if (!s) return;
+    this.world.frame([...this.pts(this.att(s.ball)), ...this.pts(this.def(s.ball))], 3, 12);
+  }
+  /** Frame everything an action involves (the shooter and the rim, the passer and the receiver...). */
+  private focusAct(a: Act) {
+    const s = this.poss!;
+    const h = this.att(s.ball), hd = this.def(s.ball);
+    const P: ScenePt[] = [...this.pts(h), ...this.pts(hd)];
+    if (a.k === 'shoot') P.push(...this.rimPts());
+    else if (a.k === 'pass') P.push(...this.pts(this.att(a.to)), ...this.pts(this.def(a.to)));
+    else if (a.k === 'drive') P.push(...this.pts(ZONES[a.z]));
+    else {
+      if (a.t === 'iso' || a.t === 'giveandgo') for (let j = 0; j < 3; j++) P.push(...this.pts(this.att(j)));
+      P.push(...this.pts(this.att(a.who)), ...this.pts(this.def(a.who)), ...this.pts(ZONES[a.z]));
+    }
+    this.world.frame(P, 3, 14);
+  }
+  /** Frame a defensive move: the duel, plus the rim or the whole team when the move involves them. */
+  private focusStance(dm: TechId) {
+    const s = this.poss!;
+    const P: ScenePt[] = [...this.pts(this.att(s.ball)), ...this.pts(this.def(s.ball))];
+    const p = this.defSpot(s, s.ball, dm);
+    P.push(...this.pts(p));
+    if (dm === 'rim' || dm === 'charge') P.push(...this.rimPts());
+    if (famOf(dm) === 'deny' || dm === 'hawk') for (let j = 0; j < 3; j++) { P.push(...this.pts(this.att(j)), ...this.pts(this.defSpot(s, j, dm))); }
+    this.world.frame(P, 3, 14);
+  }
+
+  /** The opponent's most likely choice, shown as an icon over their player. */
+  private tell(): { icon: string; name: string; st?: Stance; k?: ActKind } | null {
+    if (this.userAttacks) {
+      const plan = this.plan;
+      if (!plan) return null;
+      const st = this.shownStance ?? STANCES.slice().sort((a, b) => plan.dist[b] - plan.dist[a])[0];
+      const dm = plan.v[st];
+      return { icon: TECHS[dm].icon, name: defName(dm), st };
+    }
+    if (!this.attDist) return null;
+    const by: Record<ActKind, number> = { shoot: 0, pass: 0, drive: 0, cut: 0 };
+    for (const x of this.attDist) by[x.item.k] += x.w;
+    const k = (Object.keys(by) as ActKind[]).sort((a, b) => by[b] - by[a])[0];
+    return { icon: KIND_ICON[k], name: KIND_LABEL[k], k };
   }
 
   /**
@@ -526,9 +609,10 @@ export class Match {
       lean: this.userAttacks ? this.plan ?? undefined : undefined,
       attLean: this.attDist ? this.attDist.reduce((acc, x) => { acc[x.item.k] += x.w; return acc; }, { shoot: 0, pass: 0, drive: 0, cut: 0 } as Record<ActKind, number>) : undefined,
       shown: this.shownStance ?? undefined,
-      hint: step?.hint ?? (this.o.tutorial && s.fire && this.userAttacks ? 'Fire meter full: open a move and look for the flame special.' : this.o.hints && !this.o.coach?.[side] ? this.firstHint() : undefined),
+      hint: step?.hint ?? (this.o.tutorial && s.fire && this.userAttacks ? 'Fire: use a special' : undefined),
       fire: !!s.fire && this.userAttacks,
       threats: this.attDist ? this.threats() : undefined,
+      tell: this.tell() ?? undefined,
     };
   }
 
@@ -583,12 +667,6 @@ export class Match {
       const who = this.ents.find((e) => e.team === this.offense && e.sp.id === id)!;
       return { num: who.pl.num, name: SPECIALS[id].name, counter: SPECIALS[id].counter, pct: Math.max(1, Math.round(w * 100)) };
     });
-  }
-
-  private firstHint(): string | undefined {
-    if (this.decisions === 0 && this.userAttacks) return 'Pick a move type, then a move. Arrows = gain, triangles = risk.';
-    if (!this.userAttacks && this.stats.defHint === undefined) return 'Pick one of the 7 defenses. They move at the same time.';
-    return undefined;
   }
 
   options(): OptionInfo[] { return this.opts; }
@@ -815,6 +893,9 @@ export class Match {
         info.label = d.name;
         info.card = { ...info.card, change: `FIRE: ${d.name}. Countered by ${STANCE_LABEL[d.counter]}` };
       }
+      info.edge = this.edgeAtt(a, plan);
+      info.short = a.k === 'pass' ? `#${this.att(a.to).pl.num}` : a.k === 'drive' ? (a.t === 'stepback' || a.t === 'pumpfake' ? 'Here' : `${ZONES[a.z].name}${ZONES[a.z].x < HOOP.x ? ' L' : ' R'}`)
+        : a.k === 'cut' ? (a.t === 'iso' ? 'Clear' : a.t === 'giveandgo' ? `${ZONES[a.z].name}` : `#${this.att(a.who).pl.num} ${ZONES[a.z].name}`) : undefined;
       if (step) {
         let ok = step.allow.includes(a.k);
         if (ok && step.techs) ok = step.techs.includes(a.t);
@@ -831,12 +912,33 @@ export class Match {
       const z = ZONES[s.zones[s.ball]];
       const st = m.att[s.ball];
       const strong = z.kind === 'close' ? st.str + st.spd >= TUNE.dunk.post : st.str + st.spd >= TUNE.dunk.run;
-      const why = !strong ? `#${h.pl.num} cannot dunk from here (needs more strength and speed). Lay it up or shoot.`
-        : z.kind === 'three' ? 'Too far. Dribble to the post, or beat your man to the elbow, then dunk.'
-          : 'Beat your defender first (Dribble), or get to the post, then dunk.';
+      const why = !strong ? 'Not strong enough' : z.kind === 'three' ? 'Too far' : 'Beat him first';
+      void h;
       out.unshift({ id: 'lock-dunk', kind: 'shoot', tech: 'dunk', label: 'Dunk', odds: [], main: 0, card: { gain: '', risk: '', change: '' }, disabled: true, locked: why, group: 'dunk', what: why });
     }
     return out;
+  }
+
+  /**
+   * How an attack move does against the defense's tell, compared with the two other stances: 1 when it is
+   * this move's best matchup (it beats the tell), -1 when it is its worst, 0 when the stance barely matters.
+   */
+  private edgeAtt(a: Act, plan: DefPlan): -1 | 0 | 1 {
+    const t = this.tell();
+    if (!t?.st) return 0;
+    const s = this.poss!;
+    const win = new Set<Ev>(['make', 'and1', 'beat', 'room', 'help', 'open', 'slip', 'feed', ...(a.k === 'pass' ? ['catch' as Ev] : [])]);
+    const succ: Record<Stance, number> = { press: 0, space: 0, deny: 0 };
+    for (const st of STANCES) {
+      const o = actOdds(this.mu, s, a, planOf(ONE(st), plan.v));
+      for (const [k, p] of Object.entries(o)) if (win.has(k as Ev)) succ[st] += p ?? 0;
+    }
+    const me = succ[t.st];
+    const others = STANCES.filter((x) => x !== t.st).map((x) => succ[x]);
+    const hi = Math.max(...others), lo = Math.min(...others);
+    if (me >= hi - 0.02 && me - lo >= 0.06) return 1;
+    if (me <= lo + 0.02 && hi - me >= 0.06) return -1;
+    return 0;
   }
 
   private stanceOptions(): OptionInfo[] {
@@ -871,10 +973,18 @@ export class Match {
       for (const a of acts) if (a.k === 'shoot') shot = Math.max(shot, pct(shotChance(m, s, s.ball, dm, a.t).make));
       const guide = DEF_GUIDE[dm]!;
       let vsTop: string | undefined;
+      let stopTop = 0;
       if (top) {
-        let stop = 0;
-        for (const b of branches(m, s, top, dm)) if (!attWin.has(b.ev)) stop += b.p;
-        vsTop = `vs their ${this.actWords(top, s)}: you stop it ${pct(stop)}%`;
+        // Against the attack's most likely kind of action (the tell), weighted by how they would play it.
+        let wsum = 0;
+        const tk = this.tell()?.k ?? top.k;
+        for (const { item, w } of attDist) {
+          if (item.k !== tk) continue;
+          wsum += w;
+          for (const b of branches(m, s, item, dm)) if (!attWin.has(b.ev)) stopTop += w * b.p;
+        }
+        stopTop = wsum > 0 ? stopTop / wsum : 0;
+        vsTop = `${pct(stopTop)}`;
       }
       const card: Card = {
         gain: `Stops: ${guide.stops}`,
@@ -883,9 +993,14 @@ export class Match {
       };
       out.push({
         id: dm, kind: st, tech: dm, dm, label: defName(dm), odds, main: o.ball + o.held, card, group: dm,
-        what: guide.does, reward: lvl(o.ball + o.held, 52, 68), risk: lvl(o.beat, 32, 48), vsTop,
+        what: guide.does, reward: lvl(o.ball + o.held, 52, 68), risk: lvl(o.beat, 32, 48), vsTop, edge: 0,
       });
+      (out[out.length - 1] as OptionInfo & { stopTop?: number }).stopTop = stopTop;
     }
+    // Edge: how each move does against their tell, ranked among the seven.
+    const vals = out.map((o) => (o as OptionInfo & { stopTop?: number }).stopTop ?? 0);
+    const hi = Math.max(...vals), lo = Math.min(...vals);
+    if (hi - lo >= 0.08) out.forEach((o, i) => { o.edge = vals[i] >= hi - 0.04 ? 1 : vals[i] <= lo + 0.04 ? -1 : 0; });
     return out;
   }
 
@@ -896,29 +1011,23 @@ export class Match {
     const W = this.world;
     W.clearPreview();
     const s = this.poss!;
-    if (!id) { this.showCategory(null); return; }
+    if (!id) { this.showCategory(null); this.camDuel(); return; }
     const opt = this.opts.find((o) => o.id === id);
     if (!opt) return;
-    const lab = (k: string, pos: Vector3) => {
-      const o = opt.odds.find((x) => x.key === k);
-      if (!o || o.pct <= 0) return;
-      W.label({ pos, html: `${icon(o.icon, 16)}<b>${o.pct}%</b><small>${o.word}</small>`, cls: `odds ${o.tone}` });
-    };
-    const techTag = (pos: Vector3) => {
-      if (opt.sp) {
-        W.label({ pos, html: `${icon('fire', 16)}<small>${SPECIALS[opt.sp].name.toUpperCase()}</small>`, cls: 'special' });
-        W.floorRing(this.pos3(this.spActor(opt.act!)), '#ffb02e', 1.1);
-        return;
-      }
-      if (TECHS[opt.tech].base) return;
-      W.label({ pos, html: `${icon(TECHS[opt.tech].icon, 16)}<small>${TECHS[opt.tech].name.toUpperCase()}</small>`, cls: 'tech' });
+    // Previews are drawn, not written: routes, rings, the target hand. The numbers live in the command window.
+    const lab = (_k: string, _pos: Vector3) => {};
+    const techTag = (_pos: Vector3) => {
+      if (opt.sp) W.floorRing(this.pos3(this.spActor(opt.act!)), '#ffb02e', 1.1);
     };
     const h = this.att(s.ball);
     const A = this.pos3(h);
     const toHoop = new Vector3(HOOP.x - h.x, 0, HOOP.y - h.y).normalize();
     const side = new Vector3(-toHoop.z, 0, toHoop.x);
-    if (opt.dm) { this.previewStance(opt, lab); return; }
+    if (opt.dm) { this.previewStance(opt, lab); this.focusStance(opt.dm); return; }
     const a = opt.act!;
+    this.focusAct(a);
+    const tp = this.targetPos(a);
+    if (tp) W.pointAt(tp.x, tp.y);
     techTag(A.clone().add(new Vector3(0, 3.5, 0)));
     switch (a.k) {
       case 'shoot': {
@@ -951,7 +1060,6 @@ export class Match {
         lab('make', RIM.clone().add(new Vector3(0, 0.75, 0)));
         lab('miss', RIM.clone().addScaledVector(side, 1.3).add(new Vector3(0, -0.1, 0)));
         lab('block', D.clone().add(new Vector3(0, 3.0, 0)));
-        W.label({ pos: from.clone().lerp(target, 0.5).add(new Vector3(0, 1.0, 0)), html: `<b>+${ZONES[s.zones[s.ball]].kind === 'three' ? 2 : 1}</b>`, cls: 'pts' });
         break;
       }
       case 'pass': {
@@ -968,7 +1076,6 @@ export class Match {
           W.dots(new ArcCurve(F, B, 1.5), '#c3a6ff', 0.075, 0.36, 1.2);
         } else if (a.t === 'nolook') {
           W.dots(new ArcCurve(F, B, 0.3), '#ff9be0', 0.06, 0.24, 1.8);
-          W.label({ pos: A.clone().add(new Vector3(0, 2.5, 0)).addScaledVector(side, 0.8), html: icon('t_nolook', 18), cls: 'pts' });
         } else {
           W.dots(new ArcCurve(F, B, 0.35), '#9be7ff', 0.07, 0.32, 1.3);
         }
@@ -1151,7 +1258,6 @@ export class Match {
     if (dm === 'contest') W.wall(w3(ob.x, ob.y), toward, '#ff4d6d', 1.0, 0.9, 2.4);
     if (dm === 'rim') { W.wall(w3(HOOP.x, HOOP.y + 0.9), toward, '#4cc9f0', 1.2, 0.9, 2.8); W.floorRing(w3(HOOP.x, HOOP.y + 0.9), '#4cc9f0', 1.1, false); }
     if (dm === 'charge') { W.wall(w3(ob.x, ob.y), toward, '#ffd166', 1.1, 1.2, 0.15); W.dots(new CatmullRomCurve3([H.clone().setY(0.08), w3(ob.x, ob.y, 0.08)]), '#ffd166', 0.07, 0.3, 1.2); }
-    W.label({ pos: w3(ob.x, ob.y, 3.2), html: `${icon(TECHS[dm].icon, 16)}<small>${defName(dm).toUpperCase()}</small>`, cls: 'tech' });
     lab('ball', H.clone().add(new Vector3(0, 2.9, 0)));
     lab('beat', RIM.clone().add(new Vector3(0, 0.75, 0)));
     lab('held', H.clone().add(new Vector3(1.3, 1.6, 0)));
@@ -1162,14 +1268,18 @@ export class Match {
     if (this.phase !== 'decide' || this.previewId) return;
     const W = this.world;
     W.clearPreview();
-    if (!kind) return;
+    if (!kind) { this.camDuel(); return; }
+    const s = this.poss!;
+    const P: ScenePt[] = [...this.pts(this.att(s.ball)), ...this.pts(this.def(s.ball))];
     for (const o of this.opts) {
       if (o.kind !== kind || o.disabled || !o.act || (group && o.group !== group)) continue;
+      if (kind === 'shoot') { P.push(...this.rimPts()); continue; }
       const p = this.targetPos(o.act);
       if (!p) continue;
       W.floorRing(w3(p.x, p.y), o.act.k === 'cut' ? '#7ef0c0' : '#ffffff', 0.6);
-      W.label({ pos: w3(p.x, p.y, 0.5), html: `<b>${o.main}%</b>`, cls: 'odds tag' });
+      P.push(...this.pts(p));
     }
+    this.world.frame(P, 3, 14);
   }
 
   /** Court point that identifies an option (receiver, destination, or the mover for picks). */
@@ -1327,8 +1437,10 @@ export class Match {
     this.heat[1 - off] = clamp(this.heat[1 - off] + fd.def, 0, FIRE.max);
     for (const t of [0, 1] as const) if (this.heat[t] >= FIRE.cost && before[t] < FIRE.cost) this.later(1.4, () => { if (t === 0) sfx.levelUp(); this.hooks.banner('FIRE READY', '#ffb02e', t === 0 ? 'Your specials are on' : 'Their specials are on'); });
     this.world.clearPreview();
+    this.world.clearMarks();
     this.hooks.decision(false);
     this.phase = 'resolve';
+    this.focusAct(act);
     this.resolve(s, act, dm, b);
   }
 
@@ -1349,7 +1461,8 @@ export class Match {
     };
     const word = outcome[b.ev] ?? '';
     const head = res === 'win' ? `Your ${you.name} beats their ${them.name}` : res === 'lose' ? `Their ${them.name} beats your ${you.name}` : `${you.name} vs ${them.name}: even`;
-    return { you, them, res, head: `${head}. ${word}.`, why: this.lastRes!.text };
+    const big = RESULT_WORD[b.ev];
+    return { you, them, res, head: `${head}. ${word}.`, why: this.lastRes!.text, word: big.w, icon: big.i, pts: b.ev === 'make' || b.ev === 'and1' ? b.pts : 0 };
   }
 
   private resolve(s: Poss, act: Act, dm: TechId, b: Branch) {
@@ -1913,11 +2026,13 @@ export class Match {
       this.flight = null;
       this.looseBall = null;
       this.layout(b.next, this.shownStance, 0.45);
+      this.world.overview();
       this.pushHud();
-      this.later(0.5, () => this.openDecision());
+      this.later(0.7, () => this.openDecision());
       return;
     }
     // Possession over.
+    this.world.overview();
     this.possN[this.offense]++;
     this.poss = null;
     this.pushHud();
@@ -2064,21 +2179,21 @@ export const TUTORIAL_KITS: [TechId[][], TechId[][]] = [[[], [], []], [[], [], [
 export const TUTORIAL: TutorialPoss[] = [
   {
     title: 'SPACE: SHOOT', setup: ['wingL', 'top', 'cornerR'], handler: 2, stance: 'space',
-    steps: [{ allow: ['shoot'], outcome: 'make', hint: 'Your defender backs off. Open Shoot and take the Three.' }],
+    steps: [{ allow: ['shoot'], outcome: 'make', hint: 'Shoot: Three' }],
   },
   {
     title: 'PRESSURE: CROSSOVER, THEN DUNK', setup: ['top', 'wingL', 'wingR'], handler: 0, stance: 'press',
     steps: [
-      { allow: ['drive'], techs: ['cross'], zones: ['elbowL', 'elbowR'], outcome: 'beat', hint: 'Pressed tight. Dribble, pick Crossover, then an elbow.' },
-      { allow: ['shoot'], techs: ['dunk', 'jumper'], outcome: 'make', hint: 'You beat your man: the DUNK is open. Open Shoot and slam it.' },
+      { allow: ['drive'], techs: ['cross'], zones: ['elbowL', 'elbowR'], outcome: 'beat', hint: 'Dribble: Crossover' },
+      { allow: ['shoot'], techs: ['dunk', 'jumper'], outcome: 'make', hint: 'Shoot: Dunk' },
     ],
   },
   {
     title: 'HELP: PASS', setup: ['top', 'cornerL', 'wingR'], handler: 0, stance: 'space',
     steps: [
-      { allow: ['drive'], techs: ['drive'], zones: ['elbowL', 'elbowR'], outcome: 'help', hint: 'They sag. Dribble inside to pull help.' },
-      { allow: ['pass'], techs: ['chest'], toFreed: true, outcome: 'catch', hint: 'Help left a mate free. Pass.' },
-      { allow: ['shoot'], outcome: 'make', hint: 'Open man. Shoot.' },
+      { allow: ['drive'], techs: ['drive'], zones: ['elbowL', 'elbowR'], outcome: 'help', hint: 'Dribble: Drive' },
+      { allow: ['pass'], techs: ['chest'], toFreed: true, outcome: 'catch', hint: 'Pass: open man' },
+      { allow: ['shoot'], outcome: 'make', hint: 'Shoot' },
     ],
   },
   { title: 'YOUR CALL', setup: ['top', 'wingL', 'cornerR'], handler: 0, steps: [] },

@@ -1,6 +1,8 @@
-// Pixel-art renderer: a 262x230 canvas drawn at native resolution and scaled by a whole number of device
+// Pixel-art renderer: a 264x234 scene drawn at native resolution and scaled by a whole number of device
 // pixels (image-rendering: pixelated). Top-down court from the asset pack, side-view player sprites,
 // hoop and net sprites, and pixel previews (dotted routes, rings, walls) for the decision UI.
+// A battle camera crops the scene and enlarges it by a whole number (1x, 2x, 3x): close on a duel,
+// wide for a pass preview, back to the whole court between plays. It never scales by a fraction.
 // It offers the same calls the match code used on the 3D world, in court meters.
 import { Vector3, type Curve } from 'three';
 import { ZONES } from '../rules';
@@ -8,15 +10,16 @@ import { COURT_H, COURT_W, HOOP } from './court';
 import { A, FEET, atlasImage, drawPiece, drawPlayer, hasPiece, pixText, pixTextW, tagFrame, type Look } from './sprites';
 import type { FxStyle } from '../specials';
 
-export const VIEW_W = 262;
-export const VIEW_H = 230;
+/** Scene size in pixels (both divisible by 2 and 3, so every camera zoom covers it exactly). */
+export const VIEW_W = 264;
+export const VIEW_H = 234;
 /** Pixels per meter: along the court (screen x), across it (screen y) and up (height). */
 const KX = 15, KY = 11.1, KZ = 14.4;
 /** Hoop floor point on screen. */
 const HX = 184, HY = 114;
 const COURT_OX = -30;
-/** Portrait window: x 26..250 keeps every spot players use plus the hoop stand. */
-const CROP_X0 = 26, CROP_W = 224;
+/** Largest camera zoom. */
+export const MAX_ZOOM = 3;
 
 export const project = (x: number, y: number, h = 0) => ({ x: HX - (y - HOOP.y) * KX, y: HY + (x - HOOP.x) * KY - h * KZ });
 const fromWorld = (v: Vector3) => project(v.x + COURT_W / 2, v.z + COURT_H / 2, v.y);
@@ -75,14 +78,22 @@ const FX_COL: Record<FxStyle, string[]> = {
 };
 const rampAt = (ramp: string[], k: number) => ramp[Math.min(ramp.length - 1, Math.max(0, Math.floor(k * ramp.length)))];
 
-/** Screen layout computed from the window: court and panel side by side (landscape) or stacked (portrait). */
+type Box = { l: number; t: number; w: number; h: number };
+/**
+ * Screen layout computed from the window size only (never from what is shown): HUD on top, the stage, and the
+ * command window below the stage (stack) or beside it (side). Every box keeps its size until the window resizes.
+ */
 export interface Layout {
   side: boolean;
-  court: { l: number; t: number; w: number; h: number };
-  panel: { l: number; t: number; w: number; h: number };
-  hud: { l: number; t: number; w: number };
+  hud: Box;
+  court: Box;
+  win: Box;
+  /** The command window puts its info box beside the list (cols) or above it (rows). */
+  cols: boolean;
   scale: number;
 }
+/** A point of the scene in pixels (for camera framing). */
+export interface ScenePt { x: number; y: number }
 
 const GOOD = '#3ddc97', BAD = '#ff4d6d';
 const INK = '#1b1029';
@@ -108,9 +119,15 @@ export class PixelWorld {
   private ro: ResizeObserver;
   /** CSS pixels per canvas pixel. */
   private k = 1;
-  /** Visible window of the scene: portrait screens drop the unused side margins to get a bigger whole-number scale. */
-  private x0 = 0;
-  private vw = VIEW_W;
+  /** Camera: top-left of the visible part of the scene and its whole-number zoom. */
+  private cam = { x: 0, y: 0, z: 1 };
+  private camGoal = { x: 0, y: 0, z: 1 };
+  /** A short close-up that overrides the camera (dunks, specials). */
+  private zoom: { x: number; y: number; t: number; dur: number } | null = null;
+  /** Hand cursor pointing at a scene point (target selection). */
+  private hand: ScenePt | null = null;
+  /** Persistent labels (the opponent's tell) that previews do not clear. */
+  private marks: Label[] = [];
   shake = 0;
   showZones = true;
   /** Reduced motion: no shake, zoom, flashes or letterbox; few particles. */
@@ -125,8 +142,7 @@ export class PixelWorld {
   private trail: { style: FxStyle; pts: { x: number; y: number; t: number }[] } | null = null;
   private flash = 0;
   private flashCol = '#ffffff';
-  /** Integer zoom on a canvas point (cinematics); `bars` = letterbox. */
-  private zoom: { x: number; y: number; t: number; dur: number } | null = null;
+  /** Letterbox bars (cinematics). */
   private bars = 0;
   private speedLines = 0;
 
@@ -154,56 +170,66 @@ export class PixelWorld {
 
   destroy() {
     this.ro.disconnect();
+    this.marks = [];
     this.container.innerHTML = '';
   }
 
   /**
-   * Whole-number scale in device pixels. Landscape: the court and the panel form one centered block that fills
-   * the height (the panel takes the rest of the width, between a readable minimum and a maximum). Portrait: the
-   * HUD on top, the court (side margins cropped when that buys a bigger scale), the panel below.
+   * Whole-number scale in device pixels, from the window size only. Stack: HUD, stage, command window below
+   * (the classic battle screen). Side: HUD, then stage and command window side by side (short landscape
+   * screens). Whichever gives the bigger scale wins; on a tie the window goes below. The whole scene always
+   * fits: nothing of the court is ever cropped.
    */
   resize() {
     const screen = this.container.parentElement;
     const W = (screen?.clientWidth || this.container.clientWidth) || 1, H = (screen?.clientHeight || this.container.clientHeight) || 1;
     const dpr = window.devicePixelRatio || 1;
-    const pad = W < 600 || H < 500 ? 4 : 10;
-    const gap = W < 900 ? 6 : 12;
-    const minPanel = W < 700 ? 280 : 330, maxPanel = 560;
-    const fit = (vw: number, availW: number, availH: number) => Math.max(1, Math.floor(Math.min((availW * dpr) / vw, (availH * dpr) / VIEW_H)));
-    // Landscape candidate (full width or cropped scene, whichever is bigger).
-    const sideFor = (vw: number) => fit(vw, W - 2 * pad - gap - minPanel, H - 2 * pad);
-    const sSideFull = sideFor(VIEW_W), sSideCrop = sideFor(CROP_W);
-    // Portrait candidate: HUD on top, the panel keeps at least ~40% of the height.
-    const hudH = 50;
-    const minPanelH = Math.max(250, Math.round(H * 0.4));
-    const stackFor = (vw: number) => fit(vw, W - 2 * pad, H - hudH - minPanelH - pad);
-    const sStackFull = stackFor(VIEW_W), sStackCrop = stackFor(CROP_W);
-    const landscape = W > H * 1.1;
-    const side = landscape && W - Math.min(sSideFull, sSideCrop) >= minPanel;
-    let crop: boolean, s: number;
-    if (side) { crop = sSideCrop > sSideFull; s = crop ? sSideCrop : sSideFull; }
-    else { crop = sStackCrop > sStackFull; s = crop ? sStackCrop : sStackFull; }
-    this.x0 = crop ? CROP_X0 : 0;
-    this.vw = crop ? CROP_W : VIEW_W;
-    if (this.canvas.width !== this.vw) this.canvas.width = this.vw;
-    this.vg.imageSmoothingEnabled = false;
-    const cw = (this.vw * s) / dpr, ch = (VIEW_H * s) / dpr;
+    const small = W < 700 || H < 520;
+    const pad = small ? 6 : 14, gap = small ? 6 : 12;
+    const hudH = small ? 52 : 64;
+    const rowH = small ? 46 : 54;
+    const infoRowsH = small ? 84 : 96;
+    // Smallest command window: five rows (defense has five commands), borders and padding.
+    const minWinH = 5 * rowH + 28;
+    const fit = (availW: number, availH: number) => Math.max(1, Math.floor(Math.min((availW * dpr) / VIEW_W, (availH * dpr) / VIEW_H)));
+    const sStack = fit(W - 2 * pad, H - 2 * pad - hudH - 2 * gap - minWinH);
+    const minSideW = 300;
+    const sSide = fit(W - 2 * pad - gap - minSideW, H - 2 * pad - hudH - gap);
+    const side = sSide > sStack;
+    const s = side ? sSide : sStack;
+    const cw = (VIEW_W * s) / dpr, ch = (VIEW_H * s) / dpr;
     const snap = (v: number) => Math.round(v * dpr) / dpr;
     let L: Layout;
-    if (side) {
-      const pw = Math.round(Math.min(maxPanel, Math.max(minPanel, W - 2 * pad - gap - cw)));
-      const groupW = cw + gap + pw;
-      const left = snap(Math.max(pad, (W - groupW) / 2));
-      const top = snap((H - ch) / 2);
-      const ph = H - 2 * pad;
-      const pt = pad;
-      L = { side, scale: s / dpr, court: { l: left, t: top, w: cw, h: ch }, panel: { l: Math.round(left + cw + gap), t: pt, w: pw, h: ph }, hud: { l: Math.round(left + cw + gap), t: pt, w: pw } };
+    if (!side) {
+      const winW = Math.round(Math.min(W - 2 * pad, Math.max(cw, Math.min(900, W - 2 * pad))));
+      // The window takes what is left below the stage, up to seven rows.
+      const spare = H - 2 * pad - hudH - 2 * gap - ch;
+      const cols = winW >= 560;
+      const maxWinH = (cols ? 7 * rowH : 6 * rowH + infoRowsH) + 28;
+      const winH = Math.round(Math.max(minWinH, Math.min(spare, maxWinH)));
+      const groupH = hudH + gap + ch + gap + winH;
+      const top = Math.max(pad, Math.round((H - groupH) / 2));
+      const hudW = Math.round(Math.min(W - 2 * pad, Math.max(cw, winW)));
+      L = {
+        side, cols, scale: s / dpr,
+        hud: { l: Math.round((W - hudW) / 2), t: top, w: hudW, h: hudH },
+        court: { l: snap((W - cw) / 2), t: snap(top + hudH + gap), w: cw, h: ch },
+        win: { l: Math.round((W - winW) / 2), t: Math.round(top + hudH + gap + ch + gap), w: winW, h: winH },
+      };
     } else {
-      const left = snap((W - cw) / 2);
-      const top = snap(hudH + 2);
-      const pt = Math.round(top + ch + gap / 2);
-      const pw = Math.min(W - 2 * pad, 640);
-      L = { side, scale: s / dpr, court: { l: left, t: top, w: cw, h: ch }, panel: { l: Math.round((W - pw) / 2), t: pt, w: pw, h: Math.max(0, H - pt - pad) }, hud: { l: pad, t: 4, w: W - 2 * pad } };
+      const winW = Math.round(Math.min(560, Math.max(minSideW, W - 2 * pad - gap - cw)));
+      const groupW = cw + gap + winW;
+      const left = snap(Math.max(pad, (W - groupW) / 2));
+      const bodyH = Math.max(ch, Math.min(H - 2 * pad - hudH - gap, minWinH + 2 * rowH));
+      const groupH = hudH + gap + bodyH;
+      const top = Math.max(pad, Math.round((H - groupH) / 2));
+      const bodyT = top + hudH + gap;
+      L = {
+        side, cols: winW >= 560, scale: s / dpr,
+        hud: { l: Math.round(left), t: top, w: Math.round(groupW), h: hudH },
+        court: { l: left, t: snap(bodyT + (bodyH - ch) / 2), w: cw, h: ch },
+        win: { l: Math.round(left + cw + gap), t: Math.round(bodyT), w: winW, h: Math.round(bodyH) },
+      };
     }
     for (const el of [this.canvas, this.labelsEl]) {
       el.style.width = `${L.court.w}px`;
@@ -216,11 +242,13 @@ export class PixelWorld {
     if (screen) {
       screen.classList.toggle('side', side);
       screen.classList.toggle('stack', !side);
+      screen.classList.toggle('small', small);
       const v = (k: string, n: number) => screen.style.setProperty(k, `${Math.round(n * 100) / 100}px`);
       v('--court-l', L.court.l); v('--court-w', L.court.w); v('--court-top', L.court.t); v('--court-h', L.court.h);
-      v('--court-bottom', L.court.t + L.court.h);
-      v('--panel-l', L.panel.l); v('--panel-t', L.panel.t); v('--panel-w', L.panel.w); v('--panel-h', L.panel.h);
-      v('--hud-l', L.hud.l); v('--hud-t', L.hud.t); v('--hud-w', L.hud.w);
+      v('--hud-l', L.hud.l); v('--hud-t', L.hud.t); v('--hud-w', L.hud.w); v('--hud-h', L.hud.h);
+      v('--win-l', L.win.l); v('--win-t', L.win.t); v('--win-w', L.win.w); v('--win-h', L.win.h);
+      v('--row-h', rowH); v('--info-h', infoRowsH);
+      screen.classList.toggle('wcols', L.cols);
       screen.style.setProperty('--px', `${Math.max(2, Math.round(this.k))}px`);
     }
     this.onLayout?.(L);
@@ -254,14 +282,71 @@ export class PixelWorld {
   pickScreen(clientX: number, clientY: number) {
     const r = this.canvas.getBoundingClientRect();
     if (!r.width) return null;
-    return { x: ((clientX - r.left) / r.width) * this.vw + this.x0, y: ((clientY - r.top) / r.height) * VIEW_H };
+    const c = this.view0();
+    return { x: c.x + ((clientX - r.left) / r.width) * (VIEW_W / c.z), y: c.y + ((clientY - r.top) / r.height) * (VIEW_H / c.z) };
   }
 
   // ---------------------------------------------------------------- previews
   clearPreview() {
     this.rings = []; this.dotPaths = []; this.walls = []; this.ghosts = [];
+    this.hand = null;
     for (const l of this.labels) l.el.remove();
     this.labels = [];
+  }
+
+  /** A label that stays until clearMarks (the opponent's tell over a player). */
+  mark(pos: Vector3, html: string, cls = '') {
+    const el = document.createElement('div');
+    el.className = `wlabel ${cls}`;
+    el.innerHTML = html;
+    this.labelsEl.appendChild(el);
+    const s = fromWorld(pos);
+    const l = { el, x: Math.round(s.x), y: Math.round(s.y) };
+    this.marks.push(l);
+    this.placeLabel(l.el, l.x, l.y);
+  }
+  clearMarks() { for (const l of this.marks) l.el.remove(); this.marks = []; }
+
+  /** Point the hand cursor at a court point (meters), or hide it. */
+  pointAt(x: number | null, y = 0) { this.hand = x === null ? null : project(x, y); }
+
+  // ---------------------------------------------------------------- camera
+  /**
+   * Frame a set of scene points: the biggest whole-number zoom (up to `maxZ`) that keeps them all in view
+   * with a margin, centered on them. Reduced motion keeps the whole court (no zoom).
+   */
+  frame(pts: ScenePt[], maxZ = MAX_ZOOM, margin = 14) {
+    if (!pts.length || this.reduce) { this.overview(); return; }
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of pts) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+    x0 -= margin; x1 += margin; y0 -= margin; y1 += margin;
+    let z = Math.max(1, Math.min(MAX_ZOOM, maxZ));
+    while (z > 1 && (x1 - x0 > VIEW_W / z || y1 - y0 > VIEW_H / z)) z--;
+    this.camGoal = this.clampCam((x0 + x1) / 2, (y0 + y1) / 2, z);
+  }
+  /** The whole court. */
+  overview() { this.camGoal = { x: 0, y: 0, z: 1 }; }
+  /** Current zoom (tests). */
+  get zoomLevel() { return this.zoom && !this.reduce ? 2 : this.cam.z; }
+  private clampCam(cx: number, cy: number, z: number) {
+    const w = VIEW_W / z, h = VIEW_H / z;
+    return { x: Math.round(Math.min(VIEW_W - w, Math.max(0, cx - w / 2))), y: Math.round(Math.min(VIEW_H - h, Math.max(0, cy - h / 2))), z };
+  }
+  /** The view used this frame (a close-up overrides the camera). */
+  private view0() {
+    if (this.zoom && !this.reduce) {
+      const z = Math.max(2, this.cam.z);
+      return this.clampCam(this.zoom.x, this.zoom.y + VIEW_H / z * 0.12, z);
+    }
+    return this.cam;
+  }
+  /** Move the camera toward its goal: a zoom change is a cut; at the same zoom it pans in whole pixels. */
+  private stepCam(dt: number) {
+    const g = this.camGoal, c = this.cam;
+    if (g.z !== c.z || this.reduce) { this.cam = { ...g }; return; }
+    const k = Math.min(1, dt * 12);
+    const step = (a: number, b: number) => (a === b ? a : Math.abs(b - a) <= 1 ? b : Math.round(a + (b - a) * k) === a ? a + Math.sign(b - a) : Math.round(a + (b - a) * k));
+    c.x = step(c.x, g.x); c.y = step(c.y, g.y);
   }
 
   dots(curve: Curve<Vector3>, color: string, radius = 0.07, spacing = 0.32, speed = 0.9) {
@@ -303,11 +388,13 @@ export class PixelWorld {
   }
 
   private placeLabel(el: HTMLElement, x: number, y: number) {
-    const cx = Math.min(this.x0 + this.vw - 8, Math.max(this.x0 + 8, x)) - this.x0;
-    const cy = Math.max(14, y);
+    const c = this.view0();
+    const sx = (x - c.x) * c.z, sy = (y - c.y) * c.z;
+    const cx = Math.min(VIEW_W - 8, Math.max(8, sx));
+    const cy = Math.max(14, Math.min(VIEW_H, sy));
     el.style.transform = `translate(${Math.round(cx * this.k)}px, ${Math.round(cy * this.k)}px) translate(-50%, -100%)`;
   }
-  private placeLabels() { for (const l of this.labels) this.placeLabel(l.el, l.x, l.y); }
+  private placeLabels() { for (const l of this.labels) this.placeLabel(l.el, l.x, l.y); for (const l of this.marks) this.placeLabel(l.el, l.x, l.y); }
 
   // ---------------------------------------------------------------- drawing helpers
   private px(x: number, y: number, c: string, w = 1, h = 1) { this.g.fillStyle = c; this.g.fillRect(Math.round(x), Math.round(y), w, h); }
@@ -503,6 +590,7 @@ export class PixelWorld {
       for (let i = 0; i < 5; i++) this.px(cx - 4 + i, y - 1 + i, INK, 9 - 2 * i, 1);
       for (let i = 0; i < 3; i++) this.px(cx - 2 + i, y + i, '#ffd60a', 5 - 2 * i, 1);
     }
+    if (this.hand) this.drawHand(Math.round(this.hand.x), Math.round(this.hand.y) - 50 + (Math.sin(this.time * 7) > 0 ? 1 : 0));
 
     this.netKick = Math.max(0, this.netKick - dt * 2.5);
     this.rimKick = Math.max(0, this.rimKick - dt * 4);
@@ -510,6 +598,8 @@ export class PixelWorld {
     this.drawFx(dt);
     this.blit(dt);
 
+    // Labels follow the camera.
+    this.placeLabels();
     // Floating callouts rise in whole canvas pixels.
     this.floaters = this.floaters.filter((f) => {
       f.t += dt;
@@ -526,6 +616,28 @@ export class PixelWorld {
     this.parts = []; this.auras = []; this.ghosts2 = []; this.trail = null;
     this.zoom = null; this.bars = 0; this.flash = 0; this.speedLines = 0;
     this.labelsEl.classList.remove('hide');
+  }
+
+  /** Pixel hand cursor (white glove, dark outline) pointing down at (x, y + 9). */
+  private drawHand(x: number, y: number) {
+    const rows = [
+      '..XXX.....',
+      '.XWWWX....',
+      '.XWWWXXX..',
+      '.XWWWWWWX.',
+      'XXWWWWWWWX',
+      'XWWWWWWWWX',
+      'XWWWWWWWX.',
+      '.XWWWWWX..',
+      '..XWWWX...',
+      '...XWX....',
+      '....X.....',
+    ];
+    for (let j = 0; j < rows.length; j++) for (let i = 0; i < rows[j].length; i++) {
+      const c = rows[j][i];
+      if (c === '.') continue;
+      this.px(x - 4 + i, y + j, c === 'X' ? INK : '#fff7ea');
+    }
   }
 
   private spawn(kind: Part['kind'], x: number, y: number, vx: number, vy: number, life: number, size = 1, gr = 0) {
@@ -555,7 +667,7 @@ export class PixelWorld {
   /** The ball leaves a burning trail while it flies. */
   ballTrail(style: FxStyle | null) { this.trail = style ? { style, pts: [] } : null; }
   flashNow(color = '#ffffff', k = 0.7) { if (this.reduce) return; this.flash = k; this.flashCol = color; }
-  /** Snap a 2x zoom (whole number: pixels stay square) on a court point, with letterbox bars. */
+  /** Snap a close-up (whole-number zoom: pixels stay square) on a court point, with letterbox bars. */
   cinematic(x: number | null, y = 0, h = 1, dur = 1.2) {
     if (x === null) { this.zoom = null; this.labelsEl.classList.remove('hide'); return; }
     this.bars = 1;
@@ -660,12 +772,12 @@ export class PixelWorld {
     this.g.globalAlpha = 1;
   }
 
-  /** Copy the scene to the screen: shake, 2x zoom, letterbox, cut-in speed lines, flash. */
+  /** Copy the scene to the screen: camera (whole-number zoom), shake, letterbox, cut-in speed lines, flash. */
   private blit(dt: number) {
     const v = this.vg;
     v.setTransform(1, 0, 0, 1, 0, 0);
     v.fillStyle = '#1b1029';
-    v.fillRect(0, 0, this.vw, VIEW_H);
+    v.fillRect(0, 0, VIEW_W, VIEW_H);
     let sx = 0, sy = 0;
     if (this.shake > 0) {
       this.shake = Math.max(0, this.shake - dt);
@@ -674,18 +786,17 @@ export class PixelWorld {
         sx = Math.round((Math.random() - 0.5) * m); sy = Math.round((Math.random() - 0.5) * m);
       }
     }
+    this.stepCam(dt);
     if (this.zoom) {
-      const z = this.zoom;
-      z.t += dt;
-      const w = Math.floor(this.vw / 2), h = Math.floor(VIEW_H / 2);
-      const x = Math.round(Math.min(this.x0 + this.vw - w, Math.max(this.x0, z.x - w / 2)));
-      const y = Math.round(Math.min(VIEW_H - h, Math.max(0, z.y - h * 0.62)));
-      v.drawImage(this.view, x, y, w, h, sx, sy, w * 2, h * 2);
-      if (z.t >= z.dur) { this.zoom = null; this.labelsEl.classList.remove('hide'); }
-    } else v.drawImage(this.view, this.x0, 0, this.vw, VIEW_H, sx, sy, this.vw, VIEW_H);
+      this.zoom.t += dt;
+      if (this.zoom.t >= this.zoom.dur) { this.zoom = null; this.labelsEl.classList.remove('hide'); }
+    }
+    const c = this.view0();
+    const w = VIEW_W / c.z, h = VIEW_H / c.z;
+    v.drawImage(this.view, c.x, c.y, w, h, sx, sy, VIEW_W, VIEW_H);
     if (this.speedLines > 0) {
       this.speedLines -= dt;
-      const cx = this.vw / 2, cy = VIEW_H / 2;
+      const cx = VIEW_W / 2, cy = VIEW_H / 2;
       v.fillStyle = '#fff7ea';
       for (let i = 0; i < 26; i++) {
         const a = Math.random() * Math.PI * 2;
@@ -694,15 +805,15 @@ export class PixelWorld {
       }
     }
     if (this.bars > 0 && !this.reduce) {
-      const bh = 14;
+      const bh = 15;
       v.fillStyle = '#0a0612';
-      v.fillRect(0, 0, this.vw, bh);
-      v.fillRect(0, VIEW_H - bh, this.vw, bh);
+      v.fillRect(0, 0, VIEW_W, bh);
+      v.fillRect(0, VIEW_H - bh, VIEW_W, bh);
     }
     if (this.flash > 0) {
       v.globalAlpha = Math.min(0.7, this.flash);
       v.fillStyle = this.flashCol;
-      v.fillRect(0, 0, this.vw, VIEW_H);
+      v.fillRect(0, 0, VIEW_W, VIEW_H);
       v.globalAlpha = 1;
       this.flash = Math.max(0, this.flash - dt * 4);
     }
