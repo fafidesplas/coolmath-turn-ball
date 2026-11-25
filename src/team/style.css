@@ -1,0 +1,12 @@
+/* 5v5: grades, shot quality and stars in the command window */
+.grade { display: inline-block; min-width: 28px; text-align: center; padding: 6px 4px; font-size: 14px; color: #1b1029; }
+.grade.gA { background: #3ddc97; } .grade.gB { background: #ffd166; } .grade.gC { background: #ff9f1c; } .grade.gD { background: #ff4d6d; color: #fff7ea; }
+.qual { display: inline-block; padding: 5px 6px; font-size: 8px; }
+.qual.q-open { background: #3ddc97; color: #1b1029; }
+.qual.q-contested { background: #ffd166; color: #1b1029; }
+.qual.q-tough { background: #ff4d6d; color: #fff7ea; }
+.c-small .off { color: #4a3a6e; }
+.c-small .risky { color: #ff7a8a; font-weight: 400; margin-left: 4px; }
+.c-scheme .sch { background: #7ee0ff; }
+.cam { position: absolute; right: 6px; top: 6px; font: 8px/1 'Press Start 2P', monospace; color: #fff7ea; background: #1b1029; border: 0; padding: 8px; box-shadow: 0 0 0 2px #6b5a8e; cursor: pointer; min-height: 24px; }
+.cam:hover, .cam:focus-visible { box-shadow: 0 0 0 2px #ffd166; outline: none; }
